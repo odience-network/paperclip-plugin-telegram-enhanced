@@ -19,6 +19,22 @@ export type SendMessageOptions = {
   disableNotification?: boolean;
 };
 
+export type SendDocumentOptions = {
+  filename: string;
+  caption?: string;
+  parseMode?: "MarkdownV2" | "HTML";
+  replyToMessageId?: number;
+  messageThreadId?: number;
+  disableNotification?: boolean;
+};
+
+type TelegramResponse = {
+  ok: boolean;
+  result?: { message_id: number };
+  description?: string;
+  parameters?: { retry_after?: number };
+};
+
 export async function sendMessage(
   ctx: PluginContext,
   token: string,
@@ -88,6 +104,108 @@ export async function sendMessage(
     }
   }
   return null;
+}
+
+// Ported from ant013/paperclip-plugin-telegram (TEL-8, commits 0b57865/a6f5037):
+// "send markdown documents with native upload fallback".
+export async function sendDocument(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  markdownContent: string,
+  options: SendDocumentOptions,
+): Promise<number | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const data = await postTelegramDocument(ctx, token, chatId, markdownContent, options);
+
+      if (!data.ok) {
+        if (data.parameters?.retry_after && attempt < 2) {
+          const wait = data.parameters.retry_after * 1000;
+          ctx.logger.warn("Telegram rate limited, retrying file send", {
+            retryAfter: data.parameters.retry_after,
+            attempt,
+          });
+          await new Promise((r) => setTimeout(r, wait));
+          continue;
+        }
+
+        if (options.parseMode === "MarkdownV2" && options.caption) {
+          ctx.logger.warn("MarkdownV2 file caption failed, retrying as plain text", {
+            error: data.description,
+          });
+          return sendDocument(ctx, token, chatId, markdownContent, {
+            ...options,
+            caption: stripMarkdown(options.caption),
+            parseMode: undefined,
+          });
+        }
+
+        ctx.logger.error("Telegram document send failed", { error: data.description });
+        await ctx.metrics.write(METRIC_NAMES.failed, 1);
+        return null;
+      }
+
+      await ctx.metrics.write(METRIC_NAMES.sent, 1);
+      return data.result?.message_id ?? null;
+    } catch (err) {
+      ctx.logger.error("Telegram document API error", { error: String(err) });
+      await ctx.metrics.write(METRIC_NAMES.failed, 1);
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function buildDocumentFormData(
+  chatId: string,
+  markdownContent: string,
+  options: SendDocumentOptions,
+): FormData {
+  const body = new FormData();
+  body.append("chat_id", chatId);
+  body.append(
+    "document",
+    new Blob([markdownContent], { type: "text/markdown; charset=utf-8" }),
+    options.filename,
+  );
+  if (options.caption) body.append("caption", options.caption);
+  if (options.parseMode) body.append("parse_mode", options.parseMode);
+  if (options.replyToMessageId) body.append("reply_to_message_id", String(options.replyToMessageId));
+  if (options.messageThreadId) body.append("message_thread_id", String(options.messageThreadId));
+  if (options.disableNotification) body.append("disable_notification", "true");
+  return body;
+}
+
+async function postTelegramDocument(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  markdownContent: string,
+  options: SendDocumentOptions,
+): Promise<TelegramResponse> {
+  const url = `${TELEGRAM_API}/bot${token}/sendDocument`;
+  const proxied = await ctx.http.fetch(url, {
+    method: "POST",
+    body: buildDocumentFormData(chatId, markdownContent, options),
+  });
+  const data = await proxied.json() as TelegramResponse;
+
+  if (data.ok || data.description !== "Bad Request: there is no document in the request") {
+    return data;
+  }
+
+  // Paperclip's HTTP bridge can lose multipart file parts while serializing FormData.
+  // Retry from the worker process with native fetch so Telegram receives the Blob.
+  ctx.logger.warn("Telegram document proxy upload failed, retrying with native fetch", {
+    error: data.description,
+  });
+  const direct = await fetch(url, {
+    method: "POST",
+    body: buildDocumentFormData(chatId, markdownContent, options),
+  });
+  return await direct.json() as TelegramResponse;
 }
 
 export async function editMessage(
