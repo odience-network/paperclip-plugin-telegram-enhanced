@@ -24,6 +24,7 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  formatResolvedDecision,
   type IssueLinksOpts,
 } from "./formatters.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
@@ -1234,7 +1235,7 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u2705")} *Approved* by ${escapeMarkdownV2(actor)}`,
+          formatResolvedDecision(query.message?.text, "approved", actor),
           { parseMode: "MarkdownV2" },
         );
       }
@@ -1289,7 +1290,7 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u274c")} *Rejected* by ${escapeMarkdownV2(actor)}`,
+          formatResolvedDecision(query.message?.text, "rejected", actor),
           { parseMode: "MarkdownV2" },
         );
       }

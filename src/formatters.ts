@@ -56,6 +56,29 @@ function runButton(agentId: string, runId: string | null, publicUrl?: string): {
   return null;
 }
 
+/**
+ * Build the text for a resolved approval/decision card.
+ *
+ * Ported from the tue-Jonas fork (TWX-619): rather than collapsing the card to
+ * a bare status line, preserve the original card context (issue identifier,
+ * title, description) and append a resolution footer so the message stays
+ * legible after the buttons are removed. Falls back to just the footer when no
+ * original text is available. The original text from Telegram is plain (entity
+ * formatting stripped), so it is MarkdownV2-escaped before being re-sent.
+ */
+export function formatResolvedDecision(
+  originalText: string | undefined | null,
+  decision: "approved" | "rejected",
+  actor: string,
+): string {
+  const icon = decision === "approved" ? "✅" : "❌";
+  const label = decision === "approved" ? "Approved" : "Rejected";
+  const footer = `${esc(icon)} ${bold(label)} by ${esc(actor)}`;
+  const trimmed = (originalText ?? "").trim();
+  if (!trimmed) return footer;
+  return `${esc(trimmed)}\n\n${footer}`;
+}
+
 function classifyAgentError(errorMessage: string): string {
   if (/timed?\s*out|timeout/i.test(errorMessage)) return "Agent Timeout";
   if (/limit|rate.?limit|quota/i.test(errorMessage)) return "Agent Rate Limit";
