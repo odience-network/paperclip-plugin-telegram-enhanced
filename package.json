@@ -1,7 +1,25 @@
 {
-  "name": "paperclip-plugin-telegram",
-  "version": "0.6.1",
+  "name": "@odience-network/paperclip-plugin-telegram-enhanced",
+  "version": "0.1.0",
   "type": "module",
+  "description": "Enhanced bidirectional Telegram integration for Paperclip: push notifications, bot commands, escalation, multi-agent sessions (native + ACP), media pipeline, custom workflow commands, and proactive suggestion watches. Maintained by Odience Network; enhanced fork of mvanhorn/paperclip-plugin-telegram.",
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "telegram",
+    "telegram-bot",
+    "bot",
+    "chatbot",
+    "odience-network"
+  ],
+  "author": "Odience Network",
+  "homepage": "https://github.com/odience-network/paperclip-plugin-telegram-enhanced#readme",
+  "bugs": {
+    "url": "https://github.com/odience-network/paperclip-plugin-telegram-enhanced/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.js",
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
@@ -35,7 +53,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mvanhorn/paperclip-plugin-telegram.git"
+    "url": "git+https://github.com/odience-network/paperclip-plugin-telegram-enhanced.git"
   },
   "license": "MIT"
 }
