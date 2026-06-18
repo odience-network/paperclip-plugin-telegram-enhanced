@@ -1,15 +1,17 @@
 name: Publish to npm
 
+# Release-gated, not push-gated. Publishing only happens when a GitHub Release
+# is published (or via manual dispatch), and it no-ops unless the NPM_TOKEN
+# secret is configured. This prevents accidental publishes on every push to main.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "package.json"
+  release:
+    types: [published]
 
 jobs:
   publish:
+    # Never publish from forks — only the canonical Odience Network repo.
+    if: github.repository == 'odience-network/paperclip-plugin-telegram-enhanced'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -22,7 +24,14 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run build
-      - run: |
+      - name: Publish (skips if NPM_TOKEN unset or version already published)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::warning::NPM_TOKEN secret not configured — skipping publish."
+            exit 0
+          fi
           VERSION=$(node -p "require('./package.json').version")
           NAME=$(node -p "require('./package.json').name")
           if npm view "${NAME}@${VERSION}" version 2>/dev/null; then
@@ -30,4 +39,3 @@ jobs:
           else
             npm publish --provenance --access public
           fi
-
