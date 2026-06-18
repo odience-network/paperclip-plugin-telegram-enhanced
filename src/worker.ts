@@ -49,7 +49,11 @@ import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
-import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
+import {
+  buildPaperclipAuthHeaders,
+  fetchPaperclipApi,
+  isAlreadyResolvedConflict,
+} from "./paperclip-api.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -1194,7 +1198,46 @@ async function handleUpdate(
   }
 }
 
-async function handleCallbackQuery(
+/**
+ * Graceful fallback for a decision-button callback whose underlying approval is
+ * no longer actionable (TWX-328: stale inline-button presses). When the failure
+ * is an "already resolved/decided" conflict — the approval was decided through
+ * another channel, expired, or already resolved in the opposite direction — we
+ * acknowledge it quietly and update the card instead of surfacing a raw API
+ * error string to the board member. Any other error still surfaces as a failure.
+ */
+async function handleDecisionCallbackError(
+  ctx: PluginContext,
+  token: string,
+  query: NonNullable<TelegramUpdate["callback_query"]>,
+  chatId: string | null,
+  messageId: number | undefined,
+  decision: { kind: string; id: string; actor: string },
+  err: unknown,
+): Promise<void> {
+  if (isAlreadyResolvedConflict(err)) {
+    ctx.logger.info("Ignored stale Telegram decision callback", {
+      kind: decision.kind,
+      id: decision.id,
+      actor: decision.actor,
+    });
+    await answerCallbackQuery(ctx, token, query.id, "Already resolved");
+    if (chatId && messageId) {
+      await editMessage(
+        ctx,
+        token,
+        chatId,
+        messageId,
+        escapeMarkdownV2("This decision was already resolved."),
+        { parseMode: "MarkdownV2" },
+      );
+    }
+    return;
+  }
+  await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+}
+
+export async function handleCallbackQuery(
   ctx: PluginContext,
   token: string,
   query: NonNullable<TelegramUpdate["callback_query"]>,
@@ -1239,7 +1282,15 @@ async function handleCallbackQuery(
         );
       }
     } catch (err) {
-      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+      await handleDecisionCallbackError(
+        ctx,
+        token,
+        query,
+        chatId,
+        messageId,
+        { kind: "approval_approve", id: approvalId, actor },
+        err,
+      );
     }
     return;
   }
@@ -1294,7 +1345,15 @@ async function handleCallbackQuery(
         );
       }
     } catch (err) {
-      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+      await handleDecisionCallbackError(
+        ctx,
+        token,
+        query,
+        chatId,
+        messageId,
+        { kind: "approval_reject", id: approvalId, actor },
+        err,
+      );
     }
     return;
   }
