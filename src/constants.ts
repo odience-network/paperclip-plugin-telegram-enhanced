@@ -1,5 +1,5 @@
-export const PLUGIN_ID = "paperclip-plugin-telegram";
-export const PLUGIN_VERSION = "0.3.0";
+export const PLUGIN_ID = "paperclip-plugin-telegram-enhanced";
+export const PLUGIN_VERSION = "0.1.0";
 export const MAX_AGENTS_PER_THREAD = 5;
 
 export const DEFAULT_CONFIG = {

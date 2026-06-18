@@ -1,7 +1,9 @@
-# paperclip-plugin-telegram
+# paperclip-plugin-telegram-enhanced
 
-[![npm](https://img.shields.io/npm/v/paperclip-plugin-telegram)](https://www.npmjs.com/package/paperclip-plugin-telegram)
+[![npm](https://img.shields.io/npm/v/@odience-network/paperclip-plugin-telegram-enhanced)](https://www.npmjs.com/package/@odience-network/paperclip-plugin-telegram-enhanced)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> **Enhanced fork** maintained by [Odience Network](https://github.com/odience-network). Derived from [mvanhorn/paperclip-plugin-telegram](https://github.com/mvanhorn/paperclip-plugin-telegram) (MIT) and extended with additional features and fixes integrated from upstream forks.
 
 Bidirectional Telegram integration for [Paperclip](https://github.com/paperclipai/paperclip). Push agent notifications to Telegram, receive bot commands, approve requests with inline buttons, gather community signals, run multi-agent sessions in threads, process media attachments, register custom commands, and deploy proactive agent suggestions.
 
@@ -142,7 +144,7 @@ This is that plugin.
 ## Install
 
 ```bash
-npm install paperclip-plugin-telegram
+npm install @odience-network/paperclip-plugin-telegram-enhanced
 ```
 
 Or register with your Paperclip instance directly:
@@ -150,7 +152,7 @@ Or register with your Paperclip instance directly:
 ```bash
 curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -H "Content-Type: application/json" \
-  -d '{"packageName":"paperclip-plugin-telegram"}'
+  -d '{"packageName":"@odience-network/paperclip-plugin-telegram-enhanced"}'
 ```
 
 > **Note — `paperclipai` master, post [#5429](https://github.com/paperclipai/paperclip/pull/5429) (2026-05-09):**
@@ -290,9 +292,19 @@ pnpm build
 
 ## Contributing
 
-Issues and PRs welcome at [github.com/mvanhorn/paperclip-plugin-telegram](https://github.com/mvanhorn/paperclip-plugin-telegram).
+Issues and PRs welcome at [github.com/odience-network/paperclip-plugin-telegram-enhanced](https://github.com/odience-network/paperclip-plugin-telegram-enhanced).
 
-Auto-publishes to npm on push to `main` via OIDC trusted publishing.
+This is an enhanced fork of [mvanhorn/paperclip-plugin-telegram](https://github.com/mvanhorn/paperclip-plugin-telegram); upstream improvements are integrated with attribution.
+
+### Releases
+
+Publishing to npm is **release-gated**, not push-gated. The [`Publish to npm`](.github/workflows/publish.yml) workflow runs only when a GitHub Release is published (or via manual `workflow_dispatch`), and it no-ops unless the `NPM_TOKEN` secret is configured. To cut a release:
+
+1. Bump `version` in `package.json` (and `PLUGIN_VERSION` in `src/constants.ts`).
+2. Merge to `main`.
+3. Publish a GitHub Release tagged `vX.Y.Z`.
+
+The workflow skips automatically if the version is already on npm.
 
 ## Credits
 

@@ -4,6 +4,7 @@ import {
   usePluginData,
   type PluginSettingsPageProps,
 } from "@paperclipai/plugin-sdk/ui";
+import { PLUGIN_ID } from "../constants.js";
 
 type BoardAccessRegistration = {
   configured: boolean;
@@ -112,7 +113,7 @@ type PluginConfigResponse = {
   configJson?: Record<string, unknown> | null;
 } | null;
 
-const TELEGRAM_PLUGIN_ID = "paperclip-plugin-telegram";
+const TELEGRAM_PLUGIN_ID = PLUGIN_ID;
 
 const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
   defaultChatId: "",

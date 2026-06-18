@@ -8,7 +8,7 @@ const manifest: PaperclipPluginManifestV1 = {
   displayName: "Telegram Bot",
   description:
     "Bidirectional Telegram integration: push notifications, bot commands, escalation to humans, multi-agent sessions (native + ACP), media pipeline with transcription, custom workflow commands, and proactive suggestion watches.",
-  author: "mvanhorn",
+  author: "Odience Network",
   categories: ["connector", "automation"],
   capabilities: [
     "companies.read",
