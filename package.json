@@ -1,11 +1,15 @@
 {
-  "name": "paperclip-plugin-telegram",
+  "name": "@odience/paperclip-plugin-telegram-enhanced",
   "version": "0.6.1",
+  "description": "Enhanced Telegram plugin for Paperclip — ACP bridge, topic-to-project mapping, allowlists, and watch registry.",
   "type": "module",
   "main": "./dist/index.js",
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc",
@@ -35,7 +39,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mvanhorn/paperclip-plugin-telegram.git"
+    "url": "git+https://github.com/odience-network/paperclip-plugin-telegram-enhanced.git"
+  },
+  "homepage": "https://github.com/odience-network/paperclip-plugin-telegram-enhanced#readme",
+  "bugs": {
+    "url": "https://github.com/odience-network/paperclip-plugin-telegram-enhanced/issues"
   },
   "license": "MIT"
 }

@@ -1,6 +1,6 @@
 # Telegram Bot for Paperclip — Notifications, Approvals & Multi-Agent Chat Ops
 
-[![npm](https://img.shields.io/npm/v/paperclip-plugin-telegram)](https://www.npmjs.com/package/paperclip-plugin-telegram)
+[![npm](https://img.shields.io/npm/v/@odience/paperclip-plugin-telegram-enhanced)](https://www.npmjs.com/package/@odience/paperclip-plugin-telegram-enhanced)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > Run your [Paperclip](https://github.com/paperclipai/paperclip) AI agents from Telegram. Get instant notifications, approve requests with one tap, chat with multiple agents in a thread, send voice notes that turn into tasks, and build your own slash commands — all without leaving your chat app.
@@ -69,7 +69,7 @@ Copy the `chat.id` from the response.
 **3. Install the plugin**
 
 ```bash
-npm install paperclip-plugin-telegram
+npm install @odience/paperclip-plugin-telegram-enhanced
 ```
 
 Or register it with a running Paperclip instance:
@@ -77,7 +77,7 @@ Or register it with a running Paperclip instance:
 ```bash
 curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -H "Content-Type: application/json" \
-  -d '{"packageName":"paperclip-plugin-telegram"}'
+  -d '{"packageName":"@odience/paperclip-plugin-telegram-enhanced"}'
 ```
 
 **4. Store your bot token as a Paperclip secret**
