@@ -7,6 +7,8 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  formatIssueBlocked,
+  formatBoardMention,
 } from "../src/formatters.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
@@ -245,5 +247,42 @@ describe("formatAgentRunFinished", () => {
   it("disables notification", () => {
     const msg = formatAgentRunFinished(mockEvent());
     expect(msg.options.disableNotification).toBe(true);
+  });
+});
+
+describe("formatIssueBlocked", () => {
+  it("renders identifier, title and assignee", () => {
+    const msg = formatIssueBlocked(
+      mockEvent({ status: "blocked", assigneeName: "Alice", comment: "waiting on infra" }),
+    );
+    expect(msg.text).toContain("Blocked");
+    expect(msg.text).toContain("PROJ\\-42");
+    expect(msg.text).toContain("Alice");
+    expect(msg.text).toContain("waiting on infra");
+    expect(msg.options.parseMode).toBe("MarkdownV2");
+  });
+
+  it("falls back to entityId when no identifier", () => {
+    const msg = formatIssueBlocked(mockEvent({ identifier: undefined }));
+    expect(msg.text).toContain("iss\\-123");
+  });
+});
+
+describe("formatBoardMention", () => {
+  it("renders the mention with author and body", () => {
+    const msg = formatBoardMention(
+      mockEvent({ authorName: "Bob", body: "ping @board for sign-off" }),
+    );
+    expect(msg.text).toContain("Board Mention");
+    expect(msg.text).toContain("Bob");
+    expect(msg.text).toContain("sign\\-off");
+    expect(msg.options.parseMode).toBe("MarkdownV2");
+  });
+
+  it("derives identifier from issueIdentifier fallback", () => {
+    const msg = formatBoardMention(
+      mockEvent({ identifier: undefined, issueIdentifier: "PROJ-99", body: "@board" }),
+    );
+    expect(msg.text).toContain("PROJ\\-99");
   });
 });

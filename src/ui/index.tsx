@@ -57,6 +57,9 @@ type TelegramRoutingConfig = {
   notifyOnIssueDone: boolean;
   notifyOnIssueAssigned: boolean;
   onlyNotifyIfAssignedTo: string;
+  notifyOnIssueBlocked: boolean;
+  notifyOnBoardMention: boolean;
+  boardUsernames: string;
   approvalsChatId: string;
   approvalsTopicId: string;
   notifyOnApprovalCreated: boolean;
@@ -135,6 +138,9 @@ const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
   notifyOnIssueDone: true,
   notifyOnIssueAssigned: false,
   onlyNotifyIfAssignedTo: "",
+  notifyOnIssueBlocked: false,
+  notifyOnBoardMention: false,
+  boardUsernames: "",
   approvalsChatId: "",
   approvalsTopicId: "",
   notifyOnApprovalCreated: true,
@@ -237,6 +243,15 @@ function asStringArray(value: unknown): string[] {
     : [];
 }
 
+// board usernames may be persisted as an array (worker-side) or a raw string
+// (this text field). Always render a comma-separated string for the input.
+function asBoardUsernamesString(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).join(", ");
+  }
+  return typeof value === "string" ? value : "";
+}
+
 function asDigestMode(value: unknown): TelegramRoutingConfig["digestMode"] {
   return value === "daily" || value === "bidaily" || value === "tridaily" ? value : "off";
 }
@@ -304,6 +319,15 @@ function extractRoutingConfig(config: Record<string, unknown>): TelegramRoutingC
       DEFAULT_ROUTING_CONFIG.notifyOnIssueAssigned,
     ),
     onlyNotifyIfAssignedTo: asString(config.onlyNotifyIfAssignedTo),
+    notifyOnIssueBlocked: asBoolean(
+      config.notifyOnIssueBlocked,
+      DEFAULT_ROUTING_CONFIG.notifyOnIssueBlocked,
+    ),
+    notifyOnBoardMention: asBoolean(
+      config.notifyOnBoardMention,
+      DEFAULT_ROUTING_CONFIG.notifyOnBoardMention,
+    ),
+    boardUsernames: asBoardUsernamesString(config.boardUsernames),
     approvalsChatId: asString(config.approvalsChatId),
     approvalsTopicId: asString(config.approvalsTopicId),
     notifyOnApprovalCreated: asBoolean(
@@ -1788,6 +1812,20 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                   Send a Telegram notification when an issue assignee changes.
                 </span>
               </label>
+              <label style={{ color: "#374151", display: "grid", gap: 3, fontSize: 13 }}>
+                <span style={{ alignItems: "center", display: "flex", gap: 8 }}>
+                  <input
+                    checked={routingConfig.notifyOnIssueBlocked}
+                    disabled={routingLoading || routingSaving}
+                    onChange={(event) => updateRoutingField("notifyOnIssueBlocked", event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                  Blocked
+                </span>
+                <span style={{ color: "#6b7280", fontSize: 12, marginLeft: 22 }}>
+                  Notify when an issue becomes blocked and is owned by a human/board user. Agent-only blocks are ignored to reduce noise.
+                </span>
+              </label>
             </div>
             <label style={{ display: "grid", gap: 5 }}>
               <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Only when assigned to user ID</span>
@@ -1809,6 +1847,42 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                 Optional. Restricts assignment-change notifications to issues assigned to this Paperclip user.
               </span>
             </label>
+            <div style={{ display: "grid", gap: 10 }}>
+              <label style={{ color: "#374151", display: "grid", gap: 3, fontSize: 13 }}>
+                <span style={{ alignItems: "center", display: "flex", gap: 8 }}>
+                  <input
+                    checked={routingConfig.notifyOnBoardMention}
+                    disabled={routingLoading || routingSaving}
+                    onChange={(event) => updateRoutingField("notifyOnBoardMention", event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                  Board mentions
+                </span>
+                <span style={{ color: "#6b7280", fontSize: 12, marginLeft: 22 }}>
+                  Notify when an issue comment @-mentions one of the board usernames below. Matching is case-insensitive and word-boundary aware.
+                </span>
+              </label>
+              <label style={{ display: "grid", gap: 5 }}>
+                <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Board usernames</span>
+                <input
+                  disabled={routingLoading || routingSaving || !routingConfig.notifyOnBoardMention}
+                  onChange={(event) => updateRoutingField("boardUsernames", event.currentTarget.value)}
+                  placeholder="ceo, board (comma-separated, no @)"
+                  style={{
+                    border: "1px solid #d1d5db",
+                    borderRadius: 8,
+                    fontSize: 14,
+                    minWidth: 0,
+                    padding: "9px 10px",
+                  }}
+                  type="text"
+                  value={routingConfig.boardUsernames}
+                />
+                <span style={{ color: "#6b7280", fontSize: 12 }}>
+                  Comma- or space-separated handles. A comment forwards only when it contains <code>@&lt;handle&gt;</code> for one of these.
+                </span>
+              </label>
+            </div>
           </section>
 
           <RoutingRow

@@ -157,6 +157,64 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
   };
 }
 
+export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? event.entityId);
+  const title = String(p.title ?? "Untitled");
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const reason = p.comment ? String(p.comment) : null;
+
+  const lines: string[] = [
+    `${esc("🚫")} ${bold("Issue Blocked")}: ${issueLink(identifier, opts)}`,
+    bold(title),
+  ];
+
+  if (assigneeName) lines.push(`Assignee: ${esc(assigneeName)}`);
+
+  if (reason) {
+    const truncated = truncateAtWord(reason, 300);
+    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+  }
+
+  const button = issueButton(identifier, opts);
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
+export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? p.issueIdentifier ?? p.issueId ?? event.entityId);
+  const title = p.title ?? p.issueTitle ? String(p.title ?? p.issueTitle) : null;
+  const author = p.authorName ?? p.author ?? p.userName ?? p.agentName;
+  const authorName = author ? String(author) : null;
+  const body = String(p.body ?? p.comment ?? p.text ?? "");
+
+  const lines: string[] = [
+    `${esc("📣")} ${bold("Board Mention")}: ${issueLink(identifier, opts)}`,
+  ];
+  if (title) lines.push(bold(title));
+  if (authorName) lines.push(`From: ${esc(authorName)}`);
+
+  if (body) {
+    const truncated = truncateAtWord(body, 300);
+    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+  }
+
+  const button = issueButton(identifier, opts);
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
 export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
