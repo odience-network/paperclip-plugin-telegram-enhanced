@@ -49,6 +49,7 @@ import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
+import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
 
 type TelegramConfig = {
@@ -450,6 +451,7 @@ const plugin = definePlugin({
       formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
       overrideTopicId?: string,
+      deliveryKey?: string,
     ) => {
       const chatId = await resolveChat(
         ctx,
@@ -486,7 +488,22 @@ const plugin = definePlugin({
         }
       }
 
-      const messageId = await sendMessage(ctx, token, chatId, msg.text, msg.options);
+      // Durable idempotency guard: claim a delivery slot before sending so a
+      // duplicate event re-emission or a retried worker run cannot send the
+      // same notification twice. A failed send releases the claim so a later
+      // retry can re-attempt. Keyed by chat+topic+logical-event so the same
+      // entity notified in different chats/topics is not falsely suppressed.
+      const effectiveDeliveryKey = buildDeliveryKey(
+        chatId,
+        messageThreadId ?? "",
+        deliveryKey ?? `${event.eventType}:${event.entityId ?? event.eventId}`,
+      );
+
+      const messageId = await withIdempotentDelivery(
+        ctx,
+        effectiveDeliveryKey,
+        () => sendMessage(ctx, token, chatId, msg.text, msg.options),
+      );
 
       if (messageId) {
         await ctx.state.set(
@@ -557,7 +574,7 @@ const plugin = definePlugin({
             }
           } catch { /* best effort */ }
         }
-        await notify(event, formatIssueDone);
+        await notify(event, formatIssueDone, undefined, undefined, `done|${event.entityId}`);
       });
     }
 
@@ -599,7 +616,7 @@ const plugin = definePlugin({
           } catch { /* best effort */ }
         }
 
-        await notify(event, formatIssueAssigned);
+        await notify(event, formatIssueAssigned, undefined, undefined, dedupeKey);
       });
     }
 
@@ -678,7 +695,7 @@ const plugin = definePlugin({
         const errorMessage = normalizeAgentErrorMessage(payload.error ?? payload.message);
         const dedupeKey = ["agent.run.failed", event.companyId, agentId, errorMessage].join(":");
         if (!agentErrorDedupe(dedupeKey)) return;
-        await notify(event, formatAgentError, config.errorsChatId, config.errorsTopicId);
+        await notify(event, formatAgentError, config.errorsChatId, config.errorsTopicId, dedupeKey);
       });
     }
 
