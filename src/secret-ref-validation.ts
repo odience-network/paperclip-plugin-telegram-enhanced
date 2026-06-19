@@ -6,8 +6,12 @@ export type SecretRefConfig = {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// telegramBotTokenRef is optional: the bot token can instead be connected
+// instance-wide via the Settings "Bot Connection" flow, which stores the raw
+// token in instance-scoped plugin state (see worker.ts BOT_CONNECTION_SCOPE).
+// When a secret ref *is* provided it must still be a valid secret UUID.
 const FIELDS = [
-  { key: "telegramBotTokenRef", required: true },
+  { key: "telegramBotTokenRef", required: false },
   { key: "paperclipBoardApiTokenRef", required: false },
   { key: "transcriptionApiKeyRef", required: false },
 ] as const;

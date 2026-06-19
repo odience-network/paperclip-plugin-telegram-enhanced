@@ -263,6 +263,33 @@ export async function answerCallbackQuery(
   }
 }
 
+export type TelegramBotInfo = {
+  id: number;
+  username?: string;
+  first_name?: string;
+};
+
+/**
+ * Validate a bot token and fetch the bot identity via Telegram getMe.
+ * Returns null when the token is rejected or the call fails, so callers can
+ * treat a non-null result as proof the token is live.
+ */
+export async function getMe(
+  ctx: PluginContext,
+  token: string,
+): Promise<TelegramBotInfo | null> {
+  try {
+    const res = await ctx.http.fetch(`${TELEGRAM_API}/bot${token}/getMe`, {
+      method: "GET",
+    });
+    const data = (await res.json()) as { ok: boolean; result?: TelegramBotInfo };
+    return data.ok && data.result ? data.result : null;
+  } catch (err) {
+    ctx.logger.error("Telegram getMe failed", { error: String(err) });
+    return null;
+  }
+}
+
 export async function setMyCommands(
   ctx: PluginContext,
   token: string,
