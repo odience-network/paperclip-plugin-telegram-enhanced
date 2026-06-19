@@ -93,6 +93,7 @@ type TelegramConfig = {
     chatId: string;
     topicId?: string;
   }>;
+  opsRoutes?: TelegramOpsRoute[];
   digestMode: "off" | "daily" | "bidaily" | "tridaily";
   dailyDigestTime: string;
   bidailySecondTime: string;
@@ -445,6 +446,96 @@ async function resolveIssueIdentifierForFileRoute(
     const issueCompanyId = (issue as unknown as Record<string, unknown>).companyId;
     if (typeof issueCompanyId === "string" && issueCompanyId !== companyId) return null;
     return typeof issue.identifier === "string" ? issue.identifier : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- TEL-23 (ant013): important vs. ops notification routing ---
+//
+// Run-lifecycle / "ops" events (agent.run.started / agent.run.finished) are
+// high-frequency chatter. When an operator configures an ops route for a
+// company, those events are diverted to a dedicated ops chat/topic so the
+// primary chat stays reserved for important signals (issues, approvals,
+// errors). When no ops route matches, ops events fall back to the normal
+// default-chat routing via notify(), exactly as before.
+//
+// Ported from ant013/paperclip-plugin-telegram (commit 8314854). The fuller
+// `resolveNotificationDestination` classifier in commit c0423e4 is intentionally
+// not adopted here: it routes *important* events through ops chats whenever a
+// project-key `file_route` misses, which is only safe when the `fileRoutes`
+// feature is present to catch important events first. That feature ships under a
+// separate ticket, so we keep the self-contained ops-only routing that preserves
+// "important stays on the primary chat" on this base.
+
+export type TelegramOpsRoute = {
+  name?: unknown;
+  enabled?: unknown;
+  companyId?: unknown;
+  companyName?: unknown;
+  chatId?: unknown;
+  topicId?: unknown;
+};
+
+type TelegramOpsDestination = {
+  chatId: string;
+  topicId?: string;
+  routeName?: string;
+};
+
+// A route counts as enabled unless it is explicitly disabled (enabled === false).
+// Legacy/hand-edited config that omits the flag is treated as enabled.
+function routeEnabled(value: unknown): boolean {
+  return value !== false;
+}
+
+export function resolveTelegramOpsDestination(
+  routes: unknown,
+  companyId: string,
+  companyName?: string | null,
+): TelegramOpsDestination | null {
+  if (!Array.isArray(routes)) return null;
+
+  const normalizedCompanyName = asNonEmptyString(companyName)?.toLowerCase() ?? null;
+  for (const route of routes) {
+    if (!isRecord(route) || !routeEnabled(route.enabled)) continue;
+
+    const chatId = asNonEmptyString(route.chatId);
+    if (!chatId) continue;
+
+    const routeCompanyId = asNonEmptyString(route.companyId);
+    const routeCompanyName = asNonEmptyString(route.companyName)?.toLowerCase() ?? null;
+    const matchesCompanyId = Boolean(routeCompanyId && routeCompanyId === companyId);
+    const matchesCompanyName = Boolean(
+      routeCompanyName && normalizedCompanyName && routeCompanyName === normalizedCompanyName,
+    );
+    if (!matchesCompanyId && !matchesCompanyName) continue;
+
+    return {
+      chatId,
+      topicId: asNonEmptyString(route.topicId) ?? undefined,
+      routeName: asNonEmptyString(route.name) ?? undefined,
+    };
+  }
+
+  return null;
+}
+
+export async function resolveOpsDestinationForEvent(
+  ctx: PluginContext,
+  config: Pick<TelegramConfig, "opsRoutes">,
+  event: PluginEvent,
+): Promise<TelegramOpsDestination | null> {
+  // First try the cheap path: direct companyId match needs no extra lookup.
+  const direct = resolveTelegramOpsDestination(config.opsRoutes, event.companyId);
+  if (direct) return direct;
+
+  // Fall back to companyName matching (routes configured by name), resolving the
+  // company lazily so we never pay the lookup when no name-based route exists.
+  if (!Array.isArray(config.opsRoutes) || config.opsRoutes.length === 0) return null;
+  try {
+    const company = await ctx.companies.get(event.companyId);
+    return resolveTelegramOpsDestination(config.opsRoutes, event.companyId, company?.name ?? null);
   } catch {
     return null;
   }
@@ -1071,16 +1162,35 @@ const plugin = definePlugin({
       }
     };
 
+    // Ops events route to a dedicated ops chat when an ops route matches the
+    // company; otherwise they fall back to the normal default-chat routing.
+    const notifyOps = async (
+      event: PluginEvent,
+      formatter: typeof formatAgentRunStarted,
+    ) => {
+      const opsDestination = await resolveOpsDestinationForEvent(ctx, config, event);
+      if (opsDestination) {
+        ctx.logger.info("Telegram ops notification routed", {
+          eventType: event.eventType,
+          companyId: event.companyId,
+          routeName: opsDestination.routeName,
+          chatId: opsDestination.chatId,
+          topicId: opsDestination.topicId,
+        });
+      }
+      await notify(event, formatter, opsDestination?.chatId, opsDestination?.topicId);
+    };
+
     if (config.notifyOnAgentRunStarted) {
       ctx.events.on("agent.run.started", async (event: PluginEvent) => {
         await enrichAgentName(event);
-        await notify(event, formatAgentRunStarted);
+        await notifyOps(event, formatAgentRunStarted);
       });
     }
     if (config.notifyOnAgentRunFinished) {
       ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
         await enrichAgentName(event);
-        await notify(event, formatAgentRunFinished);
+        await notifyOps(event, formatAgentRunFinished);
       });
     }
 
