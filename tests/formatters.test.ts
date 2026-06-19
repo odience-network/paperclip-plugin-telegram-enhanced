@@ -9,6 +9,7 @@ import {
   formatAgentRunFinished,
   formatIssueBlocked,
   formatBoardMention,
+  formatResolvedDecision,
 } from "../src/formatters.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
@@ -284,5 +285,39 @@ describe("formatBoardMention", () => {
       mockEvent({ identifier: undefined, issueIdentifier: "PROJ-99", body: "@board" }),
     );
     expect(msg.text).toContain("PROJ\\-99");
+  });
+});
+
+describe("formatResolvedDecision", () => {
+  it("preserves original card context and appends an approved footer", () => {
+    const original = "🔔 Approval requested\nPROJ-42 — Deploy to prod";
+    const text = formatResolvedDecision(original, "approved", "amir");
+    // original text is preserved (MarkdownV2-escaped) ...
+    expect(text).toContain("PROJ\\-42");
+    expect(text).toContain("Deploy to prod");
+    // ... and the resolution footer is appended on its own paragraph
+    expect(text).toContain("\n\n");
+    expect(text).toContain("*Approved* by amir");
+  });
+
+  it("renders a rejected footer", () => {
+    const text = formatResolvedDecision("Approval requested", "rejected", "jane");
+    expect(text).toContain("*Rejected* by jane");
+  });
+
+  it("falls back to just the footer when no original text is available", () => {
+    expect(formatResolvedDecision(undefined, "approved", "amir")).toBe(
+      "✅ *Approved* by amir",
+    );
+    expect(formatResolvedDecision("   ", "rejected", "amir")).toBe(
+      "❌ *Rejected* by amir",
+    );
+  });
+
+  it("escapes MarkdownV2 control characters in actor and original text", () => {
+    const text = formatResolvedDecision("done (mostly).", "approved", "a.b_c");
+    // dot and underscore in actor, parens/dot in body must be escaped
+    expect(text).toContain("a\\.b\\_c");
+    expect(text).toContain("\\(mostly\\)\\.");
   });
 });
