@@ -42,29 +42,19 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -d '{"packageName":"@odience-network/paperclip-plugin-telegram-enhanced"}'
 ```
 
-## 4. Store your bot token as a Paperclip secret
+## 4. Connect your bot (instance-wide)
 
-For security, the plugin references your bot token by a **secret UUID** rather than storing the raw value. Create the secret first, then reference it.
+The plugin runs **instance-wide** — one bot serves every company on the instance. Connect the bot once from the settings page:
 
-You can do this two ways:
+1. Open the Telegram plugin **Settings** page.
+2. In the **Bot Connection** section, paste your bot token from @BotFather.
+3. Click **Connect bot**.
 
-### Option A — Paperclip UI
+The token is validated live against Telegram (`getMe`) and stored **server-side in instance-scoped plugin state**. It is never shown again in the UI, and it is **not** a per-company secret — so every company can reach the board through this one bot.
 
-1. Open any agent's **Configuration → Environment variables**.
-2. Enter a name (e.g. `telegram-bot-token`) and paste the bot token as the value.
-3. Click **Create / Seal**.
-
-The secret is created at the **company level** (not bound to that agent, despite the agent-context UI), and the returned UUID can be used by any plugin in the company.
-
-### Option B — REST API
-
-```bash
-curl -X POST http://127.0.0.1:3100/api/companies/{companyId}/secrets \
-  -H "Content-Type: application/json" \
-  -d '{"name":"telegram-bot-token","value":"<your-bot-token>","provider":"local_encrypted"}'
-```
-
-The response contains the secret's **UUID**. Copy it — you'll paste it into `telegramBotTokenRef` next.
+> **Why not a company secret?** The bot is shared across all companies, so a single company-scoped secret is the wrong scope. The instance connection is also compatible with recent `paperclipai` master, which disables plugin secret-refs (post-#5429). See [Troubleshooting](troubleshooting.md#plugin-wont-activate--secret-references-rejected).
+>
+> **Legacy / advanced:** the old `telegramBotTokenRef` secret-UUID field still works as a fallback (under **Connection & URLs → advanced**) for existing installs.
 
 ## 5. Configure the plugin
 
@@ -72,7 +62,7 @@ Open the plugin settings and set, at minimum:
 
 | Setting | Value |
 |---------|-------|
-| `telegramBotTokenRef` | The secret **UUID** from step 4. |
+| Bot token | Connected in step 4 (**Bot Connection** section). |
 | `defaultChatId` | The chat ID from step 2. |
 
 Save the settings. You should now receive notifications when issues are created or completed.
