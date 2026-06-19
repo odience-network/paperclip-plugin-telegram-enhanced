@@ -95,6 +95,17 @@ type TelegramConnectionConfig = {
   paperclipPublicUrl: string;
 };
 
+// ODIAA-720: masked status of the instance-wide bot connection. The raw token
+// is never returned to the frontend — only whether a bot is connected and, for
+// the instance-state source, the bot identity reported by Telegram getMe.
+type BotConnectionRegistration = {
+  configured: boolean;
+  source: "instance-state" | "config-secret-ref" | null;
+  botUsername: string | null;
+  botId: string | null;
+  updatedAt: string | null;
+};
+
 type TelegramBoardConfig = {
   paperclipBoardApiTokenRef: string;
 };
@@ -682,6 +693,13 @@ async function resolveOrCreateCompanySecret(
 export function TelegramSettingsPage({ context }: PluginSettingsPageProps): React.JSX.Element {
   const boardAccess = usePluginData<BoardAccessRegistration>("board-access.read");
   const updateBoardAccess = usePluginAction("board-access.update");
+  // ODIAA-720: instance-wide bot connection.
+  const botConnection = usePluginData<BotConnectionRegistration>("telegram-connection.read");
+  const updateBotConnection = usePluginAction("telegram-connection.update");
+  const clearBotConnection = usePluginAction("telegram-connection.clear");
+  const [botTokenInput, setBotTokenInput] = useState("");
+  const [botConnecting, setBotConnecting] = useState(false);
+  const [botConnectionMessage, setBotConnectionMessage] = useState<Notice | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [routingConfig, setRoutingConfig] = useState<TelegramRoutingConfig>(DEFAULT_ROUTING_CONFIG);
@@ -1153,6 +1171,69 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     }
   }
 
+  // ODIAA-720: connect the bot instance-wide. The raw token is sent to the
+  // worker action (which validates it via Telegram getMe and stores it in
+  // instance-scoped state); the frontend keeps only the masked registration.
+  // We then re-save the plugin config so the host reloads the worker and it
+  // begins polling with the freshly connected token.
+  async function handleConnectBot(): Promise<void> {
+    const token = botTokenInput.trim();
+    if (!token) {
+      setBotConnectionMessage({ tone: "error", title: "Enter a bot token first" });
+      return;
+    }
+    setBotConnecting(true);
+    setBotConnectionMessage(null);
+    try {
+      const result = (await updateBotConnection({ token })) as BotConnectionRegistration;
+      // Touch the plugin config so the host reloads the worker and starts polling.
+      try {
+        await savePluginConfig(await fetchPluginConfig());
+      } catch {
+        // Non-fatal: the token is connected; the worker will pick it up on its
+        // next reload even if this touch fails.
+      }
+      setBotTokenInput("");
+      await botConnection.refresh?.();
+      const who = result?.botUsername ? `@${result.botUsername}` : "your bot";
+      setBotConnectionMessage({
+        tone: "success",
+        title: `Connected ${who} instance-wide`,
+        text: "The bot token is stored once for the whole instance — every company can now reach the board through this bot. No company secret required.",
+      });
+    } catch (error) {
+      setBotConnectionMessage({
+        tone: "error",
+        title: "Could not connect the bot",
+        text: getErrorMessage(error),
+      });
+    } finally {
+      setBotConnecting(false);
+    }
+  }
+
+  async function handleDisconnectBot(): Promise<void> {
+    setBotConnecting(true);
+    setBotConnectionMessage(null);
+    try {
+      await clearBotConnection({});
+      await botConnection.refresh?.();
+      setBotConnectionMessage({
+        tone: "success",
+        title: "Bot disconnected",
+        text: "The stored instance token was cleared. The plugin will idle until a bot is reconnected.",
+      });
+    } catch (error) {
+      setBotConnectionMessage({
+        tone: "error",
+        title: "Could not disconnect the bot",
+        text: getErrorMessage(error),
+      });
+    } finally {
+      setBotConnecting(false);
+    }
+  }
+
   async function handleSaveConnectionConfig(): Promise<void> {
     setConnectionSaving(true);
     setConnectionMessage(null);
@@ -1341,6 +1422,114 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
         </div>
       ) : null}
 
+      {/* ODIAA-720: instance-wide bot connection. The token is configured once
+          for the whole instance — no per-company secret required. */}
+      <section
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: 8,
+          display: "grid",
+          gap: 18,
+          padding: 18,
+        }}
+      >
+        <div style={{ display: "grid", gap: 4 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700, lineHeight: "28px", margin: 0 }}>Bot Connection</h2>
+          <p style={{ color: "#6b7280", margin: 0 }}>
+            Connect your Telegram bot once for the whole instance. Every company can then reach the board through this bot — no per-company secret needed. The token is validated with Telegram and stored securely server-side; it is never shown again here.
+          </p>
+        </div>
+
+        {botConnection.loading ? (
+          <p style={{ color: "#6b7280", margin: 0 }}>Checking bot connection…</p>
+        ) : botConnection.data?.configured ? (
+          <div
+            style={{
+              background: "#f0fdf4",
+              border: "1px solid #bbf7d0",
+              borderRadius: 8,
+              color: "#166534",
+              display: "grid",
+              gap: 4,
+              padding: 14,
+            }}
+          >
+            <strong>
+              {botConnection.data.source === "instance-state"
+                ? `Connected${botConnection.data.botUsername ? ` as @${botConnection.data.botUsername}` : ""} (instance-wide)`
+                : "Connected via legacy secret reference"}
+            </strong>
+            <span style={{ fontSize: 13 }}>
+              {botConnection.data.source === "instance-state"
+                ? "This bot serves every company on the instance."
+                : "Using the advanced telegramBotTokenRef secret below. Reconnect above to switch to the instance-wide token store."}
+            </span>
+          </div>
+        ) : (
+          <div
+            style={{
+              background: "#fffbeb",
+              border: "1px solid #fde68a",
+              borderRadius: 8,
+              color: "#92400e",
+              padding: 14,
+            }}
+          >
+            <strong>No bot connected.</strong> Paste a bot token from @BotFather below to connect.
+          </div>
+        )}
+
+        <div style={{ display: "grid", gap: 12 }}>
+          <TextField
+            disabled={botConnecting}
+            label="Telegram bot token"
+            onChange={(value) => setBotTokenInput(value)}
+            placeholder="123456789:AA…  (from @BotFather)"
+            type="password"
+            value={botTokenInput}
+          >
+            Pasted once and stored server-side for the whole instance. Leave blank to keep the current connection.
+          </TextField>
+        </div>
+
+        {botConnectionMessage ? <NoticeBlock notice={botConnectionMessage} /> : null}
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          {botConnection.data?.configured && botConnection.data.source === "instance-state" ? (
+            <button
+              disabled={botConnecting}
+              onClick={() => void handleDisconnectBot()}
+              style={{
+                background: "white",
+                border: "1px solid #d1d5db",
+                borderRadius: 8,
+                color: "#374151",
+                cursor: botConnecting ? "not-allowed" : "pointer",
+                fontWeight: 700,
+                padding: "10px 14px",
+              }}
+            >
+              Disconnect
+            </button>
+          ) : null}
+          <button
+            disabled={botConnecting || !botTokenInput.trim()}
+            onClick={() => void handleConnectBot()}
+            style={{
+              background: botConnecting || !botTokenInput.trim() ? "#9ca3af" : "#111827",
+              border: "none",
+              borderRadius: 8,
+              color: "white",
+              cursor: botConnecting || !botTokenInput.trim() ? "not-allowed" : "pointer",
+              fontWeight: 700,
+              padding: "10px 14px",
+            }}
+          >
+            {botConnecting ? "Connecting…" : "Connect bot"}
+          </button>
+        </div>
+      </section>
+
       <section
         style={{
           border: "1px solid #e5e7eb",
@@ -1353,19 +1542,19 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
         <div style={{ display: "grid", gap: 4 }}>
           <h2 style={{ fontSize: 18, fontWeight: 700, lineHeight: "28px", margin: 0 }}>Connection & URLs</h2>
           <p style={{ color: "#6b7280", margin: 0 }}>
-            Core connection values used by the Telegram worker. Save the bot token as a Paperclip secret and paste its secret UUID here.
+            Paperclip URLs used by the Telegram worker. The bot token is configured above in <strong>Bot Connection</strong>; the secret-ref field below is an advanced fallback for legacy installs.
           </p>
         </div>
 
         <div style={{ display: "grid", gap: 12 }}>
           <TextField
             disabled={connectionLoading || connectionSaving}
-            label="Telegram bot token secret ref"
+            label="Telegram bot token secret ref (advanced / legacy)"
             onChange={(value) => updateConnectionField("telegramBotTokenRef", value)}
             placeholder="Secret UUID from Paperclip settings"
             value={connectionConfig.telegramBotTokenRef}
           >
-            Secret UUID for your Telegram bot token from @BotFather. The plugin resolves this secret before polling Telegram.
+            Optional fallback. Secret UUID for your bot token. Prefer <strong>Bot Connection</strong> above — secret refs are company-scoped and are disabled on recent paperclipai master (post-#5429).
           </TextField>
           <TextField
             disabled={connectionLoading || connectionSaving}
@@ -2621,6 +2810,7 @@ function TextField({
   disabled,
   children,
   onChange,
+  type = "text",
 }: {
   label: string;
   value: string;
@@ -2628,11 +2818,13 @@ function TextField({
   disabled: boolean;
   children: React.ReactNode;
   onChange(value: string): void;
+  type?: "text" | "password";
 }): React.JSX.Element {
   return (
     <label style={{ display: "grid", gap: 5 }}>
       <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>{label}</span>
       <input
+        autoComplete={type === "password" ? "off" : undefined}
         disabled={disabled}
         onChange={(event) => onChange(event.currentTarget.value)}
         placeholder={placeholder}
@@ -2643,7 +2835,7 @@ function TextField({
           minWidth: 0,
           padding: "9px 10px",
         }}
-        type="text"
+        type={type}
         value={value}
       />
       <span style={{ color: "#6b7280", fontSize: 12 }}>{children}</span>
