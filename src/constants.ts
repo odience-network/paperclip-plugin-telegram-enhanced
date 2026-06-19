@@ -27,6 +27,25 @@ export const DEFAULT_CONFIG = {
   enableInbound: true,
   allowedTelegramUserIds: [] as string[],
   allowedTelegramChatIds: [] as string[],
+  // Project-key file routing (ant013 TEL-23): route outbound markdown documents
+  // to a Telegram chat/topic by Paperclip project key.
+  fileRoutes: [] as Array<{
+    name: string;
+    enabled: boolean;
+    projectKey: string;
+    chatId: string;
+    topicId?: string;
+  }>,
+  // TEL-23 (ant013): route run-lifecycle / "ops" chatter to dedicated ops chats
+  // per company, keeping the primary chat reserved for important signals.
+  opsRoutes: [] as Array<{
+    name: string;
+    enabled: boolean;
+    companyId?: string;
+    companyName?: string;
+    chatId: string;
+    topicId?: string;
+  }>,
   digestMode: "off" as "off" | "daily" | "bidaily" | "tridaily",
   dailyDigestTime: "09:00",
   bidailySecondTime: "17:00",

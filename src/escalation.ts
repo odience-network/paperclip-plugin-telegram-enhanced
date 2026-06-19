@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { sendMessage, editMessage, escapeMarkdownV2, truncateAtWord } from "./telegram-api.js";
 import { wakeAgentWithIssue } from "./acp-bridge.js";
+import { displayNameFromFields, resolveAgentDisplayName } from "./agent-labels.js";
 
 export type EscalationReason =
   | "low_confidence"
@@ -11,6 +12,7 @@ export type EscalationReason =
 export type EscalationEvent = {
   escalationId: string;
   agentId: string;
+  agentName?: string;
   companyId: string;
   reason: EscalationReason;
   context: {
@@ -42,6 +44,7 @@ export type EscalationResponse = {
 type StoredEscalation = {
   escalationId: string;
   agentId: string;
+  agentName?: string;
   companyId: string;
   reason: EscalationReason;
   agentReasoning: string;
@@ -83,12 +86,16 @@ export class EscalationManager {
     const confidence = event.context.confidenceScore != null
       ? ` \\(${esc(String(Math.round(event.context.confidenceScore * 100)))}%\\)`
       : "";
+    const agentLabel = displayNameFromFields(event.agentName)
+      ?? await resolveAgentDisplayName(ctx, event.companyId, event.agentId)
+      ?? event.agentId;
 
     const lines: string[] = [
-      `${esc("\u26a0\ufe0f")} *Escalation* \\- ${esc(reasonLabel)}${confidence}`,
+      `${esc("\u26a0\ufe0f")} *Escalation*`,
+      `${esc("Reason:")} ${esc(reasonLabel)}${confidence}`,
       "",
-      `*Agent:* ${esc(event.agentId)}`,
-      `*Reason:* ${esc(event.context.agentReasoning ? truncateAtWord(event.context.agentReasoning, 500) : "No details provided")}`,
+      `*Agent:* ${esc(agentLabel)}`,
+      `*Reasoning:* ${esc(event.context.agentReasoning ? truncateAtWord(event.context.agentReasoning, 500) : "No details provided")}`,
     ];
 
     if (event.context.suggestedActions.length > 0) {
@@ -135,6 +142,7 @@ export class EscalationManager {
     const stored: StoredEscalation = {
       escalationId: event.escalationId,
       agentId: event.agentId,
+      agentName: agentLabel,
       companyId: event.companyId,
       reason: event.reason,
       agentReasoning: event.context.agentReasoning,

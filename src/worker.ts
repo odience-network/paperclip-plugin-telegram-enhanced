@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import {
   sendMessage,
+  sendDocument,
   editMessage,
   answerCallbackQuery,
   setMyCommands,
@@ -17,6 +18,10 @@ import {
   GENERAL_TOPIC_THREAD_ID,
 } from "./telegram-api.js";
 import {
+  resolveTelegramFileDestination,
+  getTelegramFileRouteSaveErrors,
+} from "./file-routing.js";
+import {
   formatIssueCreated,
   formatIssueDone,
   formatIssueAssigned,
@@ -24,6 +29,9 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  formatIssueBlocked,
+  formatBoardMention,
+  formatResolvedDecision,
   type IssueLinksOpts,
 } from "./formatters.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
@@ -49,7 +57,17 @@ import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
-import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
+import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
+import {
+  shouldNotifyIssueBlocked,
+  shouldNotifyBoardMention,
+  parseBoardUsernames,
+} from "./notification-filters.js";
+import {
+  buildPaperclipAuthHeaders,
+  fetchPaperclipApi,
+  isAlreadyResolvedConflict,
+} from "./paperclip-api.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -72,10 +90,21 @@ type TelegramConfig = {
   notifyOnAgentError: boolean;
   notifyOnAgentRunStarted: boolean;
   notifyOnAgentRunFinished: boolean;
+  notifyOnIssueBlocked: boolean;
+  notifyOnBoardMention: boolean;
+  boardUsernames: string[];
   enableCommands: boolean;
   enableInbound: boolean;
   allowedTelegramUserIds: string[];
   allowedTelegramChatIds: string[];
+  fileRoutes: Array<{
+    name: string;
+    enabled: boolean;
+    projectKey: string;
+    chatId: string;
+    topicId?: string;
+  }>;
+  opsRoutes?: TelegramOpsRoute[];
   digestMode: "off" | "daily" | "bidaily" | "tridaily";
   dailyDigestTime: string;
   bidailySecondTime: string;
@@ -331,6 +360,425 @@ async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<str
   return mapping?.companyId ?? mapping?.companyName ?? chatId;
 }
 
+// --- Agent file-send action (ant013 TEL-8 / TEL-23) ---
+// Ported from ant013/paperclip-plugin-telegram: agent-callable "send to
+// Telegram" action with native markdown upload plus project-key file routing.
+const MAX_OUTBOUND_MARKDOWN_BYTES = 256 * 1024;
+const MAX_MARKDOWN_CAPTION_BYTES = 1024;
+const DEFAULT_MARKDOWN_FILENAME = "paperclip-message.md";
+const SECRET_FILENAME_TOKENS =
+  /(?:^|[^0-9A-Za-z])(?:secret|token|credential|password|private\-key)(?:$|[^0-9A-Za-z])/i;
+const UNSAFE_FILENAME_CHARS = /[\\/\u0000-\u001F\u007F]/;
+const FORBIDDEN_MARKDOWN_SOURCE_FIELDS = new Set([
+  "filePath",
+  "path",
+  "fileUrl",
+  "url",
+  "fileURL",
+  "fileUri",
+  "file_uri",
+  "uri",
+  "telegramFileId",
+  "telegram_file_id",
+  "file_id",
+  "file",
+  "files",
+  "binary",
+  "binaryContent",
+  "fileContent",
+  "content",
+]);
+
+type SendToTelegramResult = {
+  ok: boolean;
+  code?: string;
+  message?: string;
+  mode?: "message" | "document";
+  chatId?: string;
+  threadId?: number;
+  messageId?: number;
+  routeSource?: "explicit" | "file_route" | "legacy_fallback";
+  routeName?: string;
+  projectKey?: string;
+  issueIdentifier?: string;
+};
+
+function validateOutboundThreadId(value: unknown): number | "invalid" | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 1) return "invalid";
+  return value;
+}
+
+function validateMarkdownFilename(name: string): { ok: boolean; code?: string; message?: string } {
+  if (!name.toLowerCase().endsWith(".md")) {
+    return { ok: false, code: "non_markdown_file", message: "Markdown file uploads must use a .md extension." };
+  }
+
+  if (/^[A-Za-z]:/.test(name)) {
+    return { ok: false, code: "invalid_markdown_filename", message: "Markdown filename must be a safe basename." };
+  }
+
+  if (name.includes("/") || name.includes("\\") || name.includes("..")) {
+    return { ok: false, code: "invalid_markdown_filename", message: "Markdown filename must be a safe basename." };
+  }
+
+  if (UNSAFE_FILENAME_CHARS.test(name) || name.startsWith(".") || SECRET_FILENAME_TOKENS.test(name)) {
+    return { ok: false, code: "unsafe_filename", message: "Markdown filename is considered unsafe." };
+  }
+
+  return { ok: true };
+}
+
+function findUnsupportedMarkdownSourceField(params: Record<string, unknown>): string | null {
+  for (const key of FORBIDDEN_MARKDOWN_SOURCE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(params, key) && params[key] !== undefined) {
+      return key;
+    }
+  }
+  return null;
+}
+
+function makeTelegramToolError(
+  code: string,
+  message: string,
+  metadata: Pick<SendToTelegramResult, "projectKey" | "issueIdentifier"> = {},
+): SendToTelegramResult {
+  return { ok: false, code, message, ...metadata };
+}
+
+async function resolveIssueIdentifierForFileRoute(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+): Promise<string | null> {
+  try {
+    const issue = await ctx.issues.get(issueId, companyId);
+    if (!issue) return null;
+    const issueCompanyId = (issue as unknown as Record<string, unknown>).companyId;
+    if (typeof issueCompanyId === "string" && issueCompanyId !== companyId) return null;
+    return typeof issue.identifier === "string" ? issue.identifier : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- TEL-23 (ant013): important vs. ops notification routing ---
+//
+// Run-lifecycle / "ops" events (agent.run.started / agent.run.finished) are
+// high-frequency chatter. When an operator configures an ops route for a
+// company, those events are diverted to a dedicated ops chat/topic so the
+// primary chat stays reserved for important signals (issues, approvals,
+// errors). When no ops route matches, ops events fall back to the normal
+// default-chat routing via notify(), exactly as before.
+//
+// Ported from ant013/paperclip-plugin-telegram (commit 8314854). The fuller
+// `resolveNotificationDestination` classifier in commit c0423e4 is intentionally
+// not adopted here: it routes *important* events through ops chats whenever a
+// project-key `file_route` misses, which is only safe when the `fileRoutes`
+// feature is present to catch important events first. That feature ships under a
+// separate ticket, so we keep the self-contained ops-only routing that preserves
+// "important stays on the primary chat" on this base.
+
+export type TelegramOpsRoute = {
+  name?: unknown;
+  enabled?: unknown;
+  companyId?: unknown;
+  companyName?: unknown;
+  chatId?: unknown;
+  topicId?: unknown;
+};
+
+type TelegramOpsDestination = {
+  chatId: string;
+  topicId?: string;
+  routeName?: string;
+};
+
+// A route counts as enabled unless it is explicitly disabled (enabled === false).
+// Legacy/hand-edited config that omits the flag is treated as enabled.
+function routeEnabled(value: unknown): boolean {
+  return value !== false;
+}
+
+export function resolveTelegramOpsDestination(
+  routes: unknown,
+  companyId: string,
+  companyName?: string | null,
+): TelegramOpsDestination | null {
+  if (!Array.isArray(routes)) return null;
+
+  const normalizedCompanyName = asNonEmptyString(companyName)?.toLowerCase() ?? null;
+  for (const route of routes) {
+    if (!isRecord(route) || !routeEnabled(route.enabled)) continue;
+
+    const chatId = asNonEmptyString(route.chatId);
+    if (!chatId) continue;
+
+    const routeCompanyId = asNonEmptyString(route.companyId);
+    const routeCompanyName = asNonEmptyString(route.companyName)?.toLowerCase() ?? null;
+    const matchesCompanyId = Boolean(routeCompanyId && routeCompanyId === companyId);
+    const matchesCompanyName = Boolean(
+      routeCompanyName && normalizedCompanyName && routeCompanyName === normalizedCompanyName,
+    );
+    if (!matchesCompanyId && !matchesCompanyName) continue;
+
+    return {
+      chatId,
+      topicId: asNonEmptyString(route.topicId) ?? undefined,
+      routeName: asNonEmptyString(route.name) ?? undefined,
+    };
+  }
+
+  return null;
+}
+
+export async function resolveOpsDestinationForEvent(
+  ctx: PluginContext,
+  config: Pick<TelegramConfig, "opsRoutes">,
+  event: PluginEvent,
+): Promise<TelegramOpsDestination | null> {
+  // First try the cheap path: direct companyId match needs no extra lookup.
+  const direct = resolveTelegramOpsDestination(config.opsRoutes, event.companyId);
+  if (direct) return direct;
+
+  // Fall back to companyName matching (routes configured by name), resolving the
+  // company lazily so we never pay the lookup when no name-based route exists.
+  if (!Array.isArray(config.opsRoutes) || config.opsRoutes.length === 0) return null;
+  try {
+    const company = await ctx.companies.get(event.companyId);
+    return resolveTelegramOpsDestination(config.opsRoutes, event.companyId, company?.name ?? null);
+  } catch {
+    return null;
+  }
+}
+
+async function logSendToTelegramAttempt(
+  ctx: PluginContext,
+  runCtx: { companyId: string; agentId: string },
+  details: {
+    params: Record<string, unknown>;
+    mode: "message" | "document";
+    routeSource: "explicit" | "file_route" | "legacy_fallback";
+    routeName?: string;
+    chatId?: string;
+    threadId?: number;
+    projectKey?: string;
+    issueIdentifier?: string;
+    errorCode?: string;
+  },
+): Promise<void> {
+  ctx.logger.info("Telegram agent send routing decision", {
+    companyId: runCtx.companyId,
+    agentId: runCtx.agentId,
+    issueId: asNonEmptyString(details.params.issueId) ?? undefined,
+    issueIdentifier: details.issueIdentifier ?? asNonEmptyString(details.params.issueIdentifier) ?? undefined,
+    projectKey: details.projectKey ?? asNonEmptyString(details.params.projectKey) ?? undefined,
+    routeSource: details.routeSource,
+    routeName: details.routeName,
+    chatId: details.chatId,
+    topicId: details.threadId,
+    contentMode: details.mode,
+    errorCode: details.errorCode,
+  });
+}
+
+export async function sendToTelegramTool(
+  ctx: PluginContext,
+  token: string,
+  config: Pick<TelegramConfig, "defaultChatId" | "allowedTelegramChatIds" | "fileRoutes">,
+  params: unknown,
+  runCtx: { companyId: string; agentId: string },
+): Promise<{ content: string; data: SendToTelegramResult }> {
+  const p = isRecord(params) ? params : {};
+  if (findUnsupportedMarkdownSourceField(p)) {
+    const result = makeTelegramToolError("unsupported_file_source", "Only text and markdownContent are supported.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  const text = asNonEmptyString(p.text);
+  const markdownContent = asNonEmptyString(p.markdownContent);
+  if (!text && !markdownContent) {
+    const result = makeTelegramToolError("missing_content", "At least one of text or markdownContent is required.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  const explicitChatId = asNonEmptyString(p.chatId);
+  const threadId = validateOutboundThreadId(p.threadId);
+  if (threadId === "invalid") {
+    const result = makeTelegramToolError("invalid_thread", "threadId must be a positive integer.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  const replyToMessageId = validateOutboundThreadId(p.replyToMessageId);
+  if (replyToMessageId === "invalid") {
+    const result = makeTelegramToolError("invalid_thread", "replyToMessageId must be a positive integer.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  const parseMode = p.parseMode === "MarkdownV2" || p.parseMode === "HTML" ? p.parseMode : undefined;
+  const requestedMarkdownFileName = asNonEmptyString(p.markdownFileName) ?? DEFAULT_MARKDOWN_FILENAME;
+  const sessionId = asNonEmptyString(p.sessionId);
+
+  if (markdownContent && Buffer.byteLength(markdownContent, "utf-8") > MAX_OUTBOUND_MARKDOWN_BYTES) {
+    const result = makeTelegramToolError("markdown_too_large", "Markdown content exceeds size limits.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  if (markdownContent && text && Buffer.byteLength(text, "utf-8") > MAX_MARKDOWN_CAPTION_BYTES) {
+    const result = makeTelegramToolError("caption_too_large", "Caption exceeds Telegram caption size limits.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  if (markdownContent) {
+    const markdownFileValidation = validateMarkdownFilename(requestedMarkdownFileName);
+    if (!markdownFileValidation.ok) {
+      const result = makeTelegramToolError(
+        markdownFileValidation.code!,
+        markdownFileValidation.message!,
+      );
+      return { content: JSON.stringify(result), data: result };
+    }
+  }
+
+  const destination = markdownContent
+    ? await resolveTelegramFileDestination(config.fileRoutes, {
+      explicitChatId,
+      explicitThreadId: typeof threadId === "number" ? threadId : undefined,
+      issueId: asNonEmptyString(p.issueId),
+      issueIdentifier: asNonEmptyString(p.issueIdentifier),
+      projectKey: asNonEmptyString(p.projectKey),
+      lookupIssueIdentifier: (issueId) => resolveIssueIdentifierForFileRoute(ctx, runCtx.companyId, issueId),
+    })
+    : null;
+
+  if (destination && !destination.ok) {
+    const result = makeTelegramToolError(destination.code, destination.message, {
+      projectKey: destination.projectKey,
+      issueIdentifier: destination.issueIdentifier,
+    });
+    await logSendToTelegramAttempt(ctx, runCtx, {
+      params: p,
+      mode: markdownContent ? "document" : "message",
+      routeSource: "file_route",
+      projectKey: destination.projectKey,
+      issueIdentifier: destination.issueIdentifier,
+      errorCode: destination.code,
+    });
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  const routeSource = destination?.ok ? destination.source : explicitChatId ? "explicit" : "legacy_fallback";
+  const chatId = destination?.ok && destination.source === "file_route"
+    ? destination.chatId
+    : explicitChatId ?? await resolveChat(ctx, runCtx.companyId, config.defaultChatId);
+  if (!chatId) {
+    const result = makeTelegramToolError("disallowed_chat", "No Telegram chat configured.");
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  const allowedChatIds = Array.isArray(config.allowedTelegramChatIds)
+    ? config.allowedTelegramChatIds.map(String).filter(Boolean)
+    : [];
+  if (explicitChatId) {
+    if (allowedChatIds.length === 0) {
+      const result = makeTelegramToolError("disallowed_chat", "Explicit Telegram chat IDs are not allowed.");
+      return { content: JSON.stringify(result), data: result };
+    }
+    if (!allowedChatIds.includes(explicitChatId)) {
+      const result = makeTelegramToolError("disallowed_chat", "Telegram chat is not allowed for agent outbound delivery.");
+      return { content: JSON.stringify(result), data: result };
+    }
+  }
+
+  const outboundThreadId = destination?.ok && destination.source === "file_route"
+    ? destination.topicId
+    : threadId;
+  const result: SendToTelegramResult = markdownContent
+    ? await sendDocument(ctx, token, chatId, markdownContent, {
+      filename: requestedMarkdownFileName,
+      caption: text ?? undefined,
+      parseMode,
+      messageThreadId: outboundThreadId,
+      replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
+      disableNotification: p.silent === true,
+    }).then((messageId) => {
+      if (!messageId) {
+        return makeTelegramToolError("telegram_send_failed", "Telegram send failed.");
+      }
+      return {
+        ok: true,
+        mode: "document",
+        chatId,
+        threadId: outboundThreadId,
+        messageId,
+        routeSource,
+        routeName: destination?.ok ? destination.routeName : undefined,
+        projectKey: destination?.ok ? destination.projectKey : undefined,
+        issueIdentifier: destination?.ok ? destination.issueIdentifier : undefined,
+      } as SendToTelegramResult;
+    })
+    : await sendMessage(ctx, token, chatId, text!, {
+      parseMode,
+      messageThreadId: outboundThreadId,
+      replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
+      disableNotification: p.silent === true,
+    }).then((messageId) => {
+      if (!messageId) {
+        return makeTelegramToolError("telegram_send_failed", "Telegram send failed.");
+      }
+      return {
+        ok: true,
+        mode: "message",
+        chatId,
+        threadId: outboundThreadId,
+        messageId,
+        routeSource,
+      } as SendToTelegramResult;
+    });
+
+  if (!result.ok) {
+    await logSendToTelegramAttempt(ctx, runCtx, {
+      params: p,
+      mode: markdownContent ? "document" : "message",
+      chatId,
+      threadId: outboundThreadId,
+      routeSource,
+      routeName: destination?.ok ? destination.routeName : undefined,
+      projectKey: destination?.ok ? destination.projectKey : undefined,
+      issueIdentifier: destination?.ok ? destination.issueIdentifier : undefined,
+      errorCode: result.code,
+    });
+    return { content: JSON.stringify(result), data: result };
+  }
+
+  if (sessionId) {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `agent_msg_${chatId}_${result.messageId}` },
+      { sessionId },
+    );
+  }
+
+  await ctx.activity.log({
+    companyId: runCtx.companyId,
+    message: "Agent sent content to Telegram",
+    entityType: "agent",
+    entityId: runCtx.agentId,
+    metadata: {
+      chatId,
+      threadId: outboundThreadId,
+      mode: result.mode,
+      messageId: result.messageId,
+      routeSource: result.routeSource,
+      routeName: destination?.ok ? destination.routeName : undefined,
+      projectKey: destination?.ok ? destination.projectKey : undefined,
+      issueId: asNonEmptyString(p.issueId) ?? undefined,
+      issueIdentifier: destination?.ok ? destination.issueIdentifier : asNonEmptyString(p.issueIdentifier) ?? undefined,
+    },
+  });
+
+  return { content: JSON.stringify(result), data: result };
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
     const rawConfig = await ctx.config.get();
@@ -362,6 +810,23 @@ const plugin = definePlugin({
     }
 
     const token = await ctx.secrets.resolve(config.telegramBotTokenRef);
+
+    // --- Agent file-send action (ant013 TEL-8 / TEL-23) ---
+    // Expose the send tool as a directly-invokable action so non-tool callers
+    // (smoke checks, other plugins) can route text/markdown to Telegram.
+    const runActionContext = (params: Record<string, unknown>) => ({
+      companyId: asNonEmptyString(params.companyId) ?? "system",
+      agentId: asNonEmptyString(params.agentId) ?? "system",
+    });
+
+    const invokeSendToTelegramAction = async (params: Record<string, unknown>) => {
+      const runCtx = runActionContext(params);
+      const result = await sendToTelegramTool(ctx, token, config, params, runCtx);
+      return { content: result.content, data: result.data };
+    };
+
+    ctx.actions.register("send_to_telegram", (params) => invokeSendToTelegramAction(params as Record<string, unknown>));
+    ctx.actions.register("send_file_to_telegram", (params) => invokeSendToTelegramAction(params as Record<string, unknown>));
 
     // --- Register bot commands with Telegram ---
     if (config.enableCommands) {
@@ -450,6 +915,7 @@ const plugin = definePlugin({
       formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
       overrideTopicId?: string,
+      deliveryKey?: string,
     ) => {
       const chatId = await resolveChat(
         ctx,
@@ -486,7 +952,22 @@ const plugin = definePlugin({
         }
       }
 
-      const messageId = await sendMessage(ctx, token, chatId, msg.text, msg.options);
+      // Durable idempotency guard: claim a delivery slot before sending so a
+      // duplicate event re-emission or a retried worker run cannot send the
+      // same notification twice. A failed send releases the claim so a later
+      // retry can re-attempt. Keyed by chat+topic+logical-event so the same
+      // entity notified in different chats/topics is not falsely suppressed.
+      const effectiveDeliveryKey = buildDeliveryKey(
+        chatId,
+        messageThreadId ?? "",
+        deliveryKey ?? `${event.eventType}:${event.entityId ?? event.eventId}`,
+      );
+
+      const messageId = await withIdempotentDelivery(
+        ctx,
+        effectiveDeliveryKey,
+        () => sendMessage(ctx, token, chatId, msg.text, msg.options),
+      );
 
       if (messageId) {
         await ctx.state.set(
@@ -557,7 +1038,7 @@ const plugin = definePlugin({
             }
           } catch { /* best effort */ }
         }
-        await notify(event, formatIssueDone);
+        await notify(event, formatIssueDone, undefined, undefined, `done|${event.entityId}`);
       });
     }
 
@@ -599,7 +1080,7 @@ const plugin = definePlugin({
           } catch { /* best effort */ }
         }
 
-        await notify(event, formatIssueAssigned);
+        await notify(event, formatIssueAssigned, undefined, undefined, dedupeKey);
       });
     }
 
@@ -678,7 +1159,7 @@ const plugin = definePlugin({
         const errorMessage = normalizeAgentErrorMessage(payload.error ?? payload.message);
         const dedupeKey = ["agent.run.failed", event.companyId, agentId, errorMessage].join(":");
         if (!agentErrorDedupe(dedupeKey)) return;
-        await notify(event, formatAgentError, config.errorsChatId, config.errorsTopicId);
+        await notify(event, formatAgentError, config.errorsChatId, config.errorsTopicId, dedupeKey);
       });
     }
 
@@ -692,16 +1173,111 @@ const plugin = definePlugin({
       }
     };
 
+    // Ops events route to a dedicated ops chat when an ops route matches the
+    // company; otherwise they fall back to the normal default-chat routing.
+    const notifyOps = async (
+      event: PluginEvent,
+      formatter: typeof formatAgentRunStarted,
+    ) => {
+      const opsDestination = await resolveOpsDestinationForEvent(ctx, config, event);
+      if (opsDestination) {
+        ctx.logger.info("Telegram ops notification routed", {
+          eventType: event.eventType,
+          companyId: event.companyId,
+          routeName: opsDestination.routeName,
+          chatId: opsDestination.chatId,
+          topicId: opsDestination.topicId,
+        });
+      }
+      await notify(event, formatter, opsDestination?.chatId, opsDestination?.topicId);
+    };
+
     if (config.notifyOnAgentRunStarted) {
       ctx.events.on("agent.run.started", async (event: PluginEvent) => {
         await enrichAgentName(event);
-        await notify(event, formatAgentRunStarted);
+        await notifyOps(event, formatAgentRunStarted);
       });
     }
     if (config.notifyOnAgentRunFinished) {
       ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
         await enrichAgentName(event);
-        await notify(event, formatAgentRunFinished);
+        await notifyOps(event, formatAgentRunFinished);
+      });
+    }
+
+    // --- Anti-flood filters (TWB-94, tue-Jonas/paperclip-plugin-telegram @03b6e99) ---
+
+    // Forward issue.updated as a "blocked" notification only when the issue is
+    // genuinely blocked AND a human/board user owns it (assigneeUserId non-null).
+    if (config.notifyOnIssueBlocked) {
+      const blockedDedupe = makeUpdateDedupe();
+      ctx.events.on("issue.updated", async (event: PluginEvent) => {
+        const payload = event.payload as Record<string, unknown>;
+        // Cheap pre-gate so we never fetch the issue for non-blocked updates.
+        if (payload.status !== "blocked") return;
+        if (!blockedDedupe(`blocked|${event.entityId}`)) return;
+        // issue.updated payloads frequently omit assignee/title, so enrich from
+        // the issue record before deciding whether a human/board user owns it.
+        if (event.entityId) {
+          try {
+            const issue = await ctx.issues.get(event.entityId, event.companyId);
+            if (issue) {
+              const anyIssue = issue as unknown as {
+                assigneeUserId?: string | null;
+                assigneeName?: string | null;
+                title?: string;
+              };
+              if (payload.assigneeUserId == null && anyIssue.assigneeUserId != null) {
+                payload.assigneeUserId = anyIssue.assigneeUserId;
+              }
+              if (!payload.assigneeName && anyIssue.assigneeName) {
+                payload.assigneeName = anyIssue.assigneeName;
+              }
+              if (!payload.title && issue.title) payload.title = issue.title;
+            }
+          } catch { /* best effort */ }
+        }
+        // Skip agent-only blocks (no human/board assignee). The rule itself lives
+        // in shouldNotifyIssueBlocked and now sees the enriched assigneeUserId.
+        if (!shouldNotifyIssueBlocked(event, true)) return;
+        // Enrich with latest comment (likely the blocker reason)
+        if (!payload.comment && event.entityId) {
+          try {
+            const comments = await ctx.issues.listComments(event.entityId, event.companyId);
+            if (comments.length > 0) {
+              const latest = comments.reduce((a, b) =>
+                new Date(a.createdAt) > new Date(b.createdAt) ? a : b,
+              );
+              payload.comment = latest.body;
+            }
+          } catch { /* best effort */ }
+        }
+        await notify(event, formatIssueBlocked);
+      });
+    }
+
+    // Forward issue.comment.created only when a configured board username is
+    // @-mentioned (word-boundary aware, case-insensitive).
+    const boardUsernames = parseBoardUsernames(config.boardUsernames);
+    if (config.notifyOnBoardMention && boardUsernames.length > 0) {
+      ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+        if (!shouldNotifyBoardMention(event, true, boardUsernames)) return;
+        const payload = event.payload as Record<string, unknown>;
+        // Enrich with issue identifier/title for a useful link + heading
+        const issueId =
+          (payload.issueId as string | undefined) ??
+          (payload.issueIdentifier as string | undefined) ??
+          undefined;
+        if (issueId && (!payload.identifier || !payload.title)) {
+          try {
+            const issue = await ctx.issues.get(String(issueId), event.companyId);
+            if (issue) {
+              payload.identifier ??= issue.identifier;
+              payload.title ??= issue.title;
+            }
+          } catch { /* best effort */ }
+        }
+        await notify(event, formatBoardMention);
       });
     }
 
@@ -990,6 +1566,79 @@ const plugin = definePlugin({
       return handleDiscussToolCall(ctx, token, params as Record<string, unknown>, runCtx.companyId, runCtx.agentId);
     });
 
+    // --- Agent file-send tool (ant013 TEL-8 / TEL-23) ---
+    const sendToTelegram = (params: unknown, runCtx: { companyId: string; agentId: string }) =>
+      sendToTelegramTool(ctx, token, config, params, runCtx);
+
+    const sendToTelegramParametersSchema = {
+      type: "object",
+      properties: {
+        chatId: {
+          type: "string",
+          description: "Telegram chat ID. Defaults to the configured company chat when omitted.",
+        },
+        threadId: {
+          type: "number",
+          description: "Optional Telegram forum topic ID.",
+        },
+        text: {
+          type: "string",
+          description: "Text message or Markdown caption if markdownContent is used.",
+        },
+        markdownContent: {
+          type: "string",
+          description: "Markdown document content for upload.",
+        },
+        markdownFileName: {
+          type: "string",
+          description: "Optional .md filename when markdownContent is provided.",
+        },
+        projectKey: {
+          type: "string",
+          description: "Optional Paperclip project key for Markdown document file routing, such as TEL.",
+        },
+        issueIdentifier: {
+          type: "string",
+          description: "Optional Paperclip issue key for Markdown document file routing, such as TEL-8.",
+        },
+        issueId: {
+          type: "string",
+          description: "Optional Paperclip issue ID used to resolve a project-key file route.",
+        },
+        parseMode: {
+          type: "string",
+          enum: ["MarkdownV2", "HTML"],
+          description: "Optional parse mode for text/caption.",
+        },
+        replyToMessageId: {
+          type: "number",
+          description: "Optional Telegram message ID to reply to.",
+        },
+        silent: {
+          type: "boolean",
+          description: "Send without notification.",
+        },
+        sessionId: {
+          type: "string",
+          description: "Optional Paperclip session ID for routing Telegram replies back to the agent session.",
+        },
+      },
+      anyOf: [{ required: ["text"] }, { required: ["markdownContent"] }],
+    } as const;
+
+    ctx.tools.register("send_to_telegram", {
+      displayName: "Send Telegram Message",
+      description: "Send text and Markdown content to Telegram.",
+      parametersSchema: sendToTelegramParametersSchema,
+    }, (params: unknown, runCtx) => sendToTelegram(params, runCtx));
+
+    // Keep the previous tool name as a compatibility alias.
+    ctx.tools.register("send_file_to_telegram", {
+      displayName: "Send File to Telegram",
+      description: "Deprecated: send text and Markdown content to Telegram.",
+      parametersSchema: sendToTelegramParametersSchema,
+    }, (params: unknown, runCtx) => sendToTelegram(params, runCtx));
+
     // --- Phase 5: Register register_watch tool ---
     ctx.tools.register("register_watch", {
       displayName: "Register Watch",
@@ -1060,6 +1709,12 @@ const plugin = definePlugin({
     const topicErrors = validateConfiguredTopicIds(config as Record<string, unknown>);
     if (topicErrors.length > 0) {
       return { ok: false, errors: topicErrors };
+    }
+    const fileRouteErrors = getTelegramFileRouteSaveErrors(
+      (config as Record<string, unknown>).fileRoutes,
+    );
+    if (fileRouteErrors.length > 0) {
+      return { ok: false, errors: fileRouteErrors };
     }
     return { ok: true };
   },
@@ -1194,7 +1849,46 @@ async function handleUpdate(
   }
 }
 
-async function handleCallbackQuery(
+/**
+ * Graceful fallback for a decision-button callback whose underlying approval is
+ * no longer actionable (TWX-328: stale inline-button presses). When the failure
+ * is an "already resolved/decided" conflict — the approval was decided through
+ * another channel, expired, or already resolved in the opposite direction — we
+ * acknowledge it quietly and update the card instead of surfacing a raw API
+ * error string to the board member. Any other error still surfaces as a failure.
+ */
+async function handleDecisionCallbackError(
+  ctx: PluginContext,
+  token: string,
+  query: NonNullable<TelegramUpdate["callback_query"]>,
+  chatId: string | null,
+  messageId: number | undefined,
+  decision: { kind: string; id: string; actor: string },
+  err: unknown,
+): Promise<void> {
+  if (isAlreadyResolvedConflict(err)) {
+    ctx.logger.info("Ignored stale Telegram decision callback", {
+      kind: decision.kind,
+      id: decision.id,
+      actor: decision.actor,
+    });
+    await answerCallbackQuery(ctx, token, query.id, "Already resolved");
+    if (chatId && messageId) {
+      await editMessage(
+        ctx,
+        token,
+        chatId,
+        messageId,
+        escapeMarkdownV2("This decision was already resolved."),
+        { parseMode: "MarkdownV2" },
+      );
+    }
+    return;
+  }
+  await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+}
+
+export async function handleCallbackQuery(
   ctx: PluginContext,
   token: string,
   query: NonNullable<TelegramUpdate["callback_query"]>,
@@ -1234,12 +1928,20 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u2705")} *Approved* by ${escapeMarkdownV2(actor)}`,
+          formatResolvedDecision(query.message?.text, "approved", actor),
           { parseMode: "MarkdownV2" },
         );
       }
     } catch (err) {
-      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+      await handleDecisionCallbackError(
+        ctx,
+        token,
+        query,
+        chatId,
+        messageId,
+        { kind: "approval_approve", id: approvalId, actor },
+        err,
+      );
     }
     return;
   }
@@ -1289,12 +1991,20 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u274c")} *Rejected* by ${escapeMarkdownV2(actor)}`,
+          formatResolvedDecision(query.message?.text, "rejected", actor),
           { parseMode: "MarkdownV2" },
         );
       }
     } catch (err) {
-      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+      await handleDecisionCallbackError(
+        ctx,
+        token,
+        query,
+        chatId,
+        messageId,
+        { kind: "approval_reject", id: approvalId, actor },
+        err,
+      );
     }
     return;
   }

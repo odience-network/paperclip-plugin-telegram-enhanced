@@ -96,6 +96,18 @@ const manifest: PaperclipPluginManifestV1 = {
       description: "Register a proactive watch that monitors entities and sends suggestions",
       parametersSchema: { type: "object" },
     },
+    {
+      name: "send_to_telegram",
+      displayName: "Send Telegram Message",
+      description: "Send text and Markdown content to a Telegram chat, with optional thread and project-key file routing.",
+      parametersSchema: { type: "object" },
+    },
+    {
+      name: "send_file_to_telegram",
+      displayName: "Send File to Telegram",
+      description: "Deprecated compatibility alias for send_to_telegram.",
+      parametersSchema: { type: "object" },
+    },
   ],
 };
 

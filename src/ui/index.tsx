@@ -57,6 +57,9 @@ type TelegramRoutingConfig = {
   notifyOnIssueDone: boolean;
   notifyOnIssueAssigned: boolean;
   onlyNotifyIfAssignedTo: string;
+  notifyOnIssueBlocked: boolean;
+  notifyOnBoardMention: boolean;
+  boardUsernames: string;
   approvalsChatId: string;
   approvalsTopicId: string;
   notifyOnApprovalCreated: boolean;
@@ -72,6 +75,18 @@ type TelegramRoutingConfig = {
   dailyDigestTime: string;
   bidailySecondTime: string;
   tridailyTimes: string;
+  opsRoutes: TelegramOpsRouteForm[];
+};
+
+// TEL-23: per-company ops route. Run-lifecycle notifications for a matching
+// company are diverted to this chat/topic instead of the primary chat.
+type TelegramOpsRouteForm = {
+  name: string;
+  enabled: boolean;
+  companyId: string;
+  companyName: string;
+  chatId: string;
+  topicId: string;
 };
 
 type TelegramConnectionConfig = {
@@ -123,6 +138,9 @@ const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
   notifyOnIssueDone: true,
   notifyOnIssueAssigned: false,
   onlyNotifyIfAssignedTo: "",
+  notifyOnIssueBlocked: false,
+  notifyOnBoardMention: false,
+  boardUsernames: "",
   approvalsChatId: "",
   approvalsTopicId: "",
   notifyOnApprovalCreated: true,
@@ -138,6 +156,7 @@ const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
   dailyDigestTime: "09:00",
   bidailySecondTime: "17:00",
   tridailyTimes: "07:00,13:00,19:00",
+  opsRoutes: [],
 };
 
 const DEFAULT_CONNECTION_CONFIG: TelegramConnectionConfig = {
@@ -224,8 +243,58 @@ function asStringArray(value: unknown): string[] {
     : [];
 }
 
+// board usernames may be persisted as an array (worker-side) or a raw string
+// (this text field). Always render a comma-separated string for the input.
+function asBoardUsernamesString(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).join(", ");
+  }
+  return typeof value === "string" ? value : "";
+}
+
 function asDigestMode(value: unknown): TelegramRoutingConfig["digestMode"] {
   return value === "daily" || value === "bidaily" || value === "tridaily" ? value : "off";
+}
+
+function asOpsRoutes(value: unknown): TelegramOpsRouteForm[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is Record<string, unknown> =>
+      typeof item === "object" && item !== null && !Array.isArray(item),
+    )
+    .map((item) => ({
+      name: asString(item.name),
+      enabled: asBoolean(item.enabled, true),
+      companyId: asString(item.companyId),
+      companyName: asString(item.companyName),
+      chatId: asString(item.chatId),
+      topicId: asString(item.topicId),
+    }));
+}
+
+// Returns a human-readable error if the ops routes are invalid, else null.
+// Expects already-trimmed routes.
+function validateOpsRoutes(routes: TelegramOpsRouteForm[]): string | null {
+  const seenCompanyIds = new Set<string>();
+  for (const route of routes) {
+    const label = route.name || route.companyName || route.companyId || "(unnamed)";
+    if (!route.chatId) {
+      return `Ops route "${label}" needs a Chat ID.`;
+    }
+    if (!route.companyId && !route.companyName) {
+      return `Ops route "${label}" needs a Company ID or Company name to match.`;
+    }
+    if (route.topicId && !/^\d+$/.test(route.topicId)) {
+      return `Ops route "${label}" topic ID must be a numeric Telegram forum topic ID.`;
+    }
+    if (route.companyId) {
+      if (seenCompanyIds.has(route.companyId)) {
+        return `Duplicate ops route for Company ID "${route.companyId}".`;
+      }
+      seenCompanyIds.add(route.companyId);
+    }
+  }
+  return null;
 }
 
 function asEscalationDefaultAction(value: unknown): TelegramEscalationConfig["escalationDefaultAction"] {
@@ -250,6 +319,15 @@ function extractRoutingConfig(config: Record<string, unknown>): TelegramRoutingC
       DEFAULT_ROUTING_CONFIG.notifyOnIssueAssigned,
     ),
     onlyNotifyIfAssignedTo: asString(config.onlyNotifyIfAssignedTo),
+    notifyOnIssueBlocked: asBoolean(
+      config.notifyOnIssueBlocked,
+      DEFAULT_ROUTING_CONFIG.notifyOnIssueBlocked,
+    ),
+    notifyOnBoardMention: asBoolean(
+      config.notifyOnBoardMention,
+      DEFAULT_ROUTING_CONFIG.notifyOnBoardMention,
+    ),
+    boardUsernames: asBoardUsernamesString(config.boardUsernames),
     approvalsChatId: asString(config.approvalsChatId),
     approvalsTopicId: asString(config.approvalsTopicId),
     notifyOnApprovalCreated: asBoolean(
@@ -280,6 +358,7 @@ function extractRoutingConfig(config: Record<string, unknown>): TelegramRoutingC
     dailyDigestTime: asString(config.dailyDigestTime) || DEFAULT_ROUTING_CONFIG.dailyDigestTime,
     bidailySecondTime: asString(config.bidailySecondTime) || DEFAULT_ROUTING_CONFIG.bidailySecondTime,
     tridailyTimes: asString(config.tridailyTimes) || DEFAULT_ROUTING_CONFIG.tridailyTimes,
+    opsRoutes: asOpsRoutes(config.opsRoutes),
   };
 }
 
@@ -898,6 +977,39 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setRoutingMessage(null);
   }
 
+  function addOpsRoute(): void {
+    setRoutingConfig((current) => ({
+      ...current,
+      opsRoutes: [
+        ...current.opsRoutes,
+        { name: "", enabled: true, companyId: "", companyName: "", chatId: "", topicId: "" },
+      ],
+    }));
+    setRoutingMessage(null);
+  }
+
+  function updateOpsRoute<K extends keyof TelegramOpsRouteForm>(
+    index: number,
+    key: K,
+    value: TelegramOpsRouteForm[K],
+  ): void {
+    setRoutingConfig((current) => ({
+      ...current,
+      opsRoutes: current.opsRoutes.map((route, i) =>
+        i === index ? { ...route, [key]: value } : route,
+      ),
+    }));
+    setRoutingMessage(null);
+  }
+
+  function removeOpsRoute(index: number): void {
+    setRoutingConfig((current) => ({
+      ...current,
+      opsRoutes: current.opsRoutes.filter((_, i) => i !== index),
+    }));
+    setRoutingMessage(null);
+  }
+
   function updateBoardField<K extends keyof TelegramBoardConfig>(
     key: K,
     value: TelegramBoardConfig[K],
@@ -998,10 +1110,33 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setRoutingSaving(true);
     setRoutingMessage(null);
     try {
+      // Drop blank rows the operator added but never filled in, then validate
+      // the rest: every ops route needs a chat ID and a company match key
+      // (companyId or companyName), and companyId must be unique across routes.
+      const trimmedRoutes = routingConfig.opsRoutes.map((route) => ({
+        name: route.name.trim(),
+        enabled: route.enabled,
+        companyId: route.companyId.trim(),
+        companyName: route.companyName.trim(),
+        chatId: route.chatId.trim(),
+        topicId: route.topicId.trim(),
+      }));
+      const opsRoutes = trimmedRoutes.filter(
+        (route) => route.companyId || route.companyName || route.chatId || route.name,
+      );
+
+      const opsRouteError = validateOpsRoutes(opsRoutes);
+      if (opsRouteError) {
+        setRoutingMessage({ tone: "error", title: "Ops route is invalid", text: opsRouteError });
+        return;
+      }
+
+      const sanitizedRouting = { ...routingConfig, opsRoutes };
       const currentConfig = await fetchPluginConfig();
-      const nextConfig = { ...currentConfig, ...routingConfig };
+      const nextConfig = { ...currentConfig, ...sanitizedRouting };
       await savePluginConfig(nextConfig);
-      setRoutingSnapshot(routingConfig);
+      setRoutingConfig(sanitizedRouting);
+      setRoutingSnapshot(sanitizedRouting);
       setRoutingMessage({
         tone: "success",
         title: "Notification routing saved",
@@ -1677,6 +1812,20 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                   Send a Telegram notification when an issue assignee changes.
                 </span>
               </label>
+              <label style={{ color: "#374151", display: "grid", gap: 3, fontSize: 13 }}>
+                <span style={{ alignItems: "center", display: "flex", gap: 8 }}>
+                  <input
+                    checked={routingConfig.notifyOnIssueBlocked}
+                    disabled={routingLoading || routingSaving}
+                    onChange={(event) => updateRoutingField("notifyOnIssueBlocked", event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                  Blocked
+                </span>
+                <span style={{ color: "#6b7280", fontSize: 12, marginLeft: 22 }}>
+                  Notify when an issue becomes blocked and is owned by a human/board user. Agent-only blocks are ignored to reduce noise.
+                </span>
+              </label>
             </div>
             <label style={{ display: "grid", gap: 5 }}>
               <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Only when assigned to user ID</span>
@@ -1698,6 +1847,42 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                 Optional. Restricts assignment-change notifications to issues assigned to this Paperclip user.
               </span>
             </label>
+            <div style={{ display: "grid", gap: 10 }}>
+              <label style={{ color: "#374151", display: "grid", gap: 3, fontSize: 13 }}>
+                <span style={{ alignItems: "center", display: "flex", gap: 8 }}>
+                  <input
+                    checked={routingConfig.notifyOnBoardMention}
+                    disabled={routingLoading || routingSaving}
+                    onChange={(event) => updateRoutingField("notifyOnBoardMention", event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                  Board mentions
+                </span>
+                <span style={{ color: "#6b7280", fontSize: 12, marginLeft: 22 }}>
+                  Notify when an issue comment @-mentions one of the board usernames below. Matching is case-insensitive and word-boundary aware.
+                </span>
+              </label>
+              <label style={{ display: "grid", gap: 5 }}>
+                <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Board usernames</span>
+                <input
+                  disabled={routingLoading || routingSaving || !routingConfig.notifyOnBoardMention}
+                  onChange={(event) => updateRoutingField("boardUsernames", event.currentTarget.value)}
+                  placeholder="ceo, board (comma-separated, no @)"
+                  style={{
+                    border: "1px solid #d1d5db",
+                    borderRadius: 8,
+                    fontSize: 14,
+                    minWidth: 0,
+                    padding: "9px 10px",
+                  }}
+                  type="text"
+                  value={routingConfig.boardUsernames}
+                />
+                <span style={{ color: "#6b7280", fontSize: 12 }}>
+                  Comma- or space-separated handles. A comment forwards only when it contains <code>@&lt;handle&gt;</code> for one of these.
+                </span>
+              </label>
+            </div>
           </section>
 
           <RoutingRow
@@ -1781,7 +1966,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                     Run started
                   </span>
                   <span style={{ color: "#6b7280", fontSize: 12, marginLeft: 22 }}>
-                    Notify on every agent run start. Off by default - high-frequency on busy instances. Routes through the default chat.
+                    Notify on every agent run start. Off by default - high-frequency on busy instances. Routes to a matching Ops route below, otherwise the default chat.
                   </span>
                 </label>
                 <label style={{ color: "#374151", display: "grid", gap: 3, fontSize: 13 }}>
@@ -1795,12 +1980,155 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                     Run finished
                   </span>
                   <span style={{ color: "#6b7280", fontSize: 12, marginLeft: 22 }}>
-                    Notify on every agent run completion. Off by default - high-frequency on busy instances. Routes through the default chat.
+                    Notify on every agent run completion. Off by default - high-frequency on busy instances. Routes to a matching Ops route below, otherwise the default chat.
                   </span>
                 </label>
               </>
             }
           />
+
+          <section
+            style={{
+              border: "1px solid #e5e7eb",
+              borderRadius: 8,
+              display: "grid",
+              gap: 10,
+              padding: 12,
+            }}
+          >
+            <div style={{ alignItems: "center", display: "flex", justifyContent: "space-between" }}>
+              <strong>Ops routes</strong>
+              <button
+                disabled={routingLoading || routingSaving}
+                onClick={() => addOpsRoute()}
+                style={{
+                  background: "#111827",
+                  border: "none",
+                  borderRadius: 8,
+                  color: "#fff",
+                  cursor: routingLoading || routingSaving ? "not-allowed" : "pointer",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  padding: "6px 12px",
+                }}
+                type="button"
+              >
+                Add ops route
+              </button>
+            </div>
+            <span style={{ color: "#6b7280", fontSize: 12 }}>
+              Divert run-lifecycle (run started / run finished) notifications for a specific company
+              to a dedicated ops chat, keeping the primary chat for important signals. The first
+              enabled route matching by Company ID (or Company name) wins; if none match, ops events
+              fall back to the default chat.
+            </span>
+            {routingConfig.opsRoutes.length === 0 ? (
+              <span style={{ color: "#9ca3af", fontSize: 12, fontStyle: "italic" }}>
+                No ops routes configured.
+              </span>
+            ) : (
+              <div style={{ display: "grid", gap: 12 }}>
+                {routingConfig.opsRoutes.map((route, index) => (
+                  <div
+                    key={index}
+                    style={{
+                      border: "1px solid #e5e7eb",
+                      borderRadius: 8,
+                      display: "grid",
+                      gap: 8,
+                      padding: 10,
+                    }}
+                  >
+                    <div style={{ alignItems: "center", display: "flex", gap: 12, justifyContent: "space-between" }}>
+                      <label style={{ alignItems: "center", color: "#374151", display: "flex", fontSize: 13, gap: 8 }}>
+                        <input
+                          checked={route.enabled}
+                          disabled={routingLoading || routingSaving}
+                          onChange={(event) => updateOpsRoute(index, "enabled", event.currentTarget.checked)}
+                          type="checkbox"
+                        />
+                        Enabled
+                      </label>
+                      <button
+                        disabled={routingLoading || routingSaving}
+                        onClick={() => removeOpsRoute(index)}
+                        style={{
+                          background: "transparent",
+                          border: "1px solid #d1d5db",
+                          borderRadius: 8,
+                          color: "#b91c1c",
+                          cursor: routingLoading || routingSaving ? "not-allowed" : "pointer",
+                          fontSize: 12,
+                          fontWeight: 600,
+                          padding: "4px 10px",
+                        }}
+                        type="button"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <label style={{ display: "grid", gap: 4 }}>
+                      <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Name (optional)</span>
+                      <input
+                        disabled={routingLoading || routingSaving}
+                        onChange={(event) => updateOpsRoute(index, "name", event.currentTarget.value)}
+                        placeholder="e.g. Acme Ops"
+                        style={{ border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, minWidth: 0, padding: "9px 10px" }}
+                        type="text"
+                        value={route.name}
+                      />
+                    </label>
+                    <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Company ID</span>
+                        <input
+                          disabled={routingLoading || routingSaving}
+                          onChange={(event) => updateOpsRoute(index, "companyId", event.currentTarget.value)}
+                          placeholder="Company UUID"
+                          style={{ border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, minWidth: 0, padding: "9px 10px" }}
+                          type="text"
+                          value={route.companyId}
+                        />
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Company name</span>
+                        <input
+                          disabled={routingLoading || routingSaving}
+                          onChange={(event) => updateOpsRoute(index, "companyName", event.currentTarget.value)}
+                          placeholder="Fallback match by name"
+                          style={{ border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, minWidth: 0, padding: "9px 10px" }}
+                          type="text"
+                          value={route.companyName}
+                        />
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Chat ID</span>
+                        <input
+                          disabled={routingLoading || routingSaving}
+                          onChange={(event) => updateOpsRoute(index, "chatId", event.currentTarget.value)}
+                          placeholder="Ops chat ID"
+                          style={{ border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, minWidth: 0, padding: "9px 10px" }}
+                          type="text"
+                          value={route.chatId}
+                        />
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Topic ID (optional)</span>
+                        <input
+                          disabled={routingLoading || routingSaving}
+                          onChange={(event) => updateOpsRoute(index, "topicId", event.currentTarget.value)}
+                          placeholder="Forum topic ID"
+                          style={{ border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, minWidth: 0, padding: "9px 10px" }}
+                          type="text"
+                          value={route.topicId}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
 
           <RoutingRow
             title="Digests"

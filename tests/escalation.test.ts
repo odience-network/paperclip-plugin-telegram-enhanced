@@ -40,6 +40,7 @@ function mockCtx(): PluginContext {
       }),
     },
     agents: {
+      get: vi.fn().mockResolvedValue(null),
       sessions: {
         sendMessage: vi.fn(),
         close: vi.fn(),
@@ -229,6 +230,30 @@ describe("EscalationManager.create", () => {
     const stored = stateStore["escalation_esc-001"] as Record<string, unknown>;
     expect(stored.transport).toBe("acp");
     expect(stored.sessionId).toBe("sess-acp");
+  });
+
+  it("uses provided agentName in the escalation message and stored state", async () => {
+    const manager = new EscalationManager();
+    const ctx = mockCtx();
+    await manager.create(ctx, "token", makeEvent({ agentName: "Support Pilot" }), "esc-chat-1");
+
+    expect(sentMessages[0].text).toContain("Support Pilot");
+    expect(sentMessages[0].text).not.toContain("*Agent:* agent\\-1");
+    const stored = stateStore["escalation_esc-001"] as Record<string, unknown>;
+    expect(stored.agentName).toBe("Support Pilot");
+  });
+
+  it("resolves agent name from Paperclip when not provided", async () => {
+    const manager = new EscalationManager();
+    const ctx = mockCtx();
+    (ctx.agents.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: "agent-1",
+      name: "Resolution Lead",
+    });
+
+    await manager.create(ctx, "token", makeEvent(), "esc-chat-1");
+
+    expect(sentMessages[0].text).toContain("Resolution Lead");
   });
 });
 

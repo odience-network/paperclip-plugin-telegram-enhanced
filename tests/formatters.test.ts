@@ -7,6 +7,9 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  formatIssueBlocked,
+  formatBoardMention,
+  formatResolvedDecision,
 } from "../src/formatters.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
@@ -245,5 +248,76 @@ describe("formatAgentRunFinished", () => {
   it("disables notification", () => {
     const msg = formatAgentRunFinished(mockEvent());
     expect(msg.options.disableNotification).toBe(true);
+  });
+});
+
+describe("formatIssueBlocked", () => {
+  it("renders identifier, title and assignee", () => {
+    const msg = formatIssueBlocked(
+      mockEvent({ status: "blocked", assigneeName: "Alice", comment: "waiting on infra" }),
+    );
+    expect(msg.text).toContain("Blocked");
+    expect(msg.text).toContain("PROJ\\-42");
+    expect(msg.text).toContain("Alice");
+    expect(msg.text).toContain("waiting on infra");
+    expect(msg.options.parseMode).toBe("MarkdownV2");
+  });
+
+  it("falls back to entityId when no identifier", () => {
+    const msg = formatIssueBlocked(mockEvent({ identifier: undefined }));
+    expect(msg.text).toContain("iss\\-123");
+  });
+});
+
+describe("formatBoardMention", () => {
+  it("renders the mention with author and body", () => {
+    const msg = formatBoardMention(
+      mockEvent({ authorName: "Bob", body: "ping @board for sign-off" }),
+    );
+    expect(msg.text).toContain("Board Mention");
+    expect(msg.text).toContain("Bob");
+    expect(msg.text).toContain("sign\\-off");
+    expect(msg.options.parseMode).toBe("MarkdownV2");
+  });
+
+  it("derives identifier from issueIdentifier fallback", () => {
+    const msg = formatBoardMention(
+      mockEvent({ identifier: undefined, issueIdentifier: "PROJ-99", body: "@board" }),
+    );
+    expect(msg.text).toContain("PROJ\\-99");
+  });
+});
+
+describe("formatResolvedDecision", () => {
+  it("preserves original card context and appends an approved footer", () => {
+    const original = "🔔 Approval requested\nPROJ-42 — Deploy to prod";
+    const text = formatResolvedDecision(original, "approved", "amir");
+    // original text is preserved (MarkdownV2-escaped) ...
+    expect(text).toContain("PROJ\\-42");
+    expect(text).toContain("Deploy to prod");
+    // ... and the resolution footer is appended on its own paragraph
+    expect(text).toContain("\n\n");
+    expect(text).toContain("*Approved* by amir");
+  });
+
+  it("renders a rejected footer", () => {
+    const text = formatResolvedDecision("Approval requested", "rejected", "jane");
+    expect(text).toContain("*Rejected* by jane");
+  });
+
+  it("falls back to just the footer when no original text is available", () => {
+    expect(formatResolvedDecision(undefined, "approved", "amir")).toBe(
+      "✅ *Approved* by amir",
+    );
+    expect(formatResolvedDecision("   ", "rejected", "amir")).toBe(
+      "❌ *Rejected* by amir",
+    );
+  });
+
+  it("escapes MarkdownV2 control characters in actor and original text", () => {
+    const text = formatResolvedDecision("done (mostly).", "approved", "a.b_c");
+    // dot and underscore in actor, parens/dot in body must be escaped
+    expect(text).toContain("a\\.b\\_c");
+    expect(text).toContain("\\(mostly\\)\\.");
   });
 });

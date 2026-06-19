@@ -56,6 +56,29 @@ function runButton(agentId: string, runId: string | null, publicUrl?: string): {
   return null;
 }
 
+/**
+ * Build the text for a resolved approval/decision card.
+ *
+ * Ported from the tue-Jonas fork (TWX-619): rather than collapsing the card to
+ * a bare status line, preserve the original card context (issue identifier,
+ * title, description) and append a resolution footer so the message stays
+ * legible after the buttons are removed. Falls back to just the footer when no
+ * original text is available. The original text from Telegram is plain (entity
+ * formatting stripped), so it is MarkdownV2-escaped before being re-sent.
+ */
+export function formatResolvedDecision(
+  originalText: string | undefined | null,
+  decision: "approved" | "rejected",
+  actor: string,
+): string {
+  const icon = decision === "approved" ? "✅" : "❌";
+  const label = decision === "approved" ? "Approved" : "Rejected";
+  const footer = `${esc(icon)} ${bold(label)} by ${esc(actor)}`;
+  const trimmed = (originalText ?? "").trim();
+  if (!trimmed) return footer;
+  return `${esc(trimmed)}\n\n${footer}`;
+}
+
 function classifyAgentError(errorMessage: string): string {
   if (/timed?\s*out|timeout/i.test(errorMessage)) return "Agent Timeout";
   if (/limit|rate.?limit|quota/i.test(errorMessage)) return "Agent Rate Limit";
@@ -144,6 +167,64 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
 
   if (comment) {
     const truncated = truncateAtWord(comment, 300);
+    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+  }
+
+  const button = issueButton(identifier, opts);
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
+export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? event.entityId);
+  const title = String(p.title ?? "Untitled");
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const reason = p.comment ? String(p.comment) : null;
+
+  const lines: string[] = [
+    `${esc("🚫")} ${bold("Issue Blocked")}: ${issueLink(identifier, opts)}`,
+    bold(title),
+  ];
+
+  if (assigneeName) lines.push(`Assignee: ${esc(assigneeName)}`);
+
+  if (reason) {
+    const truncated = truncateAtWord(reason, 300);
+    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+  }
+
+  const button = issueButton(identifier, opts);
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
+export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? p.issueIdentifier ?? p.issueId ?? event.entityId);
+  const title = p.title ?? p.issueTitle ? String(p.title ?? p.issueTitle) : null;
+  const author = p.authorName ?? p.author ?? p.userName ?? p.agentName;
+  const authorName = author ? String(author) : null;
+  const body = String(p.body ?? p.comment ?? p.text ?? "");
+
+  const lines: string[] = [
+    `${esc("📣")} ${bold("Board Mention")}: ${issueLink(identifier, opts)}`,
+  ];
+  if (title) lines.push(bold(title));
+  if (authorName) lines.push(`From: ${esc(authorName)}`);
+
+  if (body) {
+    const truncated = truncateAtWord(body, 300);
     lines.push(`\n${esc(">")} ${esc(truncated)}`);
   }
 

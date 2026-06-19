@@ -29,9 +29,11 @@ This is that plugin.
 
 - **Issue created** - Title, description, status, priority, assignee, project fields, and a "View Issue" link
 - **Issue done** - Completion confirmation with status fields
+- **Issue blocked** - Sent when an issue becomes blocked **and** is owned by a human/board user (agent-only blocks are suppressed). Off by default.
+- **Board mention** - Sent when an issue comment `@`-mentions a configured board username (case-insensitive, word-boundary aware). Off by default.
 - **Approval requested** - Interactive **Approve** and **Reject** inline buttons. Click to act without leaving Telegram.
 - **Agent error** - Error message with warning indicator
-- **Agent run started/finished** - Lifecycle notifications
+- **Agent run started/finished** - Lifecycle notifications, **off by default** (high-frequency on busy instances)
 
 ### Interactive approvals
 - Approve/reject inline buttons on every approval notification
@@ -192,6 +194,10 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 | `enableCommands` | No | Enable bot commands (default: true) |
 | `enableInbound` | No | Route Telegram replies to issues (default: true) |
 | `onlyNotifyBoardApprovals` | No | When enabled, send Telegram approval notifications only for `request_board_approval` approvals |
+| `notifyOnIssueBlocked` | No | Notify when an issue becomes blocked and is owned by a human/board user (`assigneeUserId` non-null). Agent-only blocks are suppressed. Default: false |
+| `notifyOnBoardMention` | No | Notify when an issue comment `@`-mentions a configured board username. Requires `boardUsernames`. Default: false |
+| `boardUsernames` | No | Comma/space-separated board handles (with or without `@`) matched case-insensitively and word-boundary aware by `notifyOnBoardMention` |
+| `notifyOnAgentRunStarted` / `notifyOnAgentRunFinished` | No | Per-run lifecycle notifications. Default: false (high-frequency on busy instances) |
 | `allowedTelegramUserIds` | No | Optional allowlist of Telegram user IDs allowed to use commands, inbound replies, media intake, and inline buttons. Empty means any user is allowed |
 | `allowedTelegramChatIds` | No | Optional allowlist of Telegram chat IDs where commands, inbound replies, media intake, and inline buttons are accepted. Empty means any chat is allowed |
 | `topicRouting` | No | Map forum topics to projects (default: false) |
@@ -247,6 +253,40 @@ The plugin stores the resulting board API token as a Paperclip company secret an
 | `handoff_to_agent` | 2 | Hand off work to another agent in this thread |
 | `discuss_with_agent` | 2 | Start a back-and-forth conversation with another agent |
 | `register_watch` | 5 | Register a proactive watch that monitors entities and sends suggestions |
+| `send_to_telegram` | — | Send text or a Markdown document to a Telegram chat, with optional project-key file routing (`send_file_to_telegram` is a deprecated alias) |
+
+### Agent file send & project-key routing
+
+The `send_to_telegram` tool (ported from the ant013 fork, TEL-8 / TEL-23) lets an
+agent deliver content to Telegram:
+
+- **Text** — pass `text` to send a plain/Markdown message via `sendMessage`.
+- **Markdown document** — pass `markdownContent` (optionally `markdownFileName`,
+  defaulting to `paperclip-message.md`) to upload a `.md` file via `sendDocument`.
+  When Paperclip's HTTP bridge drops the multipart body, the upload retries with
+  native `fetch` so Telegram still receives the file. Only `text` and
+  `markdownContent` are accepted as content sources — file paths, URLs, and raw
+  `file_id`s are rejected, and filenames are validated as safe `.md` basenames.
+
+Document sends can be routed **by project key** instead of an explicit `chatId`:
+
+- Provide one of `projectKey` (e.g. `TEL`), `issueIdentifier` (e.g. `TEL-8`), or
+  `issueId` (resolved to its identifier via the board API). Explicit `chatId` /
+  `threadId` may not be combined with route inputs.
+- The matching enabled `fileRoutes` entry supplies the destination chat and topic.
+  No match, an ambiguous match, or invalid route config returns a structured error.
+
+Configure routes via the `fileRoutes` config array:
+
+```json
+"fileRoutes": [
+  { "name": "Telegram squad", "enabled": true, "projectKey": "TEL", "chatId": "-1001234567890", "topicId": "42" }
+]
+```
+
+Enabled routes are validated at config-save time: each needs a unique `name`, an
+uppercase alphanumeric `projectKey` (unique across enabled routes), a numeric
+`chatId`, and an optional numeric `topicId`.
 
 ## Comparison with PR #407
 
