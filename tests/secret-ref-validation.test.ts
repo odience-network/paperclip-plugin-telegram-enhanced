@@ -57,10 +57,12 @@ describe("validateSecretRefFields", () => {
     ).toEqual([]);
   });
 
-  it("flags missing required telegramBotTokenRef with the legacy message", () => {
+  it("allows a missing telegramBotTokenRef (ODIAA-720: bot connected instance-wide)", () => {
+    // The bot token can now be connected once for the whole instance via the
+    // Settings "Bot Connection" flow (instance-scoped state), so a missing
+    // secret ref is no longer a config error.
     const errors = validateSecretRefFields({});
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toBe("telegramBotTokenRef is required.");
+    expect(errors).toEqual([]);
   });
 
   it("flags non-UUID telegramBotTokenRef with field-specific guidance", () => {
