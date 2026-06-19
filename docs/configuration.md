@@ -8,7 +8,8 @@ Every plugin setting, its default, and what it controls. Only `telegramBotTokenR
 
 | Setting | Required | Default | Description |
 |---------|:--:|---------|-------------|
-| `telegramBotTokenRef` | ✅ | — | Secret **UUID** for your bot token. See [Getting Started](getting-started.md#4-store-your-bot-token-as-a-paperclip-secret). |
+| Bot token (Bot Connection) | ✅ | — | Connect the bot instance-wide via **Settings → Bot Connection**. Stored server-side; not a config field. See [Getting Started](getting-started.md#4-connect-your-bot-instance-wide). |
+| `telegramBotTokenRef` | | — | **Optional / legacy.** Secret **UUID** fallback for the bot token. Prefer Bot Connection (secret-refs are company-scoped and disabled on recent master, post-#5429). |
 | `defaultChatId` | | — | Fallback chat ID for notifications when no per-type chat is set. |
 | `paperclipBaseUrl` | | `http://localhost:3100` | Internal Paperclip API URL. |
 | `paperclipPublicUrl` | | — | Public URL used for issue links in messages. |

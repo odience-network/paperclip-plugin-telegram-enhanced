@@ -8,26 +8,19 @@ Common problems and how to fix them. If something isn't covered here, open an is
 
 **Cause:** You're running `paperclipai` **master** after [#5429](https://github.com/paperclipai/paperclip/pull/5429) (2026-05-09). The new Secrets Manager ships with a temporary kill switch on plugin secret-ref UUIDs while a company-scoped `plugin_config` follow-up lands. This is intentional **fail-closed** mitigation (PAP-2394 — see the [upstream plan doc](https://github.com/paperclipai/paperclip/blob/master/doc/plans/2026-04-26-plugin-secret-ref-company-scope.md)).
 
-**Fix:** Until the follow-up lands, **pin to the last `paperclipai` release before #5429**. This restriction will be lifted once secret-ref resolution is restored.
+**Fix (v0.3.0+):** Stop using the secret-ref field for the bot token. Open the plugin **Settings → Bot Connection** and paste the bot token directly (see [Getting Started](getting-started.md#4-connect-your-bot-instance-wide)). The token is stored in **instance-scoped plugin state**, not via a company secret-ref, so it is unaffected by the #5429 kill switch and works on current master. Leave `telegramBotTokenRef` blank.
 
 ## "Token must be a UUID" / activation fails after upgrade
 
 **Symptom:** the plugin refuses to activate and complains about the token field.
 
-**Cause:** As of **v0.2.1**, `telegramBotTokenRef` and `transcriptionApiKeyRef` require a Paperclip **secret reference (a UUID)**, not the raw token value.
+**Cause:** Between **v0.2.1** and **v0.2.x**, `telegramBotTokenRef` required a Paperclip **secret reference (a UUID)** in the **Connection & URLs** field, and rejected a raw token pasted there.
 
-**Fix — migrate your token:**
-
-1. Create a company secret holding your bot token (UI or REST API) — see [Getting Started](getting-started.md#4-store-your-bot-token-as-a-paperclip-secret).
-2. Copy the returned secret **UUID**.
-3. Open **Plugin Settings for Telegram Bot** and paste the UUID into **Telegram Bot Token**.
-4. Save and restart the plugin.
-
-The plugin will not activate while a raw (non-UUID) token is in the field.
+**Fix (v0.3.0+):** Don't paste the token into the secret-ref field. Use **Settings → Bot Connection** and paste the raw bot token there — it is validated and stored instance-wide. The legacy `telegramBotTokenRef` field is now optional; if you do use it, it must still be a secret **UUID**.
 
 ## No notifications arriving
 
-- Confirm `telegramBotTokenRef` points to a valid secret **UUID**, not a raw token.
+- Confirm a bot is connected under **Settings → Bot Connection** (or a valid `telegramBotTokenRef` secret **UUID** for legacy installs).
 - Confirm `defaultChatId` (or the relevant per-type chat ID) is set and correct. Group IDs are negative numbers.
 - Make sure you've sent at least one message to the bot (or added it to the group) so Telegram will deliver to it.
 - Check that the relevant `notifyOn*` toggle is enabled — see the [Configuration Reference](configuration.md#notification-toggles).
