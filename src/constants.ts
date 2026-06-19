@@ -27,6 +27,15 @@ export const DEFAULT_CONFIG = {
   enableInbound: true,
   allowedTelegramUserIds: [] as string[],
   allowedTelegramChatIds: [] as string[],
+  // Project-key file routing (ant013 TEL-23): route outbound markdown documents
+  // to a Telegram chat/topic by Paperclip project key.
+  fileRoutes: [] as Array<{
+    name: string;
+    enabled: boolean;
+    projectKey: string;
+    chatId: string;
+    topicId?: string;
+  }>,
   digestMode: "off" as "off" | "daily" | "bidaily" | "tridaily",
   dailyDigestTime: "09:00",
   bidailySecondTime: "17:00",

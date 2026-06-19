@@ -247,6 +247,40 @@ The plugin stores the resulting board API token as a Paperclip company secret an
 | `handoff_to_agent` | 2 | Hand off work to another agent in this thread |
 | `discuss_with_agent` | 2 | Start a back-and-forth conversation with another agent |
 | `register_watch` | 5 | Register a proactive watch that monitors entities and sends suggestions |
+| `send_to_telegram` | — | Send text or a Markdown document to a Telegram chat, with optional project-key file routing (`send_file_to_telegram` is a deprecated alias) |
+
+### Agent file send & project-key routing
+
+The `send_to_telegram` tool (ported from the ant013 fork, TEL-8 / TEL-23) lets an
+agent deliver content to Telegram:
+
+- **Text** — pass `text` to send a plain/Markdown message via `sendMessage`.
+- **Markdown document** — pass `markdownContent` (optionally `markdownFileName`,
+  defaulting to `paperclip-message.md`) to upload a `.md` file via `sendDocument`.
+  When Paperclip's HTTP bridge drops the multipart body, the upload retries with
+  native `fetch` so Telegram still receives the file. Only `text` and
+  `markdownContent` are accepted as content sources — file paths, URLs, and raw
+  `file_id`s are rejected, and filenames are validated as safe `.md` basenames.
+
+Document sends can be routed **by project key** instead of an explicit `chatId`:
+
+- Provide one of `projectKey` (e.g. `TEL`), `issueIdentifier` (e.g. `TEL-8`), or
+  `issueId` (resolved to its identifier via the board API). Explicit `chatId` /
+  `threadId` may not be combined with route inputs.
+- The matching enabled `fileRoutes` entry supplies the destination chat and topic.
+  No match, an ambiguous match, or invalid route config returns a structured error.
+
+Configure routes via the `fileRoutes` config array:
+
+```json
+"fileRoutes": [
+  { "name": "Telegram squad", "enabled": true, "projectKey": "TEL", "chatId": "-1001234567890", "topicId": "42" }
+]
+```
+
+Enabled routes are validated at config-save time: each needs a unique `name`, an
+uppercase alphanumeric `projectKey` (unique across enabled routes), a numeric
+`chatId`, and an optional numeric `topicId`.
 
 ## Comparison with PR #407
 
