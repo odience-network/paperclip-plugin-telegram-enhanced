@@ -34,6 +34,17 @@ function jsonRes(body: unknown, status = 200): Response {
   });
 }
 
+// A Cloudflare Access login challenge that slipped through as a 200: the board
+// sits behind Access, the service-token refs are missing/invalid, the 302 to the
+// SSO login page is followed by ctx.http.fetch, and the final hop is the login
+// HTML returning 200 OK (ODIAA-746).
+function accessLoginRes(): Response {
+  return new Response(
+    "<!DOCTYPE html><html><head><title>Sign in</title></head><body>Cloudflare Access</body></html>",
+    { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } },
+  );
+}
+
 function mockCtx(response: Response): PluginContext {
   return {
     http: {
@@ -139,6 +150,53 @@ describe("handleCallbackQuery (stale decision callbacks)", () => {
     ];
     expect(message).toMatch(/^Failed: /);
     expect(message).toContain("workspace_finalize");
+  });
+
+  it("fails closed on a Cloudflare Access login challenge instead of reporting Approved", async () => {
+    const ctx = mockCtx(accessLoginRes());
+
+    await handleCallbackQuery(ctx, "telegram-token", callbackQuery("approve_apr-1"), BASE_URL, "pcp_board_test");
+
+    // Must not claim success: no "Approved" ack and no resolved-decision edit.
+    expect(answerCallbackQuery).not.toHaveBeenCalledWith(
+      ctx,
+      "telegram-token",
+      "callback-1",
+      "Approved",
+    );
+    expect(editMessage).not.toHaveBeenCalled();
+
+    // The board action is surfaced as an actionable failure.
+    expect(answerCallbackQuery).toHaveBeenCalledTimes(1);
+    const [, , , message] = telegramMocks.answerCallbackQuery.mock.calls[0] as unknown as [
+      unknown,
+      unknown,
+      unknown,
+      string,
+    ];
+    expect(message).toMatch(/^Failed: /);
+    expect(message).toContain("Cloudflare Access");
+  });
+
+  it("fails closed on a Cloudflare Access challenge for rejections too", async () => {
+    const ctx = mockCtx(accessLoginRes());
+
+    await handleCallbackQuery(ctx, "telegram-token", callbackQuery("reject_apr-9"), BASE_URL, "pcp_board_test");
+
+    expect(answerCallbackQuery).not.toHaveBeenCalledWith(
+      ctx,
+      "telegram-token",
+      "callback-1",
+      "Rejected",
+    );
+    expect(editMessage).not.toHaveBeenCalled();
+    const [, , , message] = telegramMocks.answerCallbackQuery.mock.calls[0] as unknown as [
+      unknown,
+      unknown,
+      unknown,
+      string,
+    ];
+    expect(message).toMatch(/^Failed: /);
   });
 
   it("confirms a successful approval as Approved", async () => {
