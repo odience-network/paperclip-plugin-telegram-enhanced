@@ -72,12 +72,34 @@ export async function fetchPaperclipApi(
   return response;
 }
 
+/**
+ * Cloudflare Access service-token pair (ODIAA-742). When the Paperclip board is
+ * fronted by Cloudflare Access, a bare `Authorization: Bearer <token>` is
+ * rejected with an interactive login challenge, so plugin→board calls
+ * (Approve/Reject buttons, `/approve`) silently fail. Sending the service
+ * token's `CF-Access-Client-Id` / `CF-Access-Client-Secret` pair lets the
+ * request through Access to the origin. Both values are required — Access
+ * ignores a half-configured pair — and are sourced from secret-refs, never
+ * logged or echoed.
+ */
+export type CfAccessHeaders = {
+  clientId: string;
+  clientSecret: string;
+};
+
 export function buildPaperclipAuthHeaders(
   boardApiToken?: string,
+  cfAccessHeaders?: CfAccessHeaders,
 ): Record<string, string> {
-  return boardApiToken
-    ? {
-        Authorization: `Bearer ${boardApiToken}`,
-      }
-    : {};
+  const headers: Record<string, string> = {};
+  if (boardApiToken) {
+    headers.Authorization = `Bearer ${boardApiToken}`;
+  }
+  // Only attach the Cloudflare Access pair when BOTH halves are present; a lone
+  // id or secret is never useful to Access and would just leak a partial header.
+  if (cfAccessHeaders?.clientId && cfAccessHeaders.clientSecret) {
+    headers["CF-Access-Client-Id"] = cfAccessHeaders.clientId;
+    headers["CF-Access-Client-Secret"] = cfAccessHeaders.clientSecret;
+  }
+  return headers;
 }

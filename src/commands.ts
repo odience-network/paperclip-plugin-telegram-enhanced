@@ -2,7 +2,7 @@ import type { PluginContext, PluginEvent, Agent, Issue, Project } from "@papercl
 import { sendMessage, escapeMarkdownV2, sendChatAction } from "./telegram-api.js";
 import { METRIC_NAMES } from "./constants.js";
 import { handleAcpCommand } from "./acp-bridge.js";
-import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
+import { buildPaperclipAuthHeaders, fetchPaperclipApi, type CfAccessHeaders } from "./paperclip-api.js";
 
 type BotCommand = {
   command: string;
@@ -44,6 +44,7 @@ export async function handleCommand(
   companyId?: string,
   boardApiToken?: string,
   maxAgentsPerThread?: number,
+  cfAccessHeaders?: CfAccessHeaders,
 ): Promise<void> {
   await ctx.metrics.write(METRIC_NAMES.commandsHandled, 1);
 
@@ -61,7 +62,7 @@ export async function handleCommand(
       await handleAgents(ctx, token, chatId, messageThreadId, publicUrl, companyId);
       break;
     case "approve":
-      await handleApprove(ctx, token, chatId, args, messageThreadId, baseUrl, boardApiToken);
+      await handleApprove(ctx, token, chatId, args, messageThreadId, baseUrl, boardApiToken, cfAccessHeaders);
       break;
     case "help":
       await handleHelp(ctx, token, chatId, messageThreadId);
@@ -241,6 +242,7 @@ async function handleApprove(
   messageThreadId?: number,
   baseUrl: string = "http://localhost:3100",
   boardApiToken?: string,
+  cfAccessHeaders?: CfAccessHeaders,
 ): Promise<void> {
   if (!approvalId.trim()) {
     await sendMessage(ctx, token, chatId, "Usage: /approve <approval-id>", {
@@ -257,7 +259,7 @@ async function handleApprove(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...buildPaperclipAuthHeaders(boardApiToken),
+          ...buildPaperclipAuthHeaders(boardApiToken, cfAccessHeaders),
         },
         body: JSON.stringify({ decidedByUserId: `telegram:${chatId}` }),
       },

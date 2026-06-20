@@ -118,4 +118,53 @@ describe("buildPaperclipAuthHeaders", () => {
     });
     expect(buildPaperclipAuthHeaders()).toEqual({});
   });
+
+  it("attaches Cloudflare Access service-token headers when both halves are set (ODIAA-742)", () => {
+    expect(
+      buildPaperclipAuthHeaders("pcp_board_token", {
+        clientId: "cf-id.access",
+        clientSecret: "cf-secret",
+      }),
+    ).toEqual({
+      Authorization: "Bearer pcp_board_token",
+      "CF-Access-Client-Id": "cf-id.access",
+      "CF-Access-Client-Secret": "cf-secret",
+    });
+  });
+
+  it("omits Cloudflare Access headers when no CF-Access pair is provided", () => {
+    expect(buildPaperclipAuthHeaders("pcp_board_token")).not.toHaveProperty(
+      "CF-Access-Client-Id",
+    );
+    expect(buildPaperclipAuthHeaders("pcp_board_token")).not.toHaveProperty(
+      "CF-Access-Client-Secret",
+    );
+  });
+
+  it("attaches Cloudflare Access headers even without a board token", () => {
+    expect(
+      buildPaperclipAuthHeaders(undefined, {
+        clientId: "cf-id.access",
+        clientSecret: "cf-secret",
+      }),
+    ).toEqual({
+      "CF-Access-Client-Id": "cf-id.access",
+      "CF-Access-Client-Secret": "cf-secret",
+    });
+  });
+
+  it("ignores a half-configured Cloudflare Access pair", () => {
+    expect(
+      buildPaperclipAuthHeaders("pcp_board_token", {
+        clientId: "cf-id.access",
+        clientSecret: "",
+      }),
+    ).toEqual({ Authorization: "Bearer pcp_board_token" });
+    expect(
+      buildPaperclipAuthHeaders("pcp_board_token", {
+        clientId: "",
+        clientSecret: "cf-secret",
+      }),
+    ).toEqual({ Authorization: "Bearer pcp_board_token" });
+  });
 });

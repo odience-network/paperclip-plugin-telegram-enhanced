@@ -108,6 +108,8 @@ type BotConnectionRegistration = {
 
 type TelegramBoardConfig = {
   paperclipBoardApiTokenRef: string;
+  cfAccessClientIdRef: string;
+  cfAccessClientSecretRef: string;
 };
 
 type TelegramAccessConfig = {
@@ -178,6 +180,8 @@ const DEFAULT_CONNECTION_CONFIG: TelegramConnectionConfig = {
 
 const DEFAULT_BOARD_CONFIG: TelegramBoardConfig = {
   paperclipBoardApiTokenRef: "",
+  cfAccessClientIdRef: "",
+  cfAccessClientSecretRef: "",
 };
 
 const DEFAULT_ACCESS_CONFIG: TelegramAccessConfig = {
@@ -384,6 +388,8 @@ function extractConnectionConfig(config: Record<string, unknown>): TelegramConne
 function extractBoardConfig(config: Record<string, unknown>): TelegramBoardConfig {
   return {
     paperclipBoardApiTokenRef: asString(config.paperclipBoardApiTokenRef),
+    cfAccessClientIdRef: asString(config.cfAccessClientIdRef),
+    cfAccessClientSecretRef: asString(config.cfAccessClientSecretRef),
   };
 }
 
@@ -1709,6 +1715,26 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             value={boardConfig.paperclipBoardApiTokenRef}
           >
             Optional manual fallback for approval buttons and /approve. The Board Access Connection above is preferred because it creates and tracks the company-scoped secret for you.
+          </TextField>
+
+          <TextField
+            disabled={boardConfigLoading || boardConfigSaving}
+            label="Cloudflare Access (optional) — Client ID secret ref"
+            onChange={(value) => updateBoardField("cfAccessClientIdRef", value)}
+            placeholder="Optional Paperclip secret UUID"
+            value={boardConfig.cfAccessClientIdRef}
+          >
+            If the Paperclip board sits behind Cloudflare Access, set both Client ID and Client Secret refs so approval buttons and /approve send the service-token <code>CF-Access-Client-Id</code> / <code>CF-Access-Client-Secret</code> headers. Leave both blank when not behind Access.
+          </TextField>
+
+          <TextField
+            disabled={boardConfigLoading || boardConfigSaving}
+            label="Cloudflare Access (optional) — Client Secret secret ref"
+            onChange={(value) => updateBoardField("cfAccessClientSecretRef", value)}
+            placeholder="Optional Paperclip secret UUID"
+            value={boardConfig.cfAccessClientSecretRef}
+          >
+            Paired with the Client ID above. Both must be set for Cloudflare Access headers to be attached; a half-configured pair is ignored.
           </TextField>
 
           {boardConfigMessage ? <NoticeBlock notice={boardConfigMessage} /> : null}
