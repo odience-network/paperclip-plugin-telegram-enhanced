@@ -5,6 +5,7 @@ import {
   type PluginSettingsPageProps,
 } from "@paperclipai/plugin-sdk/ui";
 import { PLUGIN_ID } from "../constants.js";
+import { evaluateInternalUrlGuidance } from "../internal-url-guidance.js";
 
 type BoardAccessRegistration = {
   configured: boolean;
@@ -743,6 +744,10 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
   const identity = boardAccess.data?.identity?.trim() || null;
   const routingDirty = JSON.stringify(routingConfig) !== JSON.stringify(routingSnapshot);
   const connectionDirty = JSON.stringify(connectionConfig) !== JSON.stringify(connectionSnapshot);
+  const baseUrlGuidance = evaluateInternalUrlGuidance(
+    connectionConfig.paperclipBaseUrl,
+    connectionConfig.paperclipPublicUrl,
+  );
   const boardConfigDirty = JSON.stringify(boardConfig) !== JSON.stringify(boardSnapshot);
   const accessDirty = JSON.stringify(accessConfig) !== JSON.stringify(accessSnapshot);
   const mediaDirty = JSON.stringify(mediaConfig) !== JSON.stringify(mediaSnapshot);
@@ -1558,13 +1563,14 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
           </TextField>
           <TextField
             disabled={connectionLoading || connectionSaving}
-            label="Paperclip API URL"
+            label="Paperclip API URL (internal)"
             onChange={(value) => updateConnectionField("paperclipBaseUrl", value)}
             placeholder="http://localhost:3100"
             value={connectionConfig.paperclipBaseUrl}
           >
-            Internal Paperclip API URL used by the plugin for actions such as approvals and comments. Keep localhost for same-server deployments.
+            Internal address the worker calls directly for approvals and comments. Keep it loopback/internal (e.g. <code>http://localhost:3100</code>) for same-server deployments. Behind Cloudflare Access, a public hostname here is intercepted by the Access login wall and approval buttons silently fail — use an internal address, or a Cloudflare Access service token for remote workers.
           </TextField>
+          {baseUrlGuidance ? <WarningBlock message={baseUrlGuidance.message} /> : null}
           <TextField
             disabled={connectionLoading || connectionSaving}
             label="Paperclip public URL"
@@ -1572,7 +1578,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             placeholder="https://paperclip.example.com"
             value={connectionConfig.paperclipPublicUrl}
           >
-            Public URL used in Telegram links. Leave empty to fall back to the API URL.
+            Public hostname embedded in Telegram links for humans — this is the Cloudflare Access–protected address. Leave empty to fall back to the API URL.
           </TextField>
         </div>
 
@@ -2799,6 +2805,26 @@ function NoticeBlock({ notice }: { notice: Notice }): React.JSX.Element {
     >
       <strong>{notice.title}</strong>
       {notice.text ? <p style={{ margin: "6px 0 0" }}>{notice.text}</p> : null}
+    </div>
+  );
+}
+
+// Non-blocking amber advisory rendered inline under a field (e.g. the Cloudflare
+// Access internal base-URL hint). Distinct from NoticeBlock's success/error tones.
+function WarningBlock({ message }: { message: string }): React.JSX.Element {
+  return (
+    <div
+      style={{
+        border: "1px solid #fde68a",
+        borderRadius: 8,
+        background: "#fffbeb",
+        color: "#92400e",
+        fontSize: 13,
+        lineHeight: "18px",
+        padding: 12,
+      }}
+    >
+      <strong>Heads up:</strong> {message}
     </div>
   );
 }
