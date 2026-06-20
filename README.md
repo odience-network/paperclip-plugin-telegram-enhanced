@@ -24,6 +24,7 @@ Paperclip agents  ⇄  Telegram bot  ⇄  You
 - [Documentation](#documentation)
 - [Configuration at a glance](#configuration-at-a-glance)
 - [Agent tools](#agent-tools)
+- [Cloudflare Access](#cloudflare-access)
 - [Compatibility note](#compatibility-note-paperclipai-master)
 - [Why this plugin](#why-this-plugin)
 - [Contributing](#contributing)
@@ -106,6 +107,7 @@ Set `telegramBotTokenRef` to the secret UUID and `defaultChatId` to your chat ID
 |-------|---------------|
 | **[Getting Started](docs/getting-started.md)** | Step-by-step setup, secrets, board access, and security allowlists. |
 | **[Configuration Reference](docs/configuration.md)** | Every config setting, default, and what it does. |
+| **[Cloudflare Access](docs/cloudflare-access.md)** | Make approvals work when the board is behind Cloudflare Access. |
 | **[Notifications & Routing](docs/notifications.md)** | Notification types, per-type chats, forum topics, and digests. |
 | **[Bot Commands](docs/commands.md)** | Full command reference with examples. |
 | **[Agent Tools](docs/agent-tools.md)** | Escalation, multi-agent threads, handoff/discuss, and watches. |
@@ -152,6 +154,19 @@ Details and parameters are in the **[Agent Tools guide](docs/agent-tools.md)**.
 > The new Secrets Manager temporarily disables plugin secret-ref UUIDs while a company-scoped `plugin_config` follow-up lands. Activation fails with `Plugin secret references are disabled until company-scoped plugin config lands`, and `POST /api/plugins/:id/config` returns HTTP 422 for configs containing secret-ref UUIDs (e.g. `telegramBotTokenRef`). This is intentional fail-closed mitigation (PAP-2394). Until the follow-up ships, pin to the last `paperclipai` release before #5429.
 
 See [Troubleshooting](docs/troubleshooting.md) for the full background and workaround.
+
+---
+
+## Cloudflare Access
+
+If your Paperclip board is fronted by **Cloudflare Access**, a bare bearer token is intercepted with a login challenge, so the plugin's **Approve/Reject** buttons and `/approve` silently fail. Two knobs make it work:
+
+- Point **`paperclipBaseUrl`** at an **internal** address the worker reaches directly (e.g. `http://localhost:3100`), and keep the public Access-protected hostname in **`paperclipPublicUrl`** for human links.
+- For remote workers that can only reach the board over the public hostname, mint a Cloudflare Access **service token** and set **`cfAccessClientIdRef`** + **`cfAccessClientSecretRef`** (sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret`).
+
+> **Caveat:** `url:` deep-link buttons (Open issue ↗, View Run ↗) open the public UI behind Access and need an authenticated **browser** session — a service token doesn't help there. Rely on in-chat `callback_data` actions, add an Access bypass policy for read-only deep links, or suppress the `url:` buttons.
+
+Full walkthrough — network legs, minting a service token, and the caveat — in **[docs/cloudflare-access.md](docs/cloudflare-access.md)**.
 
 ---
 
