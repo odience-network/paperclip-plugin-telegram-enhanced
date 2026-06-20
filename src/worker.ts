@@ -13,6 +13,7 @@ import {
   editMessage,
   answerCallbackQuery,
   setMyCommands,
+  getMe,
   escapeMarkdownV2,
   isForum,
   GENERAL_TOPIC_THREAD_ID,
@@ -216,6 +217,108 @@ function getBoardAccessRegistration(
     ...state,
     configured: Boolean(state.paperclipBoardApiTokenRef),
   };
+}
+
+// --- Instance-wide bot connection (ODIAA-720) -----------------------------
+// The plugin runs instance-wide (one worker/config for all companies), so the
+// Telegram bot must be configured once for the whole instance — not as a
+// per-company secret. We store the raw bot token in instance-scoped plugin
+// state, written only by the Settings "Bot Connection" action and never read
+// back to the frontend (the UI sees a masked registration). This also avoids
+// the post-#5429 secret-ref kill switch on paperclipai master, which disables
+// company-scoped plugin secret-refs. The legacy `telegramBotTokenRef` secret
+// ref still works as a fallback for existing installs.
+export const BOT_CONNECTION_SCOPE = {
+  scopeKind: "instance",
+  stateKey: "telegram.bot-connection.v1",
+} as const;
+
+export type TelegramBotConnectionState = {
+  botToken: string | null;
+  botUsername: string | null;
+  botId: string | null;
+  updatedAt: string | null;
+};
+
+type TelegramBotTokenSource = "instance-state" | "config-secret-ref";
+
+type TelegramBotConnectionRegistration = {
+  configured: boolean;
+  source: TelegramBotTokenSource | null;
+  botUsername: string | null;
+  botId: string | null;
+  updatedAt: string | null;
+};
+
+function normalizeBotConnectionState(value: unknown): TelegramBotConnectionState {
+  const record = isRecord(value) ? value : {};
+  return {
+    botToken: asNonEmptyString(record.botToken),
+    botUsername: asNonEmptyString(record.botUsername),
+    botId: asNonEmptyString(record.botId),
+    updatedAt: asNonEmptyString(record.updatedAt),
+  };
+}
+
+async function loadBotConnectionState(ctx: PluginContext): Promise<TelegramBotConnectionState> {
+  return normalizeBotConnectionState(await ctx.state.get(BOT_CONNECTION_SCOPE));
+}
+
+async function persistBotConnectionState(
+  ctx: PluginContext,
+  state: TelegramBotConnectionState,
+): Promise<void> {
+  await ctx.state.set(BOT_CONNECTION_SCOPE, normalizeBotConnectionState(state));
+}
+
+// Masked status for the Settings UI — never leaks the raw token.
+export function getBotConnectionRegistration(
+  state: TelegramBotConnectionState,
+  config: Pick<TelegramConfig, "telegramBotTokenRef">,
+): TelegramBotConnectionRegistration {
+  if (state.botToken) {
+    return {
+      configured: true,
+      source: "instance-state",
+      botUsername: state.botUsername,
+      botId: state.botId,
+      updatedAt: state.updatedAt,
+    };
+  }
+  if (asNonEmptyString(config.telegramBotTokenRef)) {
+    return {
+      configured: true,
+      source: "config-secret-ref",
+      botUsername: null,
+      botId: null,
+      updatedAt: null,
+    };
+  }
+  return { configured: false, source: null, botUsername: null, botId: null, updatedAt: null };
+}
+
+// Resolve the live bot token: prefer the instance-state connection, then fall
+// back to the legacy company secret ref.
+export async function resolveBotToken(
+  ctx: PluginContext,
+  config: TelegramConfig,
+): Promise<{ token: string; source: TelegramBotTokenSource } | null> {
+  const state = await loadBotConnectionState(ctx);
+  if (state.botToken) {
+    return { token: state.botToken, source: "instance-state" };
+  }
+  const ref = asNonEmptyString(config.telegramBotTokenRef);
+  if (ref) {
+    try {
+      const token = await ctx.secrets.resolve(ref);
+      if (token) return { token, source: "config-secret-ref" };
+    } catch (err) {
+      ctx.logger.warn("Failed to resolve telegramBotTokenRef secret", {
+        error: String(err),
+      });
+    }
+  }
+  return null;
 }
 
 async function resolveBoardApiToken(
@@ -804,12 +907,62 @@ const plugin = definePlugin({
       });
     });
 
-    if (!config.telegramBotTokenRef) {
-      ctx.logger.warn("No telegramBotTokenRef configured, plugin disabled");
+    // --- Instance-wide bot connection (ODIAA-720) ---
+    // Registered before the token guard so the Settings UI can connect a bot
+    // even when none is configured yet (the worker reloads on the follow-up
+    // config save and then starts polling).
+    ctx.data.register("telegram-connection.read", async () =>
+      getBotConnectionRegistration(await loadBotConnectionState(ctx), config),
+    );
+
+    ctx.actions.register("telegram-connection.update", async (params) => {
+      const record = isRecord(params) ? params : {};
+      const rawToken = asNonEmptyString(record.token);
+      if (!rawToken) {
+        throw new Error("token is required");
+      }
+      // Validate the token live before persisting so we never store junk.
+      const info = await getMe(ctx, rawToken);
+      if (!info) {
+        throw new Error(
+          "Telegram rejected this token (getMe failed). Paste the token from @BotFather exactly.",
+        );
+      }
+      const next: TelegramBotConnectionState = {
+        botToken: rawToken,
+        botUsername: asNonEmptyString(info.username),
+        botId: info.id != null ? String(info.id) : null,
+        updatedAt: new Date().toISOString(),
+      };
+      await persistBotConnectionState(ctx, next);
+      ctx.logger.info("Telegram bot connected instance-wide", {
+        botUsername: next.botUsername,
+        botId: next.botId,
+      });
+      return getBotConnectionRegistration(next, config);
+    });
+
+    ctx.actions.register("telegram-connection.clear", async () => {
+      const cleared: TelegramBotConnectionState = {
+        botToken: null,
+        botUsername: null,
+        botId: null,
+        updatedAt: new Date().toISOString(),
+      };
+      await persistBotConnectionState(ctx, cleared);
+      ctx.logger.info("Telegram bot connection cleared");
+      return getBotConnectionRegistration(cleared, config);
+    });
+
+    const resolvedToken = await resolveBotToken(ctx, config);
+    if (!resolvedToken) {
+      ctx.logger.warn(
+        "No Telegram bot token configured (instance connection or secret ref); plugin idle until connected via Settings → Bot Connection.",
+      );
       return;
     }
-
-    const token = await ctx.secrets.resolve(config.telegramBotTokenRef);
+    const token = resolvedToken.token;
+    ctx.logger.info("Telegram bot token resolved", { source: resolvedToken.source });
 
     // --- Agent file-send action (ant013 TEL-8 / TEL-23) ---
     // Expose the send tool as a directly-invokable action so non-tool callers
