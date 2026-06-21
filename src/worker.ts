@@ -890,6 +890,37 @@ const plugin = definePlugin({
     const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     const publicUrl = config.paperclipPublicUrl || baseUrl;
 
+    // Live bot token, resolved lazily. The instance-wide connection (ODIAA-720)
+    // is stored in plugin *state*, which — unlike config — does NOT restart the
+    // worker. So we never gate handler registration on a token being present at
+    // setup time (the SDK requires handlers to register synchronously during
+    // setup). Instead every token consumer reads this mutable through its
+    // closure, and the connect/clear actions update it in place. The polling
+    // loop starts unconditionally and idles until a token appears.
+    let token = "";
+    let commandsRegistered = false;
+    const ensureBotCommands = (): void => {
+      if (!token || commandsRegistered || !config.enableCommands) return;
+      commandsRegistered = true;
+      const allCommands = [
+        ...BOT_COMMANDS,
+        { command: "commands", description: "Manage custom workflow commands" },
+      ];
+      // Non-blocking: don't hold up the caller on the external Telegram API.
+      setMyCommands(ctx, token, allCommands)
+        .then((registered) => {
+          if (registered) {
+            ctx.logger.info("Bot commands registered with Telegram");
+          }
+        })
+        .catch((err) => {
+          commandsRegistered = false;
+          ctx.logger.error("Failed to register bot commands", {
+            error: String(err),
+          });
+        });
+    };
+
     ctx.data.register("board-access.read", async () => getBoardAccessRegistration(await loadBoardAccessState(ctx)));
 
     ctx.actions.register("board-access.update", async (params) => {
@@ -935,6 +966,11 @@ const plugin = definePlugin({
         updatedAt: new Date().toISOString(),
       };
       await persistBotConnectionState(ctx, next);
+      // Activate the freshly-connected token in-process so inbound polling and
+      // every token-bound handler start working immediately — no worker restart
+      // (the connection lives in plugin state, which does not trigger one).
+      token = rawToken;
+      ensureBotCommands();
       ctx.logger.info("Telegram bot connected instance-wide", {
         botUsername: next.botUsername,
         botId: next.botId,
@@ -950,19 +986,24 @@ const plugin = definePlugin({
         updatedAt: new Date().toISOString(),
       };
       await persistBotConnectionState(ctx, cleared);
+      // Fall back to a legacy secret-ref token if one is still configured, else
+      // go idle. Polling skips iterations while the token is empty.
+      const fallback = await resolveBotToken(ctx, config);
+      token = fallback?.token ?? "";
+      commandsRegistered = false;
       ctx.logger.info("Telegram bot connection cleared");
       return getBotConnectionRegistration(cleared, config);
     });
 
     const resolvedToken = await resolveBotToken(ctx, config);
-    if (!resolvedToken) {
+    if (resolvedToken) {
+      token = resolvedToken.token;
+      ctx.logger.info("Telegram bot token resolved", { source: resolvedToken.source });
+    } else {
       ctx.logger.warn(
-        "No Telegram bot token configured (instance connection or secret ref); plugin idle until connected via Settings → Bot Connection.",
+        "No Telegram bot token configured yet; handlers registered, inbound polling idle until connected via Settings → Bot Connection.",
       );
-      return;
     }
-    const token = resolvedToken.token;
-    ctx.logger.info("Telegram bot token resolved", { source: resolvedToken.source });
 
     // --- Agent file-send action (ant013 TEL-8 / TEL-23) ---
     // Expose the send tool as a directly-invokable action so non-tool callers
@@ -982,27 +1023,9 @@ const plugin = definePlugin({
     ctx.actions.register("send_file_to_telegram", (params) => invokeSendToTelegramAction(params as Record<string, unknown>));
 
     // --- Register bot commands with Telegram ---
-    if (config.enableCommands) {
-      const allCommands = [
-        ...BOT_COMMANDS,
-        { command: "commands", description: "Manage custom workflow commands" },
-      ];
-      // Non-blocking init: don't hold up worker initialize on external API.
-      // The host's worker-init RPC timeout is 15s; if api.telegram.org is
-      // slow/unreachable, awaiting this call causes the worker to be SIGKILLed
-      // before setup() completes. Fire-and-forget matches pollUpdates() below.
-      setMyCommands(ctx, token, allCommands)
-        .then((registered) => {
-          if (registered) {
-            ctx.logger.info("Bot commands registered with Telegram");
-          }
-        })
-        .catch((err) => {
-          ctx.logger.error("Failed to register bot commands", {
-            error: String(err),
-          });
-        });
-    }
+    // Non-blocking; no-op until a token is present. Re-invoked by the connect
+    // action so a bot connected after startup still gets its command list.
+    ensureBotCommands();
 
     // --- Long polling for inbound messages ---
     let pollingActive = true;
@@ -1010,6 +1033,12 @@ const plugin = definePlugin({
 
     async function pollUpdates(): Promise<void> {
       while (pollingActive) {
+        // Idle until a bot is connected. The connect action sets `token`
+        // in-process, so polling resumes within ~2s of connecting — no restart.
+        if (!token) {
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
         try {
           const res = await ctx.http.fetch(
             `${TELEGRAM_API}/bot${token}/getUpdates?offset=${lastUpdateId + 1}&timeout=10&allowed_updates=["message","callback_query"]`,
@@ -1047,7 +1076,7 @@ const plugin = definePlugin({
     });
 
     // --- Phase 2: ACP output listener (cross-plugin events) ---
-    setupAcpOutputListener(ctx, token);
+    setupAcpOutputListener(ctx, () => token);
 
     // --- Event subscriptions ---
 
@@ -1070,6 +1099,9 @@ const plugin = definePlugin({
       overrideTopicId?: string,
       deliveryKey?: string,
     ) => {
+      // No bot connected yet — nothing to deliver to. Avoids calling the
+      // Telegram API with an empty token before Settings → Bot Connection.
+      if (!token) return;
       const chatId = await resolveChat(
         ctx,
         event.companyId,
