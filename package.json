@@ -1,6 +1,6 @@
 {
   "name": "@odience-network/paperclip-plugin-telegram-enhanced",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Enhanced bidirectional Telegram integration for Paperclip: push notifications, bot commands, escalation, multi-agent sessions (native + ACP), media pipeline, custom workflow commands, and proactive suggestion watches. Maintained by Odience Network; enhanced fork of mvanhorn/paperclip-plugin-telegram.",
   "keywords": [
