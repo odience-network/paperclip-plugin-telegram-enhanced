@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getSessions, routeMessageToAgent, handleHandoffToolCall } from "../src/acp-bridge.js";
+import { getSessions, routeMessageToAgent, handleHandoffToolCall, setupAcpOutputListener } from "../src/acp-bridge.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
 let sentMessages: Array<{ chatId: string; text: string; options?: Record<string, unknown> }> = [];
@@ -58,6 +58,31 @@ beforeEach(() => {
   sentMessages = [];
   stateStore = {};
   emittedEvents = [];
+});
+
+describe("setupAcpOutputListener (lazy token, ODIAA-720)", () => {
+  it("resolves the token at event time and skips when none is connected", async () => {
+    const ctx = mockCtx();
+    let registered: ((event: { payload: unknown }) => Promise<void>) | undefined;
+    (ctx.events.on as ReturnType<typeof vi.fn>).mockImplementation(
+      (_evt: string, handler: (event: { payload: unknown }) => Promise<void>) => {
+        registered = handler;
+      },
+    );
+
+    let token = "";
+    setupAcpOutputListener(ctx, () => token);
+    expect(registered).toBeTypeOf("function");
+
+    // No bot connected yet: an inbound ACP output event is a no-op (no send).
+    await registered!({ payload: { chatId: "chat-1", text: "hi" } });
+    expect(sentMessages).toHaveLength(0);
+
+    // Connect a bot in-process; the same listener now delivers without re-registration.
+    token = "123:abc";
+    await registered!({ payload: { chatId: "chat-1", text: "hello", agentId: "a1" } });
+    expect(sentMessages.length).toBeGreaterThan(0);
+  });
 });
 
 describe("getSessions", () => {
