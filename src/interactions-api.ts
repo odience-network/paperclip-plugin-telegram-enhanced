@@ -47,6 +47,18 @@ export type RespondInteractionInput = {
 
 export type InteractionRecord = Record<string, unknown>;
 
+export class PaperclipApiError extends Error {
+  readonly status: number;
+  readonly detail: string;
+
+  constructor(message: string, status: number, detail: string) {
+    super(detail ? `${message} (${status}): ${detail}` : `${message} (${status})`);
+    this.name = "PaperclipApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 function requireBoardToken(boardApiToken: string): void {
   if (!boardApiToken) {
     throw new Error("Board API token missing (set boardApiToken or boardApiTokenRef)");
@@ -93,7 +105,7 @@ export async function fetchInteraction(
   if (!response.ok) {
     const detail = await readErrorDetail(response);
     const status = response.status ?? 0;
-    throw new Error(`Interaction list fetch failed (${status})${detail ? `: ${detail}` : ""}`);
+    throw new PaperclipApiError("Interaction list fetch failed", status, detail);
   }
 
   const parsed = await readJson(response);
@@ -132,5 +144,12 @@ export async function respondInteraction(
 
   const detail = await readErrorDetail(response);
   const status = response.status ?? 0;
-  throw new Error(`Interaction ${action} failed (${status})${detail ? `: ${detail}` : ""}`);
+  throw new PaperclipApiError(`Interaction ${action} failed`, status, detail);
+}
+
+export function isAlreadyResolvedInteractionError(error: unknown): boolean {
+  const record = error && typeof error === "object" ? (error as Record<string, unknown>) : null;
+  const status = typeof record?.status === "number" ? record.status : null;
+  const detail = typeof record?.detail === "string" ? record.detail : "";
+  return status === 409 && /interaction has already been resolved/i.test(detail);
 }
