@@ -36,7 +36,11 @@ import {
   formatInteractionCreated,
   type IssueLinksOpts,
 } from "./formatters.js";
-import { fetchInteraction } from "./interactions-api.js";
+import {
+  fetchInteraction,
+  respondInteraction,
+  isAlreadyResolvedInteractionError,
+} from "./interactions-api.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
 import {
   routeMessageToAgent,
