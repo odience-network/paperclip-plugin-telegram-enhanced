@@ -46,6 +46,9 @@ export const DEFAULT_CONFIG = {
     chatId: string;
     topicId?: string;
   }>,
+  // User-scoped decision routing (ODIAA-938). Empty => legacy broadcast behaviour.
+  userChatMappings: {} as Record<string, string>,
+  telegramActorMappings: {} as Record<string, string>,
   digestMode: "off" as "off" | "daily" | "bidaily" | "tridaily",
   dailyDigestTime: "09:00",
   bidailySecondTime: "17:00",
