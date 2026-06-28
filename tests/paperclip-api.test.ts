@@ -70,6 +70,74 @@ describe("fetchPaperclipApi", () => {
     expect(err.status).toBe(403);
     expect(err.detail).toContain("Forbidden");
   });
+
+  // ODIAA-746: a Cloudflare Access login challenge followed to a 200 HTML page
+  // must fail closed, not be reported as a successful board action.
+  describe("fails closed on a Cloudflare Access challenge masquerading as 2xx", () => {
+    it("rejects a 200 text/html Access login page (no JSON envelope)", async () => {
+      const ctx = mockCtx();
+      const nativeFetch = vi.fn(async () =>
+        new Response("<html><body>Sign in to Cloudflare Access</body></html>", {
+          status: 200,
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        }),
+      );
+      vi.stubGlobal("fetch", nativeFetch);
+
+      const promise = fetchPaperclipApi(ctx, "http://127.0.0.1:3101/api/approvals/apr-1/approve", {
+        method: "POST",
+      });
+      await expect(promise).rejects.toBeInstanceOf(PaperclipApiError);
+      const err = await promise.catch((e) => e);
+      expect(String(err)).toContain("Cloudflare Access");
+    });
+
+    it("rejects when the cf-mitigated challenge header is present", async () => {
+      const ctx = mockCtx();
+      const nativeFetch = vi.fn(async () =>
+        new Response("{}", {
+          status: 200,
+          headers: { "Content-Type": "application/json", "cf-mitigated": "challenge" },
+        }),
+      );
+      vi.stubGlobal("fetch", nativeFetch);
+
+      await expect(
+        fetchPaperclipApi(ctx, "http://127.0.0.1:3101/api/approvals/apr-1/approve", {
+          method: "POST",
+        }),
+      ).rejects.toBeInstanceOf(PaperclipApiError);
+    });
+
+    it("accepts a legitimate JSON board response", async () => {
+      const ctx = mockCtx();
+      const nativeFetch = vi.fn(async () =>
+        new Response(JSON.stringify({ id: "apr-1", status: "approved" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", nativeFetch);
+
+      await expect(
+        fetchPaperclipApi(ctx, "http://127.0.0.1:3101/api/approvals/apr-1/approve", {
+          method: "POST",
+        }),
+      ).resolves.toBeInstanceOf(Response);
+    });
+
+    it("accepts a 204 No Content response (no content-type, not a challenge)", async () => {
+      const ctx = mockCtx();
+      const nativeFetch = vi.fn(async () => new Response(null, { status: 204 }));
+      vi.stubGlobal("fetch", nativeFetch);
+
+      await expect(
+        fetchPaperclipApi(ctx, "http://127.0.0.1:3101/api/approvals/apr-1/approve", {
+          method: "POST",
+        }),
+      ).resolves.toBeInstanceOf(Response);
+    });
+  });
 });
 
 describe("isAlreadyResolvedConflict (TWX-328)", () => {

@@ -49,6 +49,47 @@ function isLoopbackUrl(url: string): boolean {
   }
 }
 
+/**
+ * Fail-securely detection for a Cloudflare Access login challenge that slipped
+ * through as a 2xx (ODIAA-746, follow-up to ODIAA-744/ODIAA-732).
+ *
+ * When the board sits behind Cloudflare Access but the service-token refs
+ * (`cfAccessClientIdRef` / `cfAccessClientSecretRef`) are missing or invalid, a
+ * plugin→board approve/reject call carries only `Authorization: Bearer …`.
+ * Access challenges it with a `302` to the SSO login page; `ctx.http.fetch`
+ * follows redirects by default, so the *final* response is the Access login
+ * HTML returning `200 OK`. Treating that as success makes the bot report
+ * "Approved"/"Rejected" while the board action never executed.
+ *
+ * Board approval/reject endpoints only ever return a JSON envelope, so any of
+ * these signals means the action did not execute and we must fail closed.
+ * Detection (cheapest first), kept narrow so legitimate JSON / empty (204)
+ * responses are never misclassified:
+ *   - `cf-mitigated` header — Cloudflare's explicit challenge marker;
+ *   - final response URL host ending in `.cloudflareaccess.com`;
+ *   - `Content-Type: text/html` where a JSON envelope is expected.
+ */
+function detectCloudflareAccessChallenge(response: Response): string | null {
+  if (response.headers.get("cf-mitigated")) {
+    return "Cloudflare Access challenge (cf-mitigated header present); board action did not execute";
+  }
+
+  try {
+    if (response.url && new URL(response.url).hostname.endsWith(".cloudflareaccess.com")) {
+      return "Cloudflare Access login redirect (response served from *.cloudflareaccess.com); board action did not execute";
+    }
+  } catch {
+    // response.url may be empty/relative in some runtimes; fall through.
+  }
+
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (contentType.includes("text/html")) {
+    return "non-JSON board response (Content-Type text/html — likely a Cloudflare Access login page); board action did not execute";
+  }
+
+  return null;
+}
+
 export async function fetchPaperclipApi(
   ctx: PluginContext,
   url: string,
@@ -67,6 +108,13 @@ export async function fetchPaperclipApi(
     }
     const detail = body ? body.slice(0, 300) : "";
     throw new PaperclipApiError(response.status, detail);
+  }
+
+  // Fail closed: a 2xx that is actually a Cloudflare Access login challenge must
+  // be treated as a failed board action, not a false "Approved"/"Rejected".
+  const accessChallenge = detectCloudflareAccessChallenge(response);
+  if (accessChallenge) {
+    throw new PaperclipApiError(response.status, accessChallenge);
   }
 
   return response;
