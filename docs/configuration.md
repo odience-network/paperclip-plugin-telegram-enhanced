@@ -11,8 +11,8 @@ Every plugin setting, its default, and what it controls. Only `telegramBotTokenR
 | Bot token (Bot Connection) | ✅ | — | Connect the bot instance-wide via **Settings → Bot Connection**. Stored server-side; not a config field. See [Getting Started](getting-started.md#4-connect-your-bot-instance-wide). |
 | `telegramBotTokenRef` | | — | **Optional / legacy.** Secret **UUID** fallback for the bot token. Prefer Bot Connection (secret-refs are company-scoped and disabled on recent master, post-#5429). |
 | `defaultChatId` | | — | Fallback chat ID for notifications when no per-type chat is set. |
-| `paperclipBaseUrl` | | `http://localhost:3100` | Internal Paperclip API URL. |
-| `paperclipPublicUrl` | | — | Public URL used for issue links in messages. |
+| `paperclipBaseUrl` | | `http://localhost:3100` | **Internal** Paperclip API URL the worker calls directly. Keep it on an address that bypasses Cloudflare Access (loopback/private). See [Cloudflare Access](cloudflare-access.md). |
+| `paperclipPublicUrl` | | — | **Public** URL used for issue/agent/run deep-links in messages. This is the Access-protected hostname for human browsers. |
 | `enableCommands` | | `true` | Enable bot commands. |
 | `enableInbound` | | `true` | Route Telegram replies back to Paperclip as issue comments / escalation replies. |
 
@@ -76,6 +76,8 @@ Route each notification type to its own chat or forum topic. Anything left unset
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `paperclipBoardApiTokenRef` | — | Advanced/manual secret reference to a Paperclip board API token used by approval buttons and `/approve`. Prefer the **Board Access Connection** settings UI when available. |
+| `cfAccessClientIdRef` | — | Secret reference to a Cloudflare Access **service-token Client ID**. Sent as the `CF-Access-Client-Id` header on plugin → board calls so approvals/`/approve` work when the board is behind Cloudflare Access. Only used when both this and the secret ref are set. See [Cloudflare Access](cloudflare-access.md). |
+| `cfAccessClientSecretRef` | — | Secret reference to a Cloudflare Access **service-token Client Secret**. Sent as the `CF-Access-Client-Secret` header. Leave both blank when the board is not behind Access. |
 
 ## Human-in-the-loop escalation
 

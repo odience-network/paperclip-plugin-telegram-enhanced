@@ -31,6 +31,14 @@ Approval **Approve** / **Reject** buttons and `/approve` call Paperclip's approv
 
 **Fix:** Connect board access from the plugin settings page (**Connect board access**), or set `paperclipBoardApiTokenRef` manually. See [Getting Started → board access](getting-started.md#6-enable-approval-buttons-board-access).
 
+**Board behind Cloudflare Access?** A bearer token alone is rejected with a login challenge, so buttons and `/approve` fail silently. Point `paperclipBaseUrl` at an internal address that bypasses Access, or configure a service token (`cfAccessClientIdRef` + `cfAccessClientSecretRef`). Full walkthrough: [Cloudflare Access](cloudflare-access.md).
+
+## Deep-link (`url:`) buttons open a login page
+
+**Open `<issue>` ↗**, agent, and **View Run ↗** buttons are `url:` links that open the **public UI** (`paperclipPublicUrl`) in the user's browser. Behind Cloudflare Access they hit a login challenge unless the browser already has an authenticated Access session — a service token does **not** help here (only the browser session does).
+
+**Fix:** Rely on the in-chat `callback_data` actions (Approve/Reject etc.), add a Cloudflare Access bypass policy for the read-only deep-link paths, or suppress `url:` buttons. See [Cloudflare Access → `url:` button caveat](cloudflare-access.md#caveat-url-deep-link-buttons-behind-access).
+
 ## Commands or replies are ignored
 
 - Make sure `enableCommands` (for commands) and `enableInbound` (for replies) are enabled.
