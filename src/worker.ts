@@ -70,7 +70,7 @@ import {
   isAlreadyResolvedConflict,
 } from "./paperclip-api.js";
 
-type TelegramConfig = {
+export type TelegramConfig = {
   telegramBotTokenRef: string;
   defaultChatId: string;
   approvalsChatId: string;
@@ -125,7 +125,7 @@ type TelegramConfig = {
   watchDeduplicationWindowMs: number;
 };
 
-type TelegramUpdate = {
+export type TelegramUpdate = {
   update_id: number;
   message?: {
     message_id: number;
@@ -1992,46 +1992,88 @@ async function handleUpdate(
     return;
   }
 
-  if (config.enableInbound && msg.reply_to_message?.from?.is_bot) {
-    const replyToId = msg.reply_to_message.message_id;
-    const mapping = await ctx.state.get({
-      scopeKind: "instance",
-      stateKey: `msg_${chatId}_${replyToId}`,
-    }) as { entityId: string; entityType: string; companyId: string } | null;
+  await routeInboundReply(ctx, token, config, msg, chatId, text);
+}
 
-    if (mapping && mapping.entityType === "escalation") {
-      const escalationManager = new EscalationManager();
-      const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
-      await escalationManager.respond(ctx, token, mapping.entityId, {
-        escalationId: mapping.entityId,
-        responderId,
-        responseText: text,
-        action: "reply_to_customer",
-      });
+export type InboundReplyOutcome =
+  | { routed: "escalation"; entityId: string }
+  | { routed: "issue"; entityId: string; companyId: string }
+  | { routed: "none" };
+
+/**
+ * Route an inbound Telegram reply (a board member replying to a bot message)
+ * back to the Paperclip entity that originated the outbound notification.
+ *
+ * Org-routing invariant (ODIAA-936): the reply is delivered to the originating
+ * org via the `companyId` persisted on the outbound message mapping
+ * (`msg_<chat>_<message>` — written at send time from `event.companyId`), and is
+ * never re-derived from the chat-level company. In a multi-tenant deployment
+ * where a single Telegram chat can carry notifications from more than one org
+ * (instance-wide bot token, ODIAA-726), this keeps a reply confidential to the
+ * board that produced the message it answers — addressing the same
+ * mis-routing/confidentiality risk as upstream tuejonas TWX-893, which our
+ * architecture already prevents by persisting the company per message rather
+ * than per chat. This helper exists so that invariant stays regression-tested.
+ */
+export async function routeInboundReply(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  chatId: string,
+  text: string,
+): Promise<InboundReplyOutcome> {
+  if (!config.enableInbound || !msg.reply_to_message?.from?.is_bot) {
+    return { routed: "none" };
+  }
+
+  const replyToId = msg.reply_to_message.message_id;
+  const mapping = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `msg_${chatId}_${replyToId}`,
+  }) as { entityId: string; entityType: string; companyId: string } | null;
+
+  if (mapping && mapping.entityType === "escalation") {
+    const escalationManager = new EscalationManager();
+    const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
+    await escalationManager.respond(ctx, token, mapping.entityId, {
+      escalationId: mapping.entityId,
+      responderId,
+      responseText: text,
+      action: "reply_to_customer",
+    });
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+    ctx.logger.info("Routed Telegram reply to escalation", {
+      escalationId: mapping.entityId,
+      from: msg.from?.username,
+    });
+    return { routed: "escalation", entityId: mapping.entityId };
+  }
+
+  if (mapping && mapping.entityType === "issue") {
+    try {
+      // Use the SDK (not ctx.http.fetch) because the plugin sandbox blocks
+      // outbound fetches to private IPs like 127.0.0.1 for SSRF protection.
+      // The SDK's createComment goes through the plugin RPC bridge instead.
+      // companyId comes from the outbound mapping, NOT resolveCompanyId(chatId):
+      // this is the org-routing invariant guarded by ODIAA-936.
+      await ctx.issues.createComment(mapping.entityId, text, mapping.companyId);
       await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-      ctx.logger.info("Routed Telegram reply to escalation", {
-        escalationId: mapping.entityId,
+      ctx.logger.info("Routed Telegram reply to issue comment", {
+        issueId: mapping.entityId,
         from: msg.from?.username,
       });
-    } else if (mapping && mapping.entityType === "issue") {
-      try {
-        // Use the SDK (not ctx.http.fetch) because the plugin sandbox blocks
-        // outbound fetches to private IPs like 127.0.0.1 for SSRF protection.
-        // The SDK's createComment goes through the plugin RPC bridge instead.
-        await ctx.issues.createComment(mapping.entityId, text, mapping.companyId);
-        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-        ctx.logger.info("Routed Telegram reply to issue comment", {
-          issueId: mapping.entityId,
-          from: msg.from?.username,
-        });
-      } catch (err) {
-        ctx.logger.error("Failed to route inbound message", {
-          issueId: mapping.entityId,
-          error: String(err),
-        });
-      }
+      return { routed: "issue", entityId: mapping.entityId, companyId: mapping.companyId };
+    } catch (err) {
+      ctx.logger.error("Failed to route inbound message", {
+        issueId: mapping.entityId,
+        error: String(err),
+      });
+      return { routed: "none" };
     }
   }
+
+  return { routed: "none" };
 }
 
 /**
