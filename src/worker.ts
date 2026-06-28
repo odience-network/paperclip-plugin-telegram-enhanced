@@ -1475,12 +1475,14 @@ async function handleUpdate(
         try {
           const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
           if (answers.length > 0) {
+            const actingUserId = msg.from?.id ? `telegram:${msg.from.id}` : undefined;
             await respondInteraction(ctx.http, {
               baseUrl,
               issueId: mapping.issueId,
               interactionId: mapping.interactionId,
               action: "respond",
               boardApiToken,
+              actingUserId,
               answers,
             });
             await clearPendingDecision(ctx, chatId);
@@ -1496,12 +1498,14 @@ async function handleUpdate(
             const affirmatives = ["accept", "approve", "yes", "y", "ok", "okay", "sure", "confirm", "👍", "✅"];
             const action = affirmatives.includes(normalized) ? "accept" : "reject";
             const reason = action === "reject" ? `Telegram reply: ${text}` : undefined;
+            const actingUserId = msg.from?.id ? `telegram:${msg.from.id}` : undefined;
             await respondInteraction(ctx.http, {
               baseUrl,
               issueId: mapping.issueId,
               interactionId: mapping.interactionId,
               action,
               boardApiToken,
+              actingUserId,
               reason,
             });
             await clearPendingDecision(ctx, chatId);
@@ -1675,12 +1679,14 @@ async function handleCallbackQuery(
       return;
     }
     try {
+      const actingUserId = `telegram:${query.from.id}`;
       await respondInteraction(ctx.http, {
         baseUrl,
         issueId: mapping.issueId,
         interactionId: mapping.interactionId,
         action,
         boardApiToken,
+        actingUserId,
       });
       await clearPendingDecision(ctx, chatId);
       await answerCallbackQuery(ctx, token, query.id, action === "accept" ? "Accepted" : "Rejected");

@@ -81,6 +81,14 @@ describe("respondInteraction", () => {
     expect(body.reason).toBe("not approved");
   });
 
+  it("POSTs with actingUserId when provided", async () => {
+    const http = mockHttp(200, null);
+    await respondInteraction(http, { ...ARGS, action: "accept", actingUserId: "telegram:user123" });
+    const call = (http.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    expect(body.actingUserId).toBe("telegram:user123");
+  });
+
   it("POSTs respond action with answers", async () => {
     const http = mockHttp(200, null);
     const answers = [{ questionId: "q1", optionIds: ["opt1"] }];
