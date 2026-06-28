@@ -85,6 +85,70 @@ function classifyAgentError(errorMessage: string): string {
   return "Agent Error";
 }
 
+function asPayload(value: unknown): Payload {
+  return value && typeof value === "object" ? (value as Payload) : {};
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function firstNonEmptyString(source: Payload, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
+type InteractionOption = {
+  id: string;
+  label: string;
+  description?: string | null;
+};
+
+type InteractionQuestion = {
+  id: string;
+  prompt: string;
+  selectionMode: "single" | "multi";
+  options: InteractionOption[];
+  required?: boolean;
+};
+
+function parseInteractionQuestions(value: unknown): InteractionQuestion[] {
+  if (!Array.isArray(value)) return [];
+  const questions: InteractionQuestion[] = [];
+  for (const rawQuestion of value) {
+    const q = asPayload(rawQuestion);
+    const id = firstNonEmptyString(q, ["id"]) ?? "";
+    const prompt = firstNonEmptyString(q, ["prompt"]) ?? "";
+    if (!id || !prompt) continue;
+    const selectionMode = q.selectionMode === "multi" ? "multi" : "single";
+    const optionsRaw = Array.isArray(q.options) ? q.options : [];
+    const options: InteractionOption[] = [];
+    for (const rawOption of optionsRaw) {
+      const option = asPayload(rawOption);
+      const optionId = firstNonEmptyString(option, ["id"]) ?? "";
+      const label = firstNonEmptyString(option, ["label"]) ?? "";
+      if (!optionId || !label) continue;
+      options.push({
+        id: optionId,
+        label,
+        description: stringOrNull(option.description),
+      });
+    }
+    if (options.length === 0) continue;
+    questions.push({
+      id,
+      prompt,
+      selectionMode,
+      options,
+      required: q.required === true,
+    });
+  }
+  return questions;
+}
+
 export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? event.entityId);
@@ -234,6 +298,62 @@ export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): F
     options: {
       parseMode: "MarkdownV2",
       ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
+export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const interactionId = String(p.interactionId ?? "interaction");
+  const kind = String(p.interactionKind ?? "unknown");
+  const issueIdentifier = String(p.issueIdentifier ?? event.entityId);
+  const issueTitle = stringOrNull(p.issueTitle);
+  const interaction = asPayload(p.interaction);
+  const interactionPayload = asPayload(interaction.payload);
+
+  const lines: string[] = [
+    `${esc("💬")} ${bold("Decision Interaction")}`,
+    `${bold("Issue")}: ${issueLink(issueIdentifier, opts)}${issueTitle ? ` ${esc(issueTitle)}` : ""}`,
+    `${bold("Kind")}: ${code(kind)}`,
+  ];
+
+  const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [];
+
+  if (kind === "request_confirmation") {
+    const prompt = firstNonEmptyString(interactionPayload, ["prompt"]) ?? "Please confirm this action.";
+    const details = firstNonEmptyString(interactionPayload, ["detailsMarkdown"]);
+    const acceptLabel = firstNonEmptyString(interactionPayload, ["acceptLabel"]) ?? "Accept";
+    const rejectLabel = firstNonEmptyString(interactionPayload, ["rejectLabel"]) ?? "Reject";
+    lines.push(`${bold("Prompt")}: ${esc(prompt)}`);
+    if (details) lines.push(`${bold("Details")}: ${esc(truncateAtWord(details, 600))}`);
+    keyboard.push([
+      { text: acceptLabel, callback_data: "interaction_accept" },
+      { text: rejectLabel, callback_data: "interaction_reject" },
+    ]);
+  } else if (kind === "ask_user_questions") {
+    const title = firstNonEmptyString(interactionPayload, ["title"]) ?? "Please answer the questions below.";
+    const questions = parseInteractionQuestions(interactionPayload.questions);
+    lines.push(`${bold("Prompt")}: ${esc(title)}`);
+    for (const question of questions.slice(0, 4)) {
+      lines.push(`\n${bold(question.id)}: ${esc(question.prompt)}`);
+      for (const option of question.options.slice(0, 6)) {
+        lines.push(`• ${esc(option.id)} = ${esc(option.label)}`);
+      }
+      if (question.options.length > 6) lines.push(`• ${esc(`+${String(question.options.length - 6)} more`)}`);
+    }
+    lines.push(`\n${esc("Reply format")}: ${code("question_id=option_id[,option_id]")}`);
+  } else {
+    lines.push(`${bold("Interaction ID")}: ${code(interactionId)}`);
+  }
+
+  const issueLinkButton = issueButton(issueIdentifier, opts);
+  if (issueLinkButton) keyboard.push([issueLinkButton]);
+
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(keyboard.length > 0 ? { inlineKeyboard: keyboard } : {}),
     },
   };
 }
