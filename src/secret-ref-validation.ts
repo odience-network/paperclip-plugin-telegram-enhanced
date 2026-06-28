@@ -2,6 +2,8 @@ export type SecretRefConfig = {
   telegramBotTokenRef?: unknown;
   paperclipBoardApiTokenRef?: unknown;
   transcriptionApiKeyRef?: unknown;
+  cfAccessClientIdRef?: unknown;
+  cfAccessClientSecretRef?: unknown;
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -14,6 +16,10 @@ const FIELDS = [
   { key: "telegramBotTokenRef", required: false },
   { key: "paperclipBoardApiTokenRef", required: false },
   { key: "transcriptionApiKeyRef", required: false },
+  // Cloudflare Access service-token refs (ODIAA-742): optional, but when set
+  // they must be valid secret UUIDs like every other secret ref.
+  { key: "cfAccessClientIdRef", required: false },
+  { key: "cfAccessClientSecretRef", required: false },
 ] as const;
 
 export function isValidSecretRef(value: unknown): value is string {

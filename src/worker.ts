@@ -72,6 +72,7 @@ import {
   buildPaperclipAuthHeaders,
   fetchPaperclipApi,
   isAlreadyResolvedConflict,
+  type CfAccessHeaders,
 } from "./paperclip-api.js";
 
 type TelegramConfig = {
@@ -85,6 +86,11 @@ type TelegramConfig = {
   digestTopicId: string;
   paperclipBaseUrl: string;
   paperclipBoardApiTokenRef: string;
+  // Optional Cloudflare Access service-token secret-refs (ODIAA-742). When the
+  // board is behind Cloudflare Access, these resolve to the CF-Access-Client-Id
+  // / CF-Access-Client-Secret pair attached to plugin→board API calls.
+  cfAccessClientIdRef: string;
+  cfAccessClientSecretRef: string;
   paperclipPublicUrl: string;
   notifyOnIssueCreated: boolean;
   notifyOnIssueDone: boolean;
@@ -373,6 +379,38 @@ async function resolveBoardApiToken(
     }
   }
 
+  return undefined;
+}
+
+// Resolve the optional Cloudflare Access service-token pair (ODIAA-742) used for
+// plugin→board API calls when the board sits behind Cloudflare Access. Both
+// secret-refs must be configured and resolve to non-empty values, otherwise we
+// attach nothing (a half-configured pair is useless to Access). Secret values
+// are never logged — only the failure is.
+async function resolveCfAccessHeaders(
+  ctx: PluginContext,
+  config: TelegramConfig,
+): Promise<CfAccessHeaders | undefined> {
+  const idRef = asNonEmptyString(config.cfAccessClientIdRef);
+  const secretRef = asNonEmptyString(config.cfAccessClientSecretRef);
+  if (!idRef || !secretRef) return undefined;
+
+  try {
+    const [clientId, clientSecret] = await Promise.all([
+      ctx.secrets.resolve(idRef),
+      ctx.secrets.resolve(secretRef),
+    ]);
+    if (clientId && clientSecret) {
+      return { clientId, clientSecret };
+    }
+    ctx.logger.warn(
+      "Cloudflare Access refs configured but resolved empty; skipping CF-Access headers",
+    );
+  } catch (err) {
+    ctx.logger.warn("Failed to resolve Cloudflare Access service-token secrets", {
+      error: String(err),
+    });
+  }
   return undefined;
 }
 
@@ -1944,7 +1982,8 @@ async function handleUpdate(
   if (update.callback_query) {
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
     const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken);
+    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, config);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders);
     return;
   }
 
@@ -2000,7 +2039,8 @@ async function handleUpdate(
 
     // Built-in commands
     const boardApiToken = command === "approve" ? await resolveBoardApiToken(ctx, config, companyId) : undefined;
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread);
+    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, config) : undefined;
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders);
     return;
   }
 
@@ -2091,6 +2131,7 @@ export async function handleCallbackQuery(
   query: NonNullable<TelegramUpdate["callback_query"]>,
   baseUrl: string,
   boardApiToken?: string,
+  cfAccessHeaders?: CfAccessHeaders,
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
@@ -2111,7 +2152,7 @@ export async function handleCallbackQuery(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            ...buildPaperclipAuthHeaders(boardApiToken),
+            ...buildPaperclipAuthHeaders(boardApiToken, cfAccessHeaders),
           },
           body: JSON.stringify({ decidedByUserId: `telegram:${actor}` }),
         },
@@ -2174,7 +2215,7 @@ export async function handleCallbackQuery(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            ...buildPaperclipAuthHeaders(boardApiToken),
+            ...buildPaperclipAuthHeaders(boardApiToken, cfAccessHeaders),
           },
           body: JSON.stringify({ decidedByUserId: `telegram:${actor}` }),
         },
