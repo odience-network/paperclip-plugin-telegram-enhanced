@@ -24,8 +24,12 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  formatIssueBlocked,
+  formatBoardMention,
+  formatInteractionCreated,
   type IssueLinksOpts,
 } from "./formatters.js";
+import { fetchInteraction } from "./interactions-api.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
 import {
   routeMessageToAgent,
@@ -50,6 +54,11 @@ import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist
 import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
 import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
+import {
+  shouldNotifyIssueBlocked,
+  shouldNotifyBoardMention,
+  parseBoardUsernames,
+} from "./notification-filters.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
 
 type TelegramConfig = {
@@ -73,6 +82,9 @@ type TelegramConfig = {
   notifyOnAgentError: boolean;
   notifyOnAgentRunStarted: boolean;
   notifyOnAgentRunFinished: boolean;
+  notifyOnIssueBlocked: boolean;
+  notifyOnBoardMention: boolean;
+  boardUsernames: string[];
   enableCommands: boolean;
   enableInbound: boolean;
   allowedTelegramUserIds: string[];
@@ -721,6 +733,144 @@ const plugin = definePlugin({
         await notify(event, formatAgentRunFinished);
       });
     }
+
+    // --- Anti-flood filters (TWB-94, tue-Jonas/paperclip-plugin-telegram @03b6e99) ---
+
+    // Forward issue.updated as a "blocked" notification only when the issue is
+    // genuinely blocked AND a human/board user owns it (assigneeUserId non-null).
+    if (config.notifyOnIssueBlocked) {
+      const blockedDedupe = makeUpdateDedupe();
+      ctx.events.on("issue.updated", async (event: PluginEvent) => {
+        const payload = event.payload as Record<string, unknown>;
+        // Cheap pre-gate so we never fetch the issue for non-blocked updates.
+        if (payload.status !== "blocked") return;
+        if (!blockedDedupe(`blocked|${event.entityId}`)) return;
+        // issue.updated payloads frequently omit assignee/title, so enrich from
+        // the issue record before deciding whether a human/board user owns it.
+        if (event.entityId) {
+          try {
+            const issue = await ctx.issues.get(event.entityId, event.companyId);
+            if (issue) {
+              const anyIssue = issue as unknown as {
+                assigneeUserId?: string | null;
+                assigneeName?: string | null;
+                title?: string;
+              };
+              if (payload.assigneeUserId == null && anyIssue.assigneeUserId != null) {
+                payload.assigneeUserId = anyIssue.assigneeUserId;
+              }
+              if (!payload.assigneeName && anyIssue.assigneeName) {
+                payload.assigneeName = anyIssue.assigneeName;
+              }
+              if (!payload.title && issue.title) payload.title = issue.title;
+            }
+          } catch { /* best effort */ }
+        }
+        // Skip agent-only blocks (no human/board assignee). The rule itself lives
+        // in shouldNotifyIssueBlocked and now sees the enriched assigneeUserId.
+        if (!shouldNotifyIssueBlocked(event, true)) return;
+        // Enrich with latest comment (likely the blocker reason)
+        if (!payload.comment && event.entityId) {
+          try {
+            const comments = await ctx.issues.listComments(event.entityId, event.companyId);
+            if (comments.length > 0) {
+              const latest = comments.reduce((a, b) =>
+                new Date(a.createdAt) > new Date(b.createdAt) ? a : b,
+              );
+              payload.comment = latest.body;
+            }
+          } catch { /* best effort */ }
+        }
+        await notify(event, formatIssueBlocked);
+      });
+    }
+
+    // Forward issue.comment.created only when a configured board username is
+    // @-mentioned (word-boundary aware, case-insensitive).
+    const boardUsernames = parseBoardUsernames(config.boardUsernames);
+    if (config.notifyOnBoardMention && boardUsernames.length > 0) {
+      ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+        if (!shouldNotifyBoardMention(event, true, boardUsernames)) return;
+        const payload = event.payload as Record<string, unknown>;
+        // Enrich with issue identifier/title for a useful link + heading
+        const issueId =
+          (payload.issueId as string | undefined) ??
+          (payload.issueIdentifier as string | undefined) ??
+          undefined;
+        if (issueId && (!payload.identifier || !payload.title)) {
+          try {
+            const issue = await ctx.issues.get(String(issueId), event.companyId);
+            if (issue) {
+              payload.identifier ??= issue.identifier;
+              payload.title ??= issue.title;
+            }
+          } catch { /* best effort */ }
+        }
+        await notify(event, formatBoardMention);
+      });
+    }
+
+    // --- Decision interactions (TWX-46, tue-Jonas/paperclip-plugin-telegram) ---
+
+    // Subscribe to `issue.interaction.created` events and render decision cards
+    // (request_confirmation, ask_user_questions) with inline Accept/Reject buttons.
+    ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
+      const payload = event.payload as Record<string, unknown>;
+      const issueId = String(event.entityId ?? "");
+      if (!issueId) return;
+      const interactionId = String(payload.interactionId ?? "");
+      const interactionKind = String(payload.interactionKind ?? "");
+      if (!interactionId) return;
+      // Only notify for confirmation-like interactions; ignore other kinds for now.
+      if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
+
+      // Board token required to fetch interaction details.
+      const boardApiToken = await resolveBoardApiToken(ctx, config);
+      if (!boardApiToken) {
+        ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
+          issueId,
+          interactionId,
+          interactionKind,
+        });
+        return;
+      }
+
+      try {
+        const [issue, interaction] = await Promise.all([
+          ctx.issues.get(issueId, event.companyId),
+          fetchInteraction(ctx.http, {
+            baseUrl: baseUrl.replace(/\/$/, ""),
+            issueId,
+            interactionId,
+            boardApiToken,
+          }),
+        ]);
+        if (!interaction) return;
+        payload.interaction = interaction;
+        payload.issueIdentifier = issue?.identifier ?? issueId;
+        payload.issueTitle = issue?.title ?? null;
+        payload.interactionKind = interactionKind;
+
+        await notify(
+          event,
+          formatInteractionCreated,
+          config.approvalsChatId || config.defaultChatId,
+          {
+            entityType: "interaction",
+            issueId,
+            interactionId,
+            interactionKind,
+          },
+        );
+      } catch (err) {
+        ctx.logger.error("Failed to dispatch interaction notification", {
+          issueId,
+          interactionId,
+          interactionKind,
+          error: String(err),
+        });
+      }
+    });
 
     // --- Per-company chat overrides ---
 

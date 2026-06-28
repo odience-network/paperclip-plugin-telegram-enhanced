@@ -29,9 +29,11 @@ This is that plugin.
 
 - **Issue created** - Title, description, status, priority, assignee, project fields, and a "View Issue" link
 - **Issue done** - Completion confirmation with status fields
+- **Issue blocked** - Sent when an issue becomes blocked **and** is owned by a human/board user (agent-only blocks are suppressed). Off by default.
+- **Board mention** - Sent when an issue comment `@`-mentions a configured board username (case-insensitive, word-boundary aware). Off by default.
 - **Approval requested** - Interactive **Approve** and **Reject** inline buttons. Click to act without leaving Telegram.
 - **Agent error** - Error message with warning indicator
-- **Agent run started/finished** - Lifecycle notifications
+- **Agent run started/finished** - Lifecycle notifications, **off by default** (high-frequency on busy instances)
 
 ### Interactive approvals
 - Approve/reject inline buttons on every approval notification
@@ -192,6 +194,10 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 | `enableCommands` | No | Enable bot commands (default: true) |
 | `enableInbound` | No | Route Telegram replies to issues (default: true) |
 | `onlyNotifyBoardApprovals` | No | When enabled, send Telegram approval notifications only for `request_board_approval` approvals |
+| `notifyOnIssueBlocked` | No | Notify when an issue becomes blocked and is owned by a human/board user (`assigneeUserId` non-null). Agent-only blocks are suppressed. Default: false |
+| `notifyOnBoardMention` | No | Notify when an issue comment `@`-mentions a configured board username. Requires `boardUsernames`. Default: false |
+| `boardUsernames` | No | Comma/space-separated board handles (with or without `@`) matched case-insensitively and word-boundary aware by `notifyOnBoardMention` |
+| `notifyOnAgentRunStarted` / `notifyOnAgentRunFinished` | No | Per-run lifecycle notifications. Default: false (high-frequency on busy instances) |
 | `allowedTelegramUserIds` | No | Optional allowlist of Telegram user IDs allowed to use commands, inbound replies, media intake, and inline buttons. Empty means any user is allowed |
 | `allowedTelegramChatIds` | No | Optional allowlist of Telegram chat IDs where commands, inbound replies, media intake, and inline buttons are accepted. Empty means any chat is allowed |
 | `topicRouting` | No | Map forum topics to projects (default: false) |
