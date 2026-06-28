@@ -33,8 +33,10 @@ import {
   formatIssueBlocked,
   formatBoardMention,
   formatResolvedDecision,
+  formatInteractionCreated,
   type IssueLinksOpts,
 } from "./formatters.js";
+import { fetchInteraction } from "./interactions-api.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
 import {
   routeMessageToAgent,
@@ -1515,6 +1517,68 @@ const plugin = definePlugin({
         await notify(event, formatBoardMention);
       });
     }
+
+    // --- Decision interactions (TWX-46, tue-Jonas/paperclip-plugin-telegram) ---
+
+    // Subscribe to `issue.interaction.created` events and render decision cards
+    // (request_confirmation, ask_user_questions) with inline Accept/Reject buttons.
+    ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
+      const payload = event.payload as Record<string, unknown>;
+      const issueId = String(event.entityId ?? "");
+      if (!issueId) return;
+      const interactionId = String(payload.interactionId ?? "");
+      const interactionKind = String(payload.interactionKind ?? "");
+      if (!interactionId) return;
+      // Only notify for confirmation-like interactions; ignore other kinds for now.
+      if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
+
+      // Board token required to fetch interaction details.
+      const boardApiToken = await resolveBoardApiToken(ctx, config);
+      if (!boardApiToken) {
+        ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
+          issueId,
+          interactionId,
+          interactionKind,
+        });
+        return;
+      }
+
+      try {
+        const [issue, interaction] = await Promise.all([
+          ctx.issues.get(issueId, event.companyId),
+          fetchInteraction(ctx.http, {
+            baseUrl: baseUrl.replace(/\/$/, ""),
+            issueId,
+            interactionId,
+            boardApiToken,
+          }),
+        ]);
+        if (!interaction) return;
+        payload.interaction = interaction;
+        payload.issueIdentifier = issue?.identifier ?? issueId;
+        payload.issueTitle = issue?.title ?? null;
+        payload.interactionKind = interactionKind;
+
+        await notify(
+          event,
+          formatInteractionCreated,
+          config.approvalsChatId || config.defaultChatId,
+          {
+            entityType: "interaction",
+            issueId,
+            interactionId,
+            interactionKind,
+          },
+        );
+      } catch (err) {
+        ctx.logger.error("Failed to dispatch interaction notification", {
+          issueId,
+          interactionId,
+          interactionKind,
+          error: String(err),
+        });
+      }
+    });
 
     // --- Per-company chat overrides ---
 
