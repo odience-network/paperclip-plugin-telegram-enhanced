@@ -147,6 +147,103 @@ type TelegramUpdate = {
 };
 
 const TELEGRAM_API = "https://api.telegram.org";
+
+type StoredMessageMapping = {
+  entityId: string;
+  entityType: string;
+  companyId: string;
+  eventType?: string;
+  issueId?: string;
+  issueIdentifier?: string;
+  interactionId?: string;
+  interactionKind?: string;
+  interactionQuestions?: Array<{
+    id: string;
+    selectionMode: "single" | "multi";
+    options: Array<{ id: string; label: string }>;
+  }>;
+};
+
+function pendingDecisionKey(chatId: string): string {
+  return `pending_decision_${chatId}`;
+}
+
+async function recordPendingDecision(
+  ctx: PluginContext,
+  chatId: string,
+  mapping: StoredMessageMapping,
+): Promise<void> {
+  if (!mapping.issueId || !mapping.interactionId) return;
+  try {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: pendingDecisionKey(chatId) },
+      mapping,
+    );
+  } catch { /* best effort */ }
+}
+
+async function getPendingDecision(
+  ctx: PluginContext,
+  chatId: string,
+): Promise<StoredMessageMapping | null> {
+  try {
+    const record = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: pendingDecisionKey(chatId),
+    }) as StoredMessageMapping | null;
+    if (!record || !record.issueId || !record.interactionId) return null;
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+async function clearPendingDecision(ctx: PluginContext, chatId: string): Promise<void> {
+  try {
+    // SDK has no state.delete; write a tombstone that reads as "nothing pending".
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: pendingDecisionKey(chatId) },
+      { entityType: "interaction", companyId: "", resolved: true },
+    );
+  } catch { /* best effort */ }
+}
+
+function parseAskQuestionsAnswers(
+  text: string,
+  questions: StoredMessageMapping["interactionQuestions"],
+): Array<{ questionId: string; optionIds: string[] }> {
+  const availableQuestions = Array.isArray(questions) ? questions : [];
+  const byQuestionId = new Map<string, { selectionMode: "single" | "multi"; options: Set<string> }>();
+  for (const question of availableQuestions) {
+    byQuestionId.set(question.id, {
+      selectionMode: question.selectionMode,
+      options: new Set(question.options.map((option) => option.id)),
+    });
+  }
+
+  const answers: Array<{ questionId: string; optionIds: string[] }> = [];
+  for (const line of text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0)) {
+    const parts = line.split("=");
+    if (parts.length !== 2) continue;
+    const questionId = parts[0]?.trim() ?? "";
+    const optionPart = parts[1]?.trim() ?? "";
+    if (!questionId || !optionPart) continue;
+    const question = byQuestionId.get(questionId);
+    if (!question) continue;
+    const optionIds = optionPart
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0 && question.options.has(entry));
+    if (optionIds.length === 0) continue;
+    const normalized = question.selectionMode === "single"
+      ? [optionIds[0]!]
+      : Array.from(new Set(optionIds));
+    answers.push({ questionId, optionIds: normalized });
+  }
+
+  return answers;
+}
+
 const BOARD_ACCESS_SCOPE = {
   scopeKind: "instance",
   stateKey: "telegram.board-access.v1",
@@ -466,9 +563,14 @@ const plugin = definePlugin({
       event: PluginEvent,
       formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
-      overrideTopicId?: string,
+      overrideTopicId?: string | Partial<StoredMessageMapping>,
       deliveryKey?: string,
     ) => {
+      // overrideTopicId doubles as mappingOverride when it's an object
+      const mappingOverride: Partial<StoredMessageMapping> | undefined =
+        overrideTopicId && typeof overrideTopicId === "object" ? overrideTopicId : undefined;
+      const resolvedTopicId: string | undefined =
+        overrideTopicId && typeof overrideTopicId === "string" ? overrideTopicId : undefined;
       const chatId = await resolveChat(
         ctx,
         event.companyId,
@@ -478,7 +580,7 @@ const plugin = definePlugin({
       const linksOpts = await resolveIssueLinksOpts(event.companyId);
       const msg = formatter(event, linksOpts);
 
-      let messageThreadId = parseTopicId(overrideTopicId);
+      let messageThreadId = parseTopicId(resolvedTopicId);
       if (!messageThreadId) {
         messageThreadId = await resolveNotificationThreadId(ctx, chatId, event, config.topicRouting);
       }
@@ -522,18 +624,32 @@ const plugin = definePlugin({
       );
 
       if (messageId) {
-        await ctx.state.set(
-          {
-            scopeKind: "instance",
-            stateKey: `msg_${chatId}_${messageId}`,
-          },
-          {
-            entityId: event.entityId,
-            entityType: event.entityType,
-            companyId: event.companyId,
-            eventType: event.eventType,
-          },
-        );
+        const storedMapping: StoredMessageMapping = {
+          entityId: String(event.entityId ?? ""),
+          entityType: String(event.entityType ?? "unknown"),
+          companyId: event.companyId,
+          eventType: event.eventType,
+          ...(mappingOverride ?? {}),
+        };
+        try {
+          await ctx.state.set(
+            {
+              scopeKind: "instance",
+              stateKey: `msg_${chatId}_${messageId}`,
+            },
+            storedMapping,
+          );
+        } catch { /* best effort */ }
+
+        // For request_confirmation, also record as a pending decision so
+        // free-text (non-native-reply) messages can route back to this interaction.
+        if (
+          storedMapping.entityType === "interaction" &&
+          storedMapping.interactionId &&
+          storedMapping.interactionKind === "request_confirmation"
+        ) {
+          await recordPendingDecision(ctx, chatId, storedMapping);
+        }
 
         await ctx.activity.log({
           companyId: event.companyId,
@@ -855,6 +971,27 @@ const plugin = definePlugin({
         payload.issueTitle = issue?.title ?? null;
         payload.interactionKind = interactionKind;
 
+        // Extract questions for ask_user_questions so the callback handler
+        // can validate and map answers by question ID.
+        const interactionPayload = (interaction.payload && typeof interaction.payload === "object")
+          ? interaction.payload as Record<string, unknown>
+          : {};
+        const interactionQuestions: StoredMessageMapping["interactionQuestions"] =
+          interactionKind === "ask_user_questions" && Array.isArray(interactionPayload.questions)
+            ? (interactionPayload.questions as Array<Record<string, unknown>>)
+                .map((q) => {
+                  const id = typeof q.id === "string" ? q.id : "";
+                  const selectionMode = q.selectionMode === "multi" ? "multi" : "single";
+                  const options = Array.isArray(q.options)
+                    ? (q.options as Array<Record<string, unknown>>)
+                        .filter((o) => typeof o.id === "string" && typeof o.label === "string")
+                        .map((o) => ({ id: o.id as string, label: o.label as string }))
+                    : [];
+                  return id && options.length > 0 ? { id, selectionMode, options } : null;
+                })
+                .filter((q): q is NonNullable<typeof q> => q !== null)
+            : undefined;
+
         await notify(
           event,
           formatInteractionCreated,
@@ -862,8 +999,10 @@ const plugin = definePlugin({
           {
             entityType: "interaction",
             issueId,
+            issueIdentifier: issue?.identifier ?? issueId,
             interactionId,
             interactionKind,
+            ...(interactionQuestions ? { interactionQuestions } : {}),
           },
         );
       } catch (err) {
@@ -1328,9 +1467,56 @@ async function handleUpdate(
     const mapping = await ctx.state.get({
       scopeKind: "instance",
       stateKey: `msg_${chatId}_${replyToId}`,
-    }) as { entityId: string; entityType: string; companyId: string } | null;
+    }) as StoredMessageMapping | null;
 
-    if (mapping && mapping.entityType === "escalation") {
+    if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
+      const boardApiToken = await resolveBoardApiToken(ctx, config);
+      if (boardApiToken) {
+        try {
+          const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
+          if (answers.length > 0) {
+            await respondInteraction(ctx.http, {
+              baseUrl,
+              issueId: mapping.issueId,
+              interactionId: mapping.interactionId,
+              action: "respond",
+              boardApiToken,
+              answers,
+            });
+            await clearPendingDecision(ctx, chatId);
+            await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+            ctx.logger.info("Routed Telegram reply to interaction", {
+              issueId: mapping.issueId,
+              interactionId: mapping.interactionId,
+              from: msg.from?.username,
+            });
+          } else if (mapping.interactionKind === "request_confirmation") {
+            // Free-text reply treated as a text-only reject-with-reason
+            const normalized = text.trim().toLowerCase();
+            const affirmatives = ["accept", "approve", "yes", "y", "ok", "okay", "sure", "confirm", "👍", "✅"];
+            const action = affirmatives.includes(normalized) ? "accept" : "reject";
+            const reason = action === "reject" ? `Telegram reply: ${text}` : undefined;
+            await respondInteraction(ctx.http, {
+              baseUrl,
+              issueId: mapping.issueId,
+              interactionId: mapping.interactionId,
+              action,
+              boardApiToken,
+              reason,
+            });
+            await clearPendingDecision(ctx, chatId);
+            await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+          }
+        } catch (err) {
+          if (!isAlreadyResolvedInteractionError(err)) {
+            ctx.logger.error("Failed to route interaction reply", {
+              issueId: mapping.issueId,
+              error: String(err),
+            });
+          }
+        }
+      }
+    } else if (mapping && mapping.entityType === "escalation") {
       const escalationManager = new EscalationManager();
       const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
       await escalationManager.respond(ctx, token, mapping.entityId, {
@@ -1465,6 +1651,67 @@ async function handleCallbackQuery(
         );
       }
     } catch (err) {
+      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+    }
+    return;
+  }
+
+  if (data === "interaction_accept" || data === "interaction_reject") {
+    const action = data === "interaction_accept" ? "accept" : "reject";
+    if (!boardApiToken) {
+      await answerCallbackQuery(ctx, token, query.id, "Board token missing");
+      return;
+    }
+    if (!chatId || !messageId) {
+      await answerCallbackQuery(ctx, token, query.id, "Missing message context");
+      return;
+    }
+    const mapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${chatId}_${messageId}`,
+    }) as StoredMessageMapping | null;
+    if (!mapping?.issueId || !mapping.interactionId) {
+      await answerCallbackQuery(ctx, token, query.id, "Interaction mapping missing");
+      return;
+    }
+    try {
+      await respondInteraction(ctx.http, {
+        baseUrl,
+        issueId: mapping.issueId,
+        interactionId: mapping.interactionId,
+        action,
+        boardApiToken,
+      });
+      await clearPendingDecision(ctx, chatId);
+      await answerCallbackQuery(ctx, token, query.id, action === "accept" ? "Accepted" : "Rejected");
+      await editMessage(
+        ctx,
+        token,
+        chatId,
+        messageId,
+        `${escapeMarkdownV2(action === "accept" ? "✅ Accepted" : "❌ Rejected")} by ${escapeMarkdownV2(actor)}`,
+        { parseMode: "MarkdownV2" },
+      );
+    } catch (err) {
+      if (isAlreadyResolvedInteractionError(err)) {
+        await clearPendingDecision(ctx, chatId);
+        await answerCallbackQuery(ctx, token, query.id, "Already resolved");
+        ctx.logger.info("Ignored stale Telegram interaction callback", {
+          issueId: mapping.issueId,
+          interactionId: mapping.interactionId,
+          action,
+          actor,
+        });
+        await editMessage(
+          ctx,
+          token,
+          chatId,
+          messageId,
+          escapeMarkdownV2("This interaction was already resolved."),
+          { parseMode: "MarkdownV2" },
+        );
+        return;
+      }
       await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
     }
     return;

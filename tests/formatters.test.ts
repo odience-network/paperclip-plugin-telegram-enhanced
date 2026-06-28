@@ -9,6 +9,7 @@ import {
   formatAgentRunFinished,
   formatIssueBlocked,
   formatBoardMention,
+  formatInteractionCreated,
 } from "../src/formatters.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
@@ -284,5 +285,75 @@ describe("formatBoardMention", () => {
       mockEvent({ identifier: undefined, issueIdentifier: "PROJ-99", body: "@board" }),
     );
     expect(msg.text).toContain("PROJ\\-99");
+  });
+});
+
+describe("formatInteractionCreated", () => {
+  function interactionEvent(kind: string, payload: Record<string, unknown> = {}): PluginEvent {
+    return {
+      eventType: "issue.interaction.created",
+      entityId: "iss-999",
+      entityType: "issue",
+      companyId: "co-1",
+      occurredAt: new Date().toISOString(),
+      payload: {
+        identifier: "PROJ-77",
+        interactionId: "ia-1",
+        interactionKind: kind,
+        issueIdentifier: "PROJ-77",
+        issueTitle: "My Issue",
+        interaction: {
+          id: "ia-1",
+          kind,
+          payload,
+        },
+        ...payload,
+      },
+    } as PluginEvent;
+  }
+
+  it("renders request_confirmation with Accept/Reject buttons", () => {
+    const msg = formatInteractionCreated(
+      interactionEvent("request_confirmation", {
+        prompt: "Approve this plan?",
+        acceptLabel: "Yes",
+        rejectLabel: "No",
+      }),
+    );
+    expect(msg.text).toContain("Decision Interaction");
+    expect(msg.text).toContain("request\\_confirmation");
+    expect(msg.text).toContain("Approve this plan");
+    expect(msg.options.parseMode).toBe("MarkdownV2");
+    const keyboard = msg.options.inlineKeyboard ?? [];
+    const buttons = keyboard.flat();
+    expect(buttons.some((b) => b.callback_data === "interaction_accept")).toBe(true);
+    expect(buttons.some((b) => b.callback_data === "interaction_reject")).toBe(true);
+  });
+
+  it("renders ask_user_questions with question list", () => {
+    const msg = formatInteractionCreated(
+      interactionEvent("ask_user_questions", {
+        title: "Please answer",
+        questions: [
+          {
+            id: "q1",
+            prompt: "Choose a color",
+            selectionMode: "single",
+            options: [{ id: "red", label: "Red" }, { id: "blue", label: "Blue" }],
+          },
+        ],
+      }),
+    );
+    expect(msg.text).toContain("ask\\_user\\_questions");
+    expect(msg.text).toContain("Please answer");
+    expect(msg.text).toContain("q1");
+    expect(msg.text).toContain("Red");
+    expect(msg.text).toContain("Reply format");
+  });
+
+  it("falls back gracefully for unknown kind", () => {
+    const msg = formatInteractionCreated(interactionEvent("suggest_tasks"));
+    expect(msg.text).toContain("Decision Interaction");
+    expect(msg.text).toContain("ia\\-1");
   });
 });
