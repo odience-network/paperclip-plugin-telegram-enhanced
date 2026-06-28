@@ -60,6 +60,10 @@ import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
 import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
 import {
+  resolveStartupTelegramBotToken,
+  type TelegramRuntimeHealth,
+} from "./runtime-token.js";
+import {
   shouldNotifyIssueBlocked,
   shouldNotifyBoardMention,
   parseBoardUsernames,
@@ -297,6 +301,13 @@ export function getBotConnectionRegistration(
   return { configured: false, source: null, botUsername: null, botId: null, updatedAt: null };
 }
 
+// Operator-facing runtime health. Defaults to "ok" and is set to "degraded"
+// when a configured secret-ref token cannot be resolved (e.g. the post-#5429
+// plugin secret-ref kill switch is active). Surfaced via onHealth() so an
+// operator sees *why* the bot is idle instead of a silent "ok". See ODIAA-935
+// (upstream mvanhorn@8a0e579) and ./runtime-token.ts.
+let runtimeHealth: TelegramRuntimeHealth = { status: "ok" };
+
 // Resolve the live bot token: prefer the instance-state connection, then fall
 // back to the legacy company secret ref.
 export async function resolveBotToken(
@@ -305,18 +316,19 @@ export async function resolveBotToken(
 ): Promise<{ token: string; source: TelegramBotTokenSource } | null> {
   const state = await loadBotConnectionState(ctx);
   if (state.botToken) {
+    // A live instance-state token means the bot is functional regardless of any
+    // earlier secret-ref failure; clear any stale degraded signal.
+    runtimeHealth = { status: "ok" };
     return { token: state.botToken, source: "instance-state" };
   }
   const ref = asNonEmptyString(config.telegramBotTokenRef);
   if (ref) {
-    try {
-      const token = await ctx.secrets.resolve(ref);
-      if (token) return { token, source: "config-secret-ref" };
-    } catch (err) {
-      ctx.logger.warn("Failed to resolve telegramBotTokenRef secret", {
-        error: String(err),
-      });
-    }
+    // Wraps ctx.secrets.resolve so a disabled/throwing resolution degrades
+    // gracefully (sets degraded health, logs) instead of crashing the worker.
+    const token = await resolveStartupTelegramBotToken(ctx, ref, (health) => {
+      runtimeHealth = health;
+    });
+    if (token) return { token, source: "config-secret-ref" };
   }
   return null;
 }
@@ -1905,7 +1917,7 @@ const plugin = definePlugin({
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
-    return { status: "ok" };
+    return runtimeHealth;
   },
 });
 
