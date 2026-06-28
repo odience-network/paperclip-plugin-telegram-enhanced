@@ -70,6 +70,10 @@ import {
   type TelegramRuntimeHealth,
 } from "./runtime-token.js";
 import {
+  resolveInteractionRouting,
+  evaluateDecisionActor,
+} from "./decision-routing.js";
+import {
   shouldNotifyIssueBlocked,
   shouldNotifyBoardMention,
   parseBoardUsernames,
@@ -122,6 +126,13 @@ export type TelegramConfig = {
     topicId?: string;
   }>;
   opsRoutes?: TelegramOpsRoute[];
+  // User-scoped decision routing (ODIAA-938 / TWX-517/525).
+  // userChatMappings: Paperclip userId -> Telegram chatId — routes a decision card to its owner.
+  userChatMappings: Record<string, string>;
+  // telegramActorMappings: stringified numeric Telegram `from.id` -> Paperclip userId.
+  // SECURITY (ODIAA-942 Finding 2): authorization is keyed STRICTLY on the immutable
+  // numeric id. Usernames/first names are reclaimable and never used for ownership.
+  telegramActorMappings: Record<string, string>;
   digestMode: "off" | "daily" | "bidaily" | "tridaily";
   dailyDigestTime: string;
   bidailySecondTime: string;
@@ -191,6 +202,11 @@ type StoredMessageMapping = {
     selectionMode: "single" | "multi";
     options: Array<{ id: string; label: string }>;
   }>;
+  // Set only when the decision card was routed to a specific owner's chat
+  // (user-scoped routing, ODIAA-938). Absent => legacy broadcast, no ownership guard.
+  // Persisted into BOTH the msg_<chat>_<msgId> mapping and the pending-decision record
+  // so the callback and native-reply guards can verify the actor (ODIAA-942 Finding 4).
+  ownerUserId?: string;
 };
 
 function pendingDecisionKey(chatId: string): string {
@@ -1689,7 +1705,7 @@ const plugin = definePlugin({
             ? (interactionPayload.questions as Array<Record<string, unknown>>)
                 .map((q) => {
                   const id = typeof q.id === "string" ? q.id : "";
-                  const selectionMode = q.selectionMode === "multi" ? "multi" : "single";
+                  const selectionMode: "single" | "multi" = q.selectionMode === "multi" ? "multi" : "single";
                   const options = Array.isArray(q.options)
                     ? (q.options as Array<Record<string, unknown>>)
                         .filter((o) => typeof o.id === "string" && typeof o.label === "string")
@@ -1700,10 +1716,58 @@ const plugin = definePlugin({
                 .filter((q): q is NonNullable<typeof q> => q !== null)
             : undefined;
 
+        // User-scoped routing (ODIAA-938 / TWX-525): when the interaction names a
+        // target user and that user has a Telegram chat mapping, route the decision
+        // card to the owner's chat and stamp `ownerUserId` so the callback/native
+        // guards can verify the actor. Decisions with no target keep the legacy
+        // broadcast to the shared approvals chat.
+        const interactionRecord = interaction as Record<string, unknown>;
+        const targetUserId =
+          asNonEmptyString(interactionRecord.targetUserId)
+          ?? asNonEmptyString(interactionPayload.targetUserId)
+          ?? asNonEmptyString(payload.targetUserId)
+          ?? null;
+
+        const { ownerUserId, targetChatId, needsSetupNotice } =
+          resolveInteractionRouting(targetUserId, config.userChatMappings);
+
+        if (needsSetupNotice) {
+          // Owner is known but has no Telegram chat configured. Do NOT fall back to
+          // broadcasting an actionable decision card into the shared approvals chat —
+          // that would both leak the decision and let anyone there act on it. Send a
+          // non-actionable admin setup notice instead and stop (ODIAA-942 Finding 4,
+          // fail-closed). The board remains the way to act until a mapping exists.
+          ctx.logger.warn("Interaction owner has no Telegram chat mapping; sending admin setup notice", {
+            issueId,
+            interactionId,
+            interactionKind,
+            targetUserId,
+          });
+          const noticeChatId = await resolveChat(
+            ctx,
+            event.companyId,
+            config.approvalsChatId || config.defaultChatId,
+          );
+          if (noticeChatId) {
+            const ident = issue?.identifier ?? issueId;
+            await sendMessage(
+              ctx,
+              token,
+              noticeChatId,
+              escapeMarkdownV2(
+                `⚠️ Decision needed for ${ident} but its owner has no Telegram chat configured. `
+                + `Add a userChatMappings entry for this user and act from the Paperclip board.`,
+              ),
+              { parseMode: "MarkdownV2" },
+            );
+          }
+          return;
+        }
+
         await notify(
           event,
           formatInteractionCreated,
-          config.approvalsChatId || config.defaultChatId,
+          targetChatId ?? (config.approvalsChatId || config.defaultChatId),
           {
             entityType: "interaction",
             issueId,
@@ -1711,6 +1775,7 @@ const plugin = definePlugin({
             interactionId,
             interactionKind,
             ...(interactionQuestions ? { interactionQuestions } : {}),
+            ...(ownerUserId ? { ownerUserId } : {}),
           },
         );
       } catch (err) {
@@ -2190,7 +2255,7 @@ async function handleUpdate(
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
     const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
     const cfAccessHeaders = await resolveCfAccessHeaders(ctx, config);
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders, config.telegramActorMappings);
     return;
   }
 
@@ -2264,6 +2329,34 @@ async function handleUpdate(
     }) as StoredMessageMapping | null;
 
     if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
+      // User-scoped ownership guard (ODIAA-938 / TWX-525), native-reply path. Same
+      // deny-by-default rule as the callback guard, keyed on the immutable numeric id,
+      // applied BEFORE any board API call. The ephemeral error must not reveal the
+      // owner's identity (ODIAA-942 Finding 6) — say only "Not your decision."
+      {
+        const { allowed, actorUserId } = evaluateDecisionActor({
+          ownerUserId: mapping.ownerUserId,
+          telegramActorMappings: config.telegramActorMappings,
+          fromId: msg.from?.id,
+        });
+        if (!allowed) {
+          ctx.logger.warn("Rejected cross-user interaction reply", {
+            fromId: msg.from?.id,
+            actorUserId,
+            ownerUserId: mapping.ownerUserId,
+            interactionId: mapping.interactionId,
+            issueId: mapping.issueId,
+          });
+          await sendMessage(
+            ctx,
+            token,
+            chatId,
+            escapeMarkdownV2("Not your decision."),
+            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+          );
+          return;
+        }
+      }
       const boardApiToken = await resolveBoardApiToken(ctx, config);
       if (boardApiToken) {
         try {
@@ -2444,10 +2537,13 @@ export async function handleCallbackQuery(
   baseUrl: string,
   boardApiToken?: string,
   cfAccessHeaders?: CfAccessHeaders,
+  telegramActorMappings?: Record<string, string>,
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
 
+  // `actor` is for display/audit only. Authorization keys on the immutable numeric
+  // id below (ODIAA-942 Finding 2) — never on this mutable username/first_name.
   const actor = query.from.username ?? query.from.first_name ?? String(query.from.id);
   const chatId = query.message?.chat.id ? String(query.message.chat.id) : null;
   const messageId = query.message?.message_id;
@@ -2576,6 +2672,33 @@ export async function handleCallbackQuery(
     if (!mapping?.issueId || !mapping.interactionId) {
       await answerCallbackQuery(ctx, token, query.id, "Interaction mapping missing");
       return;
+    }
+    // User-scoped ownership guard (ODIAA-938 / TWX-525). Deny-by-default: when the
+    // decision is owner-routed, only the mapped owner (resolved by immutable numeric
+    // id) may act; unmapped/mismatched actors are rejected BEFORE any board API call.
+    //
+    // SECURITY NOTE (ODIAA-942 Finding 1): for the interaction accept/reject path this
+    // local guard is currently the ONLY ownership control. `respondInteraction` uses the
+    // company-scoped board token and sends no acting-user identity, so the server cannot
+    // yet enforce per-user ownership (no authoritative 403 here). Server-side enforcement
+    // is tracked as a follow-up; until it lands, do not weaken this guard.
+    {
+      const { allowed, actorUserId } = evaluateDecisionActor({
+        ownerUserId: mapping.ownerUserId,
+        telegramActorMappings,
+        fromId: query.from.id,
+      });
+      if (!allowed) {
+        ctx.logger.warn("Rejected cross-user interaction callback", {
+          fromId: query.from.id,
+          actorUserId,
+          ownerUserId: mapping.ownerUserId,
+          interactionId: mapping.interactionId,
+          issueId: mapping.issueId,
+        });
+        await answerCallbackQuery(ctx, token, query.id, "Not your decision");
+        return;
+      }
     }
     try {
       await respondInteraction(ctx.http, {
