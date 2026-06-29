@@ -71,6 +71,7 @@ import {
 } from "./runtime-token.js";
 import {
   resolveInteractionRouting,
+  resolveInteractionTargetUserId,
   evaluateDecisionActor,
 } from "./decision-routing.js";
 import {
@@ -1721,15 +1722,32 @@ const plugin = definePlugin({
         // card to the owner's chat and stamp `ownerUserId` so the callback/native
         // guards can verify the actor. Decisions with no target keep the legacy
         // broadcast to the shared approvals chat.
+        // Identify the decision owner (TWX-940 / ODIAA-937): event target first,
+        // then the interaction record/payload, and finally the issue assignee so a
+        // card addressed to a specific person is never broadcast to the shared
+        // approvals chat just because the host event omitted `targetUserId`.
         const interactionRecord = interaction as Record<string, unknown>;
-        const targetUserId =
-          asNonEmptyString(interactionRecord.targetUserId)
-          ?? asNonEmptyString(interactionPayload.targetUserId)
-          ?? asNonEmptyString(payload.targetUserId)
-          ?? null;
+        const target = resolveInteractionTargetUserId({
+          eventPayload: payload,
+          interactionRecord,
+          interactionPayload,
+          issueAssigneeUserId:
+            (issue as unknown as { assigneeUserId?: string | null } | null)?.assigneeUserId ?? null,
+        });
+        const targetUserId = target?.userId ?? null;
 
         const { ownerUserId, targetChatId, needsSetupNotice } =
           resolveInteractionRouting(targetUserId, config.userChatMappings);
+
+        if (targetChatId) {
+          ctx.logger.info("Routing interaction to identified owner chat", {
+            issueId,
+            interactionId,
+            interactionKind,
+            targetUserId,
+            targetSource: target?.source,
+          });
+        }
 
         if (needsSetupNotice) {
           // Owner is known but has no Telegram chat configured. Do NOT fall back to
@@ -1742,6 +1760,7 @@ const plugin = definePlugin({
             interactionId,
             interactionKind,
             targetUserId,
+            targetSource: target?.source,
           });
           const noticeChatId = await resolveChat(
             ctx,
