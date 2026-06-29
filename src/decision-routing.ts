@@ -58,6 +58,68 @@ export function resolveActorUserId(
   return telegramActorMappings[idKey] ?? telegramActorMappings[`tg_id:${idKey}`] ?? null;
 }
 
+/** Narrow an unknown value to a trimmed non-empty string, else null. */
+function nonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Coerce an unknown value to a plain record for safe key access. */
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+/** The board user a decision interaction resolved to, plus where it was found (log evidence). */
+export type TargetUserResolution = { userId: string; source: string };
+
+/**
+ * Identify the board user a targeted decision card is addressed to (TWX-940 / ODIAA-937).
+ *
+ * Historically routing only consulted the host event's `targetUserId` (TWX-517)
+ * and the fetched interaction record/payload. When NONE of those name a user —
+ * older hosts that predate the field, or an interaction emitted before the issue
+ * was owned — the dispatcher silently broadcast the card to the shared
+ * approvals/default chat. That is how a "Decision needed / FYI for Thomas"
+ * confirmation could reach the wrong chat (a confidentiality + correctness bug).
+ *
+ * We now resolve, in descending authority:
+ *   1. the host event payload `targetUserId` (TWX-517, most authoritative);
+ *   2. the fetched interaction record's `targetUserId` / `assigneeUserId`;
+ *   3. the interaction record's nested payload `targetUserId` / `assigneeUserId`;
+ *   4. as a last resort the issue's `assigneeUserId` (TWX-940),
+ * so a decision that genuinely belongs to a specific person is routed to — or, via
+ * `resolveInteractionRouting`, held for — that person instead of being broadcast.
+ * `source` is returned for log evidence when diagnosing future misroutes. Returns
+ * null only when no owner can be identified anywhere (legacy broadcast).
+ */
+export function resolveInteractionTargetUserId(input: {
+  eventPayload?: Record<string, unknown> | null;
+  interactionRecord?: Record<string, unknown> | null;
+  interactionPayload?: Record<string, unknown> | null;
+  issueAssigneeUserId?: string | null;
+}): TargetUserResolution | null {
+  const fromEvent = nonEmptyString(asRecord(input.eventPayload).targetUserId);
+  if (fromEvent) return { userId: fromEvent, source: "event" };
+
+  if (input.interactionRecord) {
+    const record = input.interactionRecord;
+    const fromInteraction = nonEmptyString(record.targetUserId) ?? nonEmptyString(record.assigneeUserId);
+    if (fromInteraction) return { userId: fromInteraction, source: "interaction" };
+  }
+
+  if (input.interactionPayload) {
+    const p = input.interactionPayload;
+    const fromPayload = nonEmptyString(p.targetUserId) ?? nonEmptyString(p.assigneeUserId);
+    if (fromPayload) return { userId: fromPayload, source: "interaction_payload" };
+  }
+
+  const fromAssignee = nonEmptyString(input.issueAssigneeUserId);
+  if (fromAssignee) return { userId: fromAssignee, source: "issue_assignee" };
+
+  return null;
+}
+
 export type InteractionRouting = {
   /** The owner userId to stamp on the stored mapping (only when owner-routed). */
   ownerUserId?: string;
