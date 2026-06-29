@@ -4,6 +4,7 @@ import {
   resolveActorUserId,
   evaluateDecisionActor,
   resolveInteractionRouting,
+  resolveInteractionTargetUserId,
 } from "../src/decision-routing.js";
 
 /**
@@ -140,5 +141,101 @@ describe("Condition 6 — ownerUserId persistence contract", () => {
   it("broadcast decision yields no ownerUserId (guard stays inert, anyone may act)", () => {
     const routing = resolveInteractionRouting(undefined, { [ALICE]: "chat-alice" });
     expect(routing.ownerUserId).toBeUndefined();
+  });
+});
+
+describe("resolveInteractionTargetUserId — owner resolution fallback chain (TWX-940 / ODIAA-937)", () => {
+  it("prefers the host event payload targetUserId (most authoritative)", () => {
+    const r = resolveInteractionTargetUserId({
+      eventPayload: { targetUserId: ALICE },
+      interactionRecord: { targetUserId: BOB },
+      interactionPayload: { targetUserId: BOB },
+      issueAssigneeUserId: BOB,
+    });
+    expect(r).toEqual({ userId: ALICE, source: "event" });
+  });
+
+  it("falls back to the interaction record targetUserId when the event omits it", () => {
+    const r = resolveInteractionTargetUserId({
+      eventPayload: {},
+      interactionRecord: { targetUserId: ALICE },
+    });
+    expect(r).toEqual({ userId: ALICE, source: "interaction" });
+  });
+
+  it("accepts the interaction record assigneeUserId as an alternate owner key", () => {
+    const r = resolveInteractionTargetUserId({
+      eventPayload: {},
+      interactionRecord: { assigneeUserId: ALICE },
+    });
+    expect(r).toEqual({ userId: ALICE, source: "interaction" });
+  });
+
+  it("falls back to the nested interaction payload targetUserId/assigneeUserId", () => {
+    expect(
+      resolveInteractionTargetUserId({
+        eventPayload: {},
+        interactionRecord: { payload: {} },
+        interactionPayload: { targetUserId: ALICE },
+      }),
+    ).toEqual({ userId: ALICE, source: "interaction_payload" });
+    expect(
+      resolveInteractionTargetUserId({
+        eventPayload: {},
+        interactionPayload: { assigneeUserId: BOB },
+      }),
+    ).toEqual({ userId: BOB, source: "interaction_payload" });
+  });
+
+  // The core TWX-940 fix: a "FYI for Thomas" card with no explicit target anywhere
+  // must resolve to the issue assignee instead of broadcasting to the shared chat.
+  it("falls back to the issue assignee when nothing else names a target (the confidentiality fix)", () => {
+    const r = resolveInteractionTargetUserId({
+      eventPayload: { interactionId: "int-1" },
+      interactionRecord: { id: "int-1", payload: { prompt: "Confirm?" } },
+      interactionPayload: { prompt: "Confirm?" },
+      issueAssigneeUserId: ALICE,
+    });
+    expect(r).toEqual({ userId: ALICE, source: "issue_assignee" });
+  });
+
+  it("returns null (legacy broadcast) only when no owner can be identified anywhere", () => {
+    expect(
+      resolveInteractionTargetUserId({
+        eventPayload: {},
+        interactionRecord: { id: "int-1", payload: {} },
+        interactionPayload: {},
+        issueAssigneeUserId: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("ignores blank / whitespace-only owner values and keeps falling back", () => {
+    const r = resolveInteractionTargetUserId({
+      eventPayload: { targetUserId: "   " },
+      interactionRecord: { targetUserId: "" },
+      issueAssigneeUserId: ALICE,
+    });
+    expect(r).toEqual({ userId: ALICE, source: "issue_assignee" });
+  });
+
+  it("end-to-end: an assignee-resolved owner with a chat mapping routes to that owner", () => {
+    const target = resolveInteractionTargetUserId({
+      eventPayload: {},
+      interactionRecord: { id: "int-1" },
+      issueAssigneeUserId: ALICE,
+    });
+    const routing = resolveInteractionRouting(target?.userId, { [ALICE]: "chat-alice" });
+    expect(routing).toEqual({ ownerUserId: ALICE, targetChatId: "chat-alice", needsSetupNotice: false });
+  });
+
+  it("end-to-end: an assignee-resolved owner with NO chat mapping fails closed (setup notice, no broadcast)", () => {
+    const target = resolveInteractionTargetUserId({
+      eventPayload: {},
+      issueAssigneeUserId: BOB,
+    });
+    const routing = resolveInteractionRouting(target?.userId, { [ALICE]: "chat-alice" });
+    expect(routing.needsSetupNotice).toBe(true);
+    expect(routing.targetChatId).toBeUndefined();
   });
 });
