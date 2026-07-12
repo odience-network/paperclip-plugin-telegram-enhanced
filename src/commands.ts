@@ -485,7 +485,13 @@ export async function handleConnectTopic(
     projectNameInput = parts.join(" ");
   }
 
-  const companyId = await resolveCompanyId(ctx, chatId);
+  let companyId: string;
+  try {
+    companyId = await resolveCompanyId(ctx, chatId);
+  } catch {
+    await sendMessage(ctx, token, chatId, "This chat is not linked to a Paperclip company. Use /connect first.", { messageThreadId });
+    return;
+  }
   const project = await resolveProjectByName(ctx, companyId, projectNameInput);
   if (!project) {
     await sendProjectNotFoundMessage(ctx, token, chatId, companyId, projectNameInput, messageThreadId);
@@ -802,5 +808,13 @@ async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<str
     scopeKind: "instance",
     stateKey: `chat_${chatId}`,
   }) as { companyId?: string; companyName?: string } | null;
-  return mapping?.companyId ?? mapping?.companyName ?? chatId;
+  // Never fall back to the raw Telegram chatId as a companyId (cross-tenant
+  // misrouting / BEL-183 spam-loop root cause). The company-scoped command
+  // handlers already catch this throw and answer with "linked with /connect"
+  // guidance. Ported from mvanhorn/paperclip-plugin-telegram 48eeafc (CTO).
+  const companyId = mapping?.companyId ?? mapping?.companyName;
+  if (!companyId) {
+    throw new Error("This chat is not linked to a Paperclip company. Use /connect first.");
+  }
+  return companyId;
 }
