@@ -96,6 +96,16 @@ export async function handleCommandsCommand(
   const parts = args.trim().split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? "";
 
+  // Unlinked chat: company-scoped subcommands need a real companyId. Reply with
+  // guidance instead of falling back to chatId-as-companyId (cross-tenant
+  // misrouting). The help/default case needs no company. This guard also
+  // guarantees the sub-handlers below receive a defined companyId.
+  // Ported from mvanhorn/paperclip-plugin-telegram 5f65627 (Michel Tomas).
+  if (!companyId && ["list", "import", "delete", "run"].includes(subcommand)) {
+    await sendMessage(ctx, token, chatId, "This chat is not linked to a Paperclip company. Use /connect first.", { messageThreadId });
+    return;
+  }
+
   switch (subcommand) {
     case "list":
       await listCommands(ctx, token, chatId, messageThreadId, companyId);
@@ -133,14 +143,18 @@ export async function tryCustomCommand(
 ): Promise<boolean> {
   if (BUILTIN_COMMANDS.has(command)) return false;
 
-  const resolvedCompanyId = companyId ?? chatId;
-  const commands = await getCommandRegistry(ctx, resolvedCompanyId);
+  // Unlinked chat: never fall back to chatId as a companyId. Returning false
+  // lets the built-in command path answer with its "not linked" guidance.
+  // Ported from mvanhorn/paperclip-plugin-telegram 5f65627 (Michel Tomas).
+  if (!companyId) return false;
+
+  const commands = await getCommandRegistry(ctx, companyId);
   const cmd = commands.find((c) => c.name === command);
 
   if (!cmd) return false;
 
   const args = argsStr.trim().split(/\s+/).filter(Boolean);
-  await executeWorkflow(ctx, token, chatId, cmd, args, messageThreadId, resolvedCompanyId);
+  await executeWorkflow(ctx, token, chatId, cmd, args, messageThreadId, companyId);
   return true;
 }
 
@@ -151,7 +165,10 @@ async function listCommands(
   messageThreadId?: number,
   companyId?: string,
 ): Promise<void> {
-  const resolvedCompanyId = companyId ?? chatId;
+  // companyId is guaranteed defined here (handleCommandsCommand guards unlinked
+  // chats); never fall back to chatId-as-companyId.
+  if (!companyId) return;
+  const resolvedCompanyId = companyId;
   const commands = await getCommandRegistry(ctx, resolvedCompanyId);
 
   if (commands.length === 0) {
@@ -219,7 +236,10 @@ async function importCommand(
     }
   }
 
-  const resolvedCompanyId = companyId ?? chatId;
+  // companyId is guaranteed defined here (handleCommandsCommand guards unlinked
+  // chats); never fall back to chatId-as-companyId.
+  if (!companyId) return;
+  const resolvedCompanyId = companyId;
   const commands = await getCommandRegistry(ctx, resolvedCompanyId);
 
   // Replace existing or add new
@@ -262,7 +282,10 @@ async function deleteCommand(
     return;
   }
 
-  const resolvedCompanyId = companyId ?? chatId;
+  // companyId is guaranteed defined here (handleCommandsCommand guards unlinked
+  // chats); never fall back to chatId-as-companyId.
+  if (!companyId) return;
+  const resolvedCompanyId = companyId;
   const commands = await getCommandRegistry(ctx, resolvedCompanyId);
   const filtered = commands.filter((c) => c.name !== name);
 
@@ -291,7 +314,10 @@ async function runCommand(
   messageThreadId?: number,
   companyId?: string,
 ): Promise<void> {
-  const resolvedCompanyId = companyId ?? chatId;
+  // companyId is guaranteed defined here (handleCommandsCommand guards unlinked
+  // chats); never fall back to chatId-as-companyId.
+  if (!companyId) return;
+  const resolvedCompanyId = companyId;
   const commands = await getCommandRegistry(ctx, resolvedCompanyId);
   const cmd = commands.find((c) => c.name === name);
 

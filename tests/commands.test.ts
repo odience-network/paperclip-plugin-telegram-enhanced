@@ -82,6 +82,12 @@ beforeEach(() => {
   sentMessages = [];
   metricsWritten = [];
   stateStore = {};
+  // Company-scoped commands now require a real chat→company mapping;
+  // resolveCompanyId throws for unlinked chats instead of falling back to the
+  // raw chatId (mvanhorn 48eeafc). Seed a linked chat_123 so the existing
+  // handler tests exercise the linked path; the regression tests below use a
+  // fresh, unmapped chatId to cover the unlinked path.
+  stateStore["chat_123"] = { companyId: "co-1", companyName: "Test Co" };
 });
 
 describe("handleCommand", () => {
@@ -112,6 +118,17 @@ describe("handleCommand", () => {
     await handleCommand(ctx, "token", "123", "issues", "");
     expect(sentMessages.length).toBe(1);
     expect(sentMessages[0].text).toContain("Issues");
+  });
+
+  it("never uses chatId as companyId when chat is not linked (regression: BEL-183 spam-loop)", async () => {
+    const ctx = mockCtx();
+    // No stateStore["chat_5851857072"] mapping — simulates an unlinked group chat.
+    await handleCommand(ctx, "token", "5851857072", "status", "");
+    expect(sentMessages.length).toBe(1);
+    expect(sentMessages[0].text).toContain("Make sure this chat is linked");
+    // The raw chatId must never reach the API as a companyId.
+    expect(ctx.agents.list).not.toHaveBeenCalledWith(expect.objectContaining({ companyId: "5851857072" }));
+    expect(ctx.issues.list).not.toHaveBeenCalledWith(expect.objectContaining({ companyId: "5851857072" }));
   });
 
   it("routes /agents command", async () => {
@@ -243,7 +260,7 @@ describe("handleCommand", () => {
 
     expect(ctx.issues.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        companyId: "123",
+        companyId: "co-1",
         title: "Topic scoped task",
         projectId: issueProjectId,
       }),
@@ -301,6 +318,17 @@ describe("handleConnectTopic", () => {
     const ctx = mockCtx();
     await handleConnectTopic(ctx, "token", "123", "");
     expect(sentMessages[0].text).toContain("Usage");
+  });
+
+  it("sends a friendly error when the chat is not linked (no chatId-as-companyId)", async () => {
+    const ctx = mockCtx();
+    // Unmapped chat: resolveCompanyId throws and handleConnectTopic must reply
+    // rather than resolve a project against the raw chatId.
+    await handleConnectTopic(ctx, "token", "5851857072", "Backend 42");
+    expect(sentMessages.length).toBe(1);
+    expect(sentMessages[0].text).toContain("not linked");
+    expect(stateStore["topic-map-5851857072"]).toBeUndefined();
+    expect(ctx.projects.list).not.toHaveBeenCalled();
   });
 
   it("appends to existing topic map", async () => {
