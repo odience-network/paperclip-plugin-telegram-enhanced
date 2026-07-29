@@ -58,7 +58,7 @@ import {
 } from "./polling-offset.js";
 import { handleCommandsCommand, tryCustomCommand } from "./command-registry.js";
 import { handleRegisterWatch, checkWatches } from "./watch-registry.js";
-import { AGENT_ERROR_DEDUPLICATION_WINDOW_MS, METRIC_NAMES } from "./constants.js";
+import { AGENT_ERROR_DEDUPLICATION_WINDOW_MS, DEFAULT_CONFIG, METRIC_NAMES } from "./constants.js";
 import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
@@ -432,6 +432,15 @@ export function getBotConnectionRegistration(
 // operator sees *why* the bot is idle instead of a silent "ok". See ODIAA-935
 // (upstream mvanhorn@8a0e579) and ./runtime-token.ts.
 let runtimeHealth: TelegramRuntimeHealth = { status: "ok" };
+
+// Bridge from the definition-level `onConfigChanged` hook into the live worker
+// closure built by `setup()`. The hook is a sibling of `setup` on the plugin
+// definition, so it has no access to setup's `config`/`token`/`baseUrl`
+// bindings; setup publishes its applier here. Null until setup() has run.
+// See the company-scoped-config note in setup() (ODIAA-1379).
+let activeConfigApply:
+  | ((config: Record<string, unknown>, companyId: string | null) => Promise<void>)
+  | null = null;
 
 // Resolve the live bot token: prefer the instance-state connection, then fall
 // back to the legacy company secret ref.
@@ -1051,13 +1060,27 @@ export async function sendToTelegramTool(
   return { content: JSON.stringify(result), data: result };
 }
 
-const plugin = definePlugin({
+// Exported so the config-lifecycle tests can drive setup()/onConfigChanged()
+// against an SDK test harness. runWorker() below still no-ops on import because
+// it only starts the RPC host when this module is the process entrypoint.
+export const plugin = definePlugin({
   async setup(ctx) {
-    const rawConfig = await ctx.config.get();
-    ctx.logger.info("Telegram plugin config loaded");
-    const config = rawConfig as unknown as TelegramConfig;
-    const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
-    const publicUrl = config.paperclipPublicUrl || baseUrl;
+    // Plugin configuration is company-scoped (ODIAA-1379). From paperclip host
+    // 2026.707.0 the governed-access gate only resolves `config.get` inside a
+    // company-scoped invocation, so calling `ctx.config.get()` from setup() —
+    // which runs inside `initialize`, before any invocation exists — is denied
+    // with `config.get: company context is required` and the whole plugin fails
+    // to activate.
+    //
+    // The host instead replays each configured company's stored config through
+    // `configChanged` immediately after the worker starts, and again on every
+    // operator save. So setup() starts on DEFAULT_CONFIG and nothing may be
+    // *gated* on config at registration time: every handler registers
+    // unconditionally (the SDK requires registration to be synchronous within
+    // setup) and reads these mutables through its closure at call time.
+    let config: TelegramConfig = { ...DEFAULT_CONFIG } as unknown as TelegramConfig;
+    let baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
+    let publicUrl = config.paperclipPublicUrl || baseUrl;
 
     // Live bot token, resolved lazily. The instance-wide connection (ODIAA-720)
     // is stored in plugin *state*, which — unlike config — does NOT restart the
@@ -1174,6 +1197,39 @@ const plugin = definePlugin({
       );
     }
 
+    // Host → worker configuration delivery (ODIAA-1379). Called once per
+    // configured company right after startup, and again on every operator save.
+    // Everything config-derived is recomputed in place — the worker is never
+    // restarted for a config change once `onConfigChanged` is implemented, so
+    // this is the only place new settings take effect.
+    const applyConfig = async (
+      next: Record<string, unknown>,
+      companyId: string | null,
+    ): Promise<void> => {
+      config = { ...DEFAULT_CONFIG, ...next } as unknown as TelegramConfig;
+      baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
+      publicUrl = config.paperclipPublicUrl || baseUrl;
+
+      // A config save can add, rotate, or drop the legacy secret-ref token. The
+      // instance-state connection still wins inside resolveBotToken, so this
+      // never clobbers a bot connected via Settings → Bot Connection.
+      const resolved = await resolveBotToken(ctx, config);
+      const nextToken = resolved?.token ?? "";
+      if (nextToken !== token) {
+        token = nextToken;
+        commandsRegistered = false;
+      }
+      ensureBotCommands();
+
+      ctx.logger.info("Telegram plugin config applied", {
+        companyId,
+        hasToken: Boolean(token),
+        enableCommands: config.enableCommands,
+        enableInbound: config.enableInbound,
+      });
+    };
+    activeConfigApply = applyConfig;
+
     // --- Agent file-send action (ant013 TEL-8 / TEL-23) ---
     // Expose the send tool as a directly-invokable action so non-tool callers
     // (smoke checks, other plugins) can route text/markdown to Telegram.
@@ -1202,9 +1258,10 @@ const plugin = definePlugin({
 
     async function pollUpdates(): Promise<void> {
       while (pollingActive) {
-        // Idle until a bot is connected. The connect action sets `token`
-        // in-process, so polling resumes within ~2s of connecting — no restart.
-        if (!token) {
+        // Idle until a bot is connected *and* inbound is enabled. The connect
+        // action sets `token` in-process and configChanged sets the flags, so
+        // polling resumes within ~2s of either — no restart.
+        if (!token || !(config.enableCommands || config.enableInbound)) {
           await new Promise((r) => setTimeout(r, 2000));
           continue;
         }
@@ -1234,11 +1291,12 @@ const plugin = definePlugin({
       }
     }
 
-    if (config.enableCommands || config.enableInbound) {
-      pollUpdates().catch((err) =>
-        ctx.logger.error("Polling loop crashed", { error: String(err) }),
-      );
-    }
+    // Started unconditionally: the enableCommands/enableInbound gate lives
+    // inside the loop so a config delivery can turn inbound on or off without a
+    // worker restart (ODIAA-1379).
+    pollUpdates().catch((err) =>
+      ctx.logger.error("Polling loop crashed", { error: String(err) }),
+    );
 
     ctx.events.on("plugin.stopping", async () => {
       pollingActive = false;
@@ -1380,15 +1438,21 @@ const plugin = definePlugin({
       }
     };
 
-    if (config.notifyOnIssueCreated) {
-      ctx.events.on("issue.created", (event: PluginEvent) =>
-        notify(event, formatIssueCreated),
-      );
-    }
+    // Every subscription below registers unconditionally and re-checks its
+    // notifyOn* flag at delivery time. Registration happens before the host has
+    // delivered any company config (ODIAA-1379), and the SDK only accepts
+    // registrations made synchronously inside setup(), so a registration-time
+    // gate would permanently disable the notification instead of following the
+    // operator's saved setting.
+    ctx.events.on("issue.created", async (event: PluginEvent) => {
+      if (!config.notifyOnIssueCreated) return;
+      await notify(event, formatIssueCreated);
+    });
 
-    if (config.notifyOnIssueDone) {
+    {
       const doneDedupe = makeUpdateDedupe();
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
+        if (!config.notifyOnIssueDone) return;
         const payload = event.payload as Record<string, unknown>;
         if (payload.status !== "done") return;
         if (!doneDedupe(`done|${event.entityId}`)) return;
@@ -1415,10 +1479,11 @@ const plugin = definePlugin({
       });
     }
 
-    if (config.notifyOnIssueAssigned) {
+    {
       const assignmentDedupe = makeUpdateDedupe();
 
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
+        if (!config.notifyOnIssueAssigned) return;
         const payload = event.payload as Record<string, unknown>;
         const prev = (payload._previous as Record<string, unknown> | undefined) ?? {};
 
@@ -1457,55 +1522,55 @@ const plugin = definePlugin({
       });
     }
 
-    if (config.notifyOnApprovalCreated) {
-      ctx.events.on("approval.created", async (event: PluginEvent) => {
-        if (!shouldNotifyApproval(event, config.onlyNotifyBoardApprovals)) return;
-        const payload = event.payload as Record<string, unknown>;
-        // Enrich with linked issue details (event only has issueIds)
-        const issueIds = Array.isArray(payload.issueIds) ? payload.issueIds as string[] : [];
-        if (issueIds.length > 0 && !payload.linkedIssues) {
-          try {
-            const issues = await Promise.all(
-              issueIds.slice(0, 5).map((id) => ctx.issues.get(id, event.companyId)),
-            );
-            payload.linkedIssues = issues
-              .filter(Boolean)
-              .map((i) => ({
-                identifier: i!.identifier,
-                title: i!.title,
-                status: i!.status,
-                priority: i!.priority,
-              }));
-            // Use first issue's title as the approval title if missing
-            if (!payload.title && issues[0]) {
-              payload.title = issues[0].identifier
-                ? `${issues[0].identifier}: ${issues[0].title}`
-                : issues[0].title;
-            }
-          } catch { /* best effort */ }
-        }
-        // Enrich agent name
-        if (payload.agentId && !payload.agentName) {
-          try {
-            const agent = await ctx.agents.get(String(payload.agentId), event.companyId);
-            if (agent) payload.agentName = agent.name;
-          } catch { /* best effort */ }
-        }
-        // Build a meaningful title if still missing
-        if (!payload.title || payload.title === "Approval Requested") {
-          const approvalType = String(payload.type ?? "unknown").replace(/_/g, " ");
-          const agentLabel = payload.agentName ? String(payload.agentName) : null;
-          payload.title = agentLabel
-            ? `${approvalType} — ${agentLabel}`
-            : approvalType;
-        }
-        await notify(event, formatApprovalCreated, config.approvalsChatId, config.approvalsTopicId);
-      });
-    }
+    ctx.events.on("approval.created", async (event: PluginEvent) => {
+      if (!config.notifyOnApprovalCreated) return;
+      if (!shouldNotifyApproval(event, config.onlyNotifyBoardApprovals)) return;
+      const payload = event.payload as Record<string, unknown>;
+      // Enrich with linked issue details (event only has issueIds)
+      const issueIds = Array.isArray(payload.issueIds) ? payload.issueIds as string[] : [];
+      if (issueIds.length > 0 && !payload.linkedIssues) {
+        try {
+          const issues = await Promise.all(
+            issueIds.slice(0, 5).map((id) => ctx.issues.get(id, event.companyId)),
+          );
+          payload.linkedIssues = issues
+            .filter(Boolean)
+            .map((i) => ({
+              identifier: i!.identifier,
+              title: i!.title,
+              status: i!.status,
+              priority: i!.priority,
+            }));
+          // Use first issue's title as the approval title if missing
+          if (!payload.title && issues[0]) {
+            payload.title = issues[0].identifier
+              ? `${issues[0].identifier}: ${issues[0].title}`
+              : issues[0].title;
+          }
+        } catch { /* best effort */ }
+      }
+      // Enrich agent name
+      if (payload.agentId && !payload.agentName) {
+        try {
+          const agent = await ctx.agents.get(String(payload.agentId), event.companyId);
+          if (agent) payload.agentName = agent.name;
+        } catch { /* best effort */ }
+      }
+      // Build a meaningful title if still missing
+      if (!payload.title || payload.title === "Approval Requested") {
+        const approvalType = String(payload.type ?? "unknown").replace(/_/g, " ");
+        const agentLabel = payload.agentName ? String(payload.agentName) : null;
+        payload.title = agentLabel
+          ? `${approvalType} — ${agentLabel}`
+          : approvalType;
+      }
+      await notify(event, formatApprovalCreated, config.approvalsChatId, config.approvalsTopicId);
+    });
 
-    if (config.notifyOnAgentError) {
+    {
       const agentErrorDedupe = makeUpdateDedupe(AGENT_ERROR_DEDUPLICATION_WINDOW_MS, 1000);
       ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
+        if (!config.notifyOnAgentError) return;
         const payload = event.payload as Record<string, unknown>;
         const agentId = String(payload.agentId ?? event.entityId);
         if (payload.agentId && !payload.agentName) {
@@ -1565,26 +1630,25 @@ const plugin = definePlugin({
       await notify(event, formatter, opsDestination?.chatId, opsDestination?.topicId);
     };
 
-    if (config.notifyOnAgentRunStarted) {
-      ctx.events.on("agent.run.started", async (event: PluginEvent) => {
-        await enrichAgentName(event);
-        await notifyOps(event, formatAgentRunStarted);
-      });
-    }
-    if (config.notifyOnAgentRunFinished) {
-      ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
-        await enrichAgentName(event);
-        await notifyOps(event, formatAgentRunFinished);
-      });
-    }
+    ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+      if (!config.notifyOnAgentRunStarted) return;
+      await enrichAgentName(event);
+      await notifyOps(event, formatAgentRunStarted);
+    });
+    ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+      if (!config.notifyOnAgentRunFinished) return;
+      await enrichAgentName(event);
+      await notifyOps(event, formatAgentRunFinished);
+    });
 
     // --- Anti-flood filters (TWB-94, tue-Jonas/paperclip-plugin-telegram @03b6e99) ---
 
     // Forward issue.updated as a "blocked" notification only when the issue is
     // genuinely blocked AND a human/board user owns it (assigneeUserId non-null).
-    if (config.notifyOnIssueBlocked) {
+    {
       const blockedDedupe = makeUpdateDedupe();
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
+        if (!config.notifyOnIssueBlocked) return;
         const payload = event.payload as Record<string, unknown>;
         // Cheap pre-gate so we never fetch the issue for non-blocked updates.
         if (payload.status !== "blocked") return;
@@ -1631,28 +1695,29 @@ const plugin = definePlugin({
 
     // Forward issue.comment.created only when a configured board username is
     // @-mentioned (word-boundary aware, case-insensitive).
-    const boardUsernames = parseBoardUsernames(config.boardUsernames);
-    if (config.notifyOnBoardMention && boardUsernames.length > 0) {
-      ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
-        if (!shouldNotifyBoardMention(event, true, boardUsernames)) return;
-        const payload = event.payload as Record<string, unknown>;
-        // Enrich with issue identifier/title for a useful link + heading
-        const issueId =
-          (payload.issueId as string | undefined) ??
-          (payload.issueIdentifier as string | undefined) ??
-          undefined;
-        if (issueId && (!payload.identifier || !payload.title)) {
-          try {
-            const issue = await ctx.issues.get(String(issueId), event.companyId);
-            if (issue) {
-              payload.identifier ??= issue.identifier;
-              payload.title ??= issue.title;
-            }
-          } catch { /* best effort */ }
-        }
-        await notify(event, formatBoardMention);
-      });
-    }
+    ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+      if (!config.notifyOnBoardMention) return;
+      // Re-parsed per delivery: the username list arrives with the config.
+      const boardUsernames = parseBoardUsernames(config.boardUsernames);
+      if (boardUsernames.length === 0) return;
+      if (!shouldNotifyBoardMention(event, true, boardUsernames)) return;
+      const payload = event.payload as Record<string, unknown>;
+      // Enrich with issue identifier/title for a useful link + heading
+      const issueId =
+        (payload.issueId as string | undefined) ??
+        (payload.issueIdentifier as string | undefined) ??
+        undefined;
+      if (issueId && (!payload.identifier || !payload.title)) {
+        try {
+          const issue = await ctx.issues.get(String(issueId), event.companyId);
+          if (issue) {
+            payload.identifier ??= issue.identifier;
+            payload.title ??= issue.title;
+          }
+        } catch { /* best effort */ }
+      }
+      await notify(event, formatBoardMention);
+    });
 
     // --- Decision interactions (TWX-46, tue-Jonas/paperclip-plugin-telegram) ---
 
@@ -1813,128 +1878,131 @@ const plugin = definePlugin({
 
     // --- Daily digest job ---
 
-    // Support legacy dailyDigestEnabled boolean
-    const effectiveDigestMode = (config as Record<string, unknown>).dailyDigestEnabled === true && config.digestMode === "off"
-      ? "daily"
-      : config.digestMode ?? "off";
+    // Support legacy dailyDigestEnabled boolean. Resolved per run rather than
+    // once at setup: the mode arrives with the host's config delivery, which
+    // lands after registration (ODIAA-1379).
+    const resolveDigestMode = (): string =>
+      (config as Record<string, unknown>).dailyDigestEnabled === true && config.digestMode === "off"
+        ? "daily"
+        : config.digestMode ?? "off";
 
-    if (effectiveDigestMode !== "off") {
-      ctx.jobs.register("telegram-daily-digest", async () => {
-        // Check if current UTC hour matches a configured digest time
-        const nowHour = new Date().getUTCHours();
-        const nowMin = new Date().getUTCMinutes();
-        if (nowMin >= 5) return; // only fire within first 5 min of the hour
+    ctx.jobs.register("telegram-daily-digest", async () => {
+      const effectiveDigestMode = resolveDigestMode();
+      if (effectiveDigestMode === "off") return;
+      // Check if current UTC hour matches a configured digest time
+      const nowHour = new Date().getUTCHours();
+      const nowMin = new Date().getUTCMinutes();
+      if (nowMin >= 5) return; // only fire within first 5 min of the hour
 
-        const parseHour = (t: string) => {
-          const [h] = (t || "").split(":");
-          return parseInt(h ?? "", 10);
-        };
-        const firstHour = parseHour(config.dailyDigestTime);
-        const secondHour = parseHour(config.bidailySecondTime);
-        const tridailyHours = (config.tridailyTimes || "07:00,13:00,19:00")
-          .split(",")
-          .map((t) => parseHour(t.trim()));
+      const parseHour = (t: string) => {
+        const [h] = (t || "").split(":");
+        return parseInt(h ?? "", 10);
+      };
+      const firstHour = parseHour(config.dailyDigestTime);
+      const secondHour = parseHour(config.bidailySecondTime);
+      const tridailyHours = (config.tridailyTimes || "07:00,13:00,19:00")
+        .split(",")
+        .map((t) => parseHour(t.trim()));
 
-        let shouldSend = false;
-        if (effectiveDigestMode === "daily") {
-          shouldSend = nowHour === firstHour;
-        } else if (effectiveDigestMode === "bidaily") {
-          shouldSend = nowHour === firstHour || nowHour === secondHour;
-        } else if (effectiveDigestMode === "tridaily") {
-          shouldSend = tridailyHours.includes(nowHour);
-        }
-        if (!shouldSend) return;
+      let shouldSend = false;
+      if (effectiveDigestMode === "daily") {
+        shouldSend = nowHour === firstHour;
+      } else if (effectiveDigestMode === "bidaily") {
+        shouldSend = nowHour === firstHour || nowHour === secondHour;
+      } else if (effectiveDigestMode === "tridaily") {
+        shouldSend = tridailyHours.includes(nowHour);
+      }
+      if (!shouldSend) return;
 
-        const companies = await ctx.companies.list();
-        for (const company of companies) {
-          const chatId = await resolveChat(ctx, company.id, config.digestChatId || config.defaultChatId);
-          if (!chatId) continue;
+      const companies = await ctx.companies.list();
+      for (const company of companies) {
+        const chatId = await resolveChat(ctx, company.id, config.digestChatId || config.defaultChatId);
+        if (!chatId) continue;
 
-          try {
-            const agents = await ctx.agents.list({ companyId: company.id });
-            const activeAgents = agents.filter((a: Agent) => a.status === "active");
-            const issues = await ctx.issues.list({ companyId: company.id, limit: 50 });
+        try {
+          const agents = await ctx.agents.list({ companyId: company.id });
+          const activeAgents = agents.filter((a: Agent) => a.status === "active");
+          const issues = await ctx.issues.list({ companyId: company.id, limit: 50 });
 
-            const now = Date.now();
-            const oneDayMs = 24 * 60 * 60 * 1000;
-            const completedToday = issues.filter((i: Issue) =>
-              i.status === "done" && i.completedAt && (now - new Date(i.completedAt).getTime()) < oneDayMs
-            );
-            const createdToday = issues.filter((i: Issue) =>
-              (now - new Date(i.createdAt).getTime()) < oneDayMs
-            );
+          const now = Date.now();
+          const oneDayMs = 24 * 60 * 60 * 1000;
+          const completedToday = issues.filter((i: Issue) =>
+            i.status === "done" && i.completedAt && (now - new Date(i.completedAt).getTime()) < oneDayMs
+          );
+          const createdToday = issues.filter((i: Issue) =>
+            (now - new Date(i.createdAt).getTime()) < oneDayMs
+          );
 
-            const issuePrefix = company.issuePrefix;
-            const inProgress = issues.filter((i: Issue) => i.status === "in_progress");
-            const inReview = issues.filter((i: Issue) => i.status === "in_review");
-            const blocked = issues.filter((i: Issue) => i.status === "blocked");
+          const issuePrefix = company.issuePrefix;
+          const inProgress = issues.filter((i: Issue) => i.status === "in_progress");
+          const inReview = issues.filter((i: Issue) => i.status === "in_review");
+          const blocked = issues.filter((i: Issue) => i.status === "blocked");
 
-            const dateStr = new Date().toISOString().split("T")[0];
-            const companyLabel = company.name ? ` \\- ${escapeMarkdownV2(company.name)}` : "";
-            const digestLabel = effectiveDigestMode === "bidaily" ? "Digest" : "Daily Digest";
-            const lines = [
-              escapeMarkdownV2("\ud83d\udcca") + ` *${escapeMarkdownV2(digestLabel)}${companyLabel} \\- ${escapeMarkdownV2(dateStr!)}*`,
-              "",
-              `${escapeMarkdownV2("\u2705")} Tasks completed: *${completedToday.length}*`,
-              `${escapeMarkdownV2("\ud83d\udccb")} Tasks created: *${createdToday.length}*`,
-              `${escapeMarkdownV2("\ud83e\udd16")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
-            ];
+          const dateStr = new Date().toISOString().split("T")[0];
+          const companyLabel = company.name ? ` \\- ${escapeMarkdownV2(company.name)}` : "";
+          const digestLabel = effectiveDigestMode === "bidaily" ? "Digest" : "Daily Digest";
+          const lines = [
+            escapeMarkdownV2("\ud83d\udcca") + ` *${escapeMarkdownV2(digestLabel)}${companyLabel} \\- ${escapeMarkdownV2(dateStr!)}*`,
+            "",
+            `${escapeMarkdownV2("\u2705")} Tasks completed: *${completedToday.length}*`,
+            `${escapeMarkdownV2("\ud83d\udccb")} Tasks created: *${createdToday.length}*`,
+            `${escapeMarkdownV2("\ud83e\udd16")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
+          ];
 
-            if (activeAgents.length > 0) {
-              const topAgent = activeAgents[0]!.name;
-              lines.push(`${escapeMarkdownV2("\u2b50")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
-            }
-
-            const formatIssueItem = (i: Issue) => {
-              const id = i.identifier ?? i.id;
-              const idText = issuePrefix
-                ? `[${escapeMarkdownV2(id)}](${publicUrl}/${issuePrefix}/issues/${id})`
-                : escapeMarkdownV2(id);
-              return `  ${idText} \\- ${escapeMarkdownV2(i.title)}`;
-            };
-
-            if (inProgress.length > 0) {
-              lines.push("", `${escapeMarkdownV2("\ud83d\udd04")} *In Progress \\(${inProgress.length}\\)*`);
-              for (const i of inProgress.slice(0, 10)) lines.push(formatIssueItem(i));
-            }
-            if (inReview.length > 0) {
-              lines.push("", `${escapeMarkdownV2("\ud83d\udd0d")} *In Review \\(${inReview.length}\\)*`);
-              for (const i of inReview.slice(0, 10)) lines.push(formatIssueItem(i));
-            }
-            if (blocked.length > 0) {
-              lines.push("", `${escapeMarkdownV2("\ud83d\udeab")} *Blocked \\(${blocked.length}\\)*`);
-              for (const i of blocked.slice(0, 10)) lines.push(formatIssueItem(i));
-            }
-
-            const digestThreadId = await resolveDigestThreadId(ctx, token, chatId, config.digestTopicId);
-
-            await sendMessage(ctx, token, chatId, lines.join("\n"), {
-              parseMode: "MarkdownV2",
-              messageThreadId: digestThreadId,
-            });
-          } catch (err) {
-            ctx.logger.error("Daily digest failed for company", { companyId: company.id, error: String(err) });
-            const text = [
-              escapeMarkdownV2("\ud83d\udcca") + " *Daily Digest*",
-              "",
-              escapeMarkdownV2("Could not generate digest. Check plugin logs for details."),
-            ].join("\n");
-
-            const errorThreadId = await resolveDigestThreadId(
-              ctx,
-              token,
-              chatId,
-              config.errorsTopicId || config.digestTopicId,
-            );
-
-            await sendMessage(ctx, token, chatId, text, {
-              parseMode: "MarkdownV2",
-              messageThreadId: errorThreadId,
-            });
+          if (activeAgents.length > 0) {
+            const topAgent = activeAgents[0]!.name;
+            lines.push(`${escapeMarkdownV2("\u2b50")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
           }
+
+          const formatIssueItem = (i: Issue) => {
+            const id = i.identifier ?? i.id;
+            const idText = issuePrefix
+              ? `[${escapeMarkdownV2(id)}](${publicUrl}/${issuePrefix}/issues/${id})`
+              : escapeMarkdownV2(id);
+            return `  ${idText} \\- ${escapeMarkdownV2(i.title)}`;
+          };
+
+          if (inProgress.length > 0) {
+            lines.push("", `${escapeMarkdownV2("\ud83d\udd04")} *In Progress \\(${inProgress.length}\\)*`);
+            for (const i of inProgress.slice(0, 10)) lines.push(formatIssueItem(i));
+          }
+          if (inReview.length > 0) {
+            lines.push("", `${escapeMarkdownV2("\ud83d\udd0d")} *In Review \\(${inReview.length}\\)*`);
+            for (const i of inReview.slice(0, 10)) lines.push(formatIssueItem(i));
+          }
+          if (blocked.length > 0) {
+            lines.push("", `${escapeMarkdownV2("\ud83d\udeab")} *Blocked \\(${blocked.length}\\)*`);
+            for (const i of blocked.slice(0, 10)) lines.push(formatIssueItem(i));
+          }
+
+          const digestThreadId = await resolveDigestThreadId(ctx, token, chatId, config.digestTopicId);
+
+          await sendMessage(ctx, token, chatId, lines.join("\n"), {
+            parseMode: "MarkdownV2",
+            messageThreadId: digestThreadId,
+          });
+        } catch (err) {
+          ctx.logger.error("Daily digest failed for company", { companyId: company.id, error: String(err) });
+          const text = [
+            escapeMarkdownV2("\ud83d\udcca") + " *Daily Digest*",
+            "",
+            escapeMarkdownV2("Could not generate digest. Check plugin logs for details."),
+          ].join("\n");
+
+          const errorThreadId = await resolveDigestThreadId(
+            ctx,
+            token,
+            chatId,
+            config.errorsTopicId || config.digestTopicId,
+          );
+
+          await sendMessage(ctx, token, chatId, text, {
+            parseMode: "MarkdownV2",
+            messageThreadId: errorThreadId,
+          });
         }
-      });
-    }
+      }
+    });
 
     // --- Phase 1: Escalation support ---
     const escalationManager = new EscalationManager();
@@ -2224,6 +2292,30 @@ const plugin = definePlugin({
       return { ok: false, errors: fileRouteErrors };
     }
     return { ok: true };
+  },
+
+  // Config delivery (ODIAA-1379). Implementing this hook is what makes the
+  // plugin work at all on paperclip host >= 2026.707.0: setup() may no longer
+  // read company-scoped config, so the host's post-startup `configChanged`
+  // replay is the only way stored settings reach the worker. It also stops the
+  // host from restarting the worker on every operator save — applyConfig
+  // recomputes everything config-derived in place instead.
+  //
+  // Deliberately single-tenant (no `multiCompanyConfig`): the bot connection is
+  // instance-wide and chats map to companies at runtime, so the host's
+  // fail-closed CROSS_TENANT_CONFIG guard is the behaviour we want if two
+  // companies are ever configured with different settings.
+  //
+  // `context` is declared optional on purpose: SDKs up to 2026.722.0 type (and
+  // call) this hook with the config alone, while newer hosts thread the company
+  // scope through. Optional keeps it assignable to both, and the companyId is
+  // only used for logging.
+  async onConfigChanged(
+    newConfig: Record<string, unknown>,
+    context?: { companyId?: string | null },
+  ): Promise<void> {
+    if (!activeConfigApply) return;
+    await activeConfigApply(newConfig, context?.companyId ?? null);
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
