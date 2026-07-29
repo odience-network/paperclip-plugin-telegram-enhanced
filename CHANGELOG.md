@@ -6,6 +6,51 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Plugin could not be activated on Paperclip >= 2026.707.0 (ODIAA-1379).** Activation
+  failed with
+
+  ```
+  Plugin "<id>" is not allowed to perform "config.get": company context is required
+  ```
+
+  Paperclip made plugin configuration company-scoped: `config.get` now only resolves
+  inside a company-scoped invocation (action / tool / event / job). `setup()` runs inside
+  the `initialize` RPC, before any invocation exists, so the `await ctx.config.get()` at
+  the top of `setup()` was denied and worker initialize — and with it the whole
+  activation — failed. The host instead replays each configured company's stored config
+  through `configChanged` immediately after the worker starts.
+
+  - `setup()` no longer reads configuration. The worker starts on `DEFAULT_CONFIG` and
+    adopts the operator's settings when the host delivers them.
+  - New `onConfigChanged` hook applies a delivered config in place: notification flags,
+    chat/topic routing, base URLs, digest mode, and the legacy secret-ref bot token are
+    all recomputed live.
+  - Every event subscription, the daily-digest job, and the inbound polling loop now
+    register **unconditionally** and re-check their `notifyOn*` / `enableCommands` /
+    `enableInbound` / `digestMode` flag at delivery time. Gating registration on config
+    would have disabled those handlers permanently, because registration happens before
+    any config exists and the SDK only accepts registrations made synchronously inside
+    `setup()`.
+  - Delivered config is merged over `DEFAULT_CONFIG`, so keys an operator never saved
+    keep their documented defaults instead of reading `undefined`.
+
+### Changed
+
+- **A config save no longer restarts the worker.** Implementing `onConfigChanged` opts
+  the plugin out of the host's restart-on-config-change default; settings now take effect
+  inside the running worker (inbound polling picks up `enableCommands` / `enableInbound`
+  changes within ~2s). The plugin stays deliberately single-tenant — the bot connection is
+  instance-wide and chats map to companies at runtime — so the host's fail-closed
+  `CROSS_TENANT_CONFIG` guard still applies if two companies are configured with
+  different settings.
+- **`@paperclipai/plugin-sdk` and `@paperclipai/shared` dev dependencies bumped to
+  `^2026.722.0`** (from `^2026.318.0`) to match the current host and SDK. The
+  `onConfigChanged` company-scope argument is typed as optional so the plugin builds
+  against both the current SDK — which passes the config alone — and newer hosts that
+  thread the company scope through.
+
 ### Added
 
 - **Cloudflare Access support for board API calls (ODIAA-732).** When the Paperclip
