@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.4.1] — 2026-08-09
+## [0.4.1] — 2026-08-12
 
 Follow-up to the 0.4.0 company-scoped config work: the settings page itself was still
 calling the host config endpoints unscoped.
