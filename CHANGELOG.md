@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-09
+
+Follow-up to the 0.4.0 company-scoped config work: the settings page itself was still
+calling the host config endpoints unscoped.
+
+### Fixed
+
+- **Settings page sections failed with `"companyId" is required and must be a non-empty
+  string` (ODIAA-1379).** Paperclip made plugin configuration company-scoped, and the host
+  now runs both config routes through `requirePluginConfigCompanyId()`:
+  `GET /api/plugins/:pluginId/config` reads `companyId` from the query string and
+  `POST .../config` reads it from the request body. The settings page sent neither, so the
+  host answered HTTP 400 and every section that loads config — Notification routing,
+  Connection, Bot access, Media intake, Human escalation, Proactive suggestions, and Board
+  fallback — rendered the raw host error instead of its settings. All reads and writes are
+  now company-scoped, matching the host's own `pluginsApi.getConfig`/`saveConfig` client.
+
+  0.4.0 fixed the *worker* side of this migration (config arrives via `onConfigChanged`
+  instead of `ctx.config.get()`); this release fixes the *settings UI* side.
+
+### Added
+
+- New `src/plugin-config-scope.ts` builds the company-scoped config path and save body in
+  one place, and fails fast with an operator-facing message ("Open this plugin's settings
+  from inside a company…") instead of round-tripping to the host for its raw field-level
+  400. Covered by `tests/plugin-config-scope.test.ts` (25 tests).
+
+### Changed
+
+- The seven settings sections now re-load when the selected company changes, rather than
+  loading once on mount.
+
 ## [0.4.0] — 2026-08-09
 
 Decision-interface release. Paperclip interactions (`request_confirmation`,
