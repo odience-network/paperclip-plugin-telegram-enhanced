@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`getUpdates` polling hot-spun on a non-ok response (ODIAA-1590).** The long-poll loop
+  in `src/worker.ts` only handled the `data.ok && data.result` success path; there was no
+  `else` branch, and only the `catch` block slept. When Telegram returns `ok:false` — a
+  revoked token (401), a second-poller conflict (409), or a rate limit (429) — it replies
+  immediately instead of honoring `timeout=10`, and `ctx.http.fetch` does not throw on
+  non-2xx, so the loop fell straight back into the next poll with zero delay: a hot spin
+  that flooded logs and kept hammering Telegram. The non-ok / missing-result path now backs
+  off 5s (mirroring the `catch` block) and logs a diagnostic warning with the HTTP status
+  and Telegram `error_code`/`description`. Ported from upstream mvanhorn
+  [`174fcc6`](https://github.com/mvanhorn/paperclip-plugin-telegram/commit/174fcc6c9aabf5f871de57ccb0a4ab32f34b0bbb)
+  (PR #59, iws17).
+
 ## [0.4.1] — 2026-08-12
 
 Follow-up to the 0.4.0 company-scoped config work: the settings page itself was still
