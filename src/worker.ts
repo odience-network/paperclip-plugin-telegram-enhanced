@@ -1297,6 +1297,8 @@ export const plugin = definePlugin({
           const data = (await res.json()) as {
             ok: boolean;
             result?: TelegramUpdate[];
+            error_code?: number;
+            description?: string;
           };
 
           if (data.ok && data.result) {
@@ -1307,6 +1309,19 @@ export const plugin = definePlugin({
               persistOffset: (updateId) => persistTelegramUpdateOffset(ctx, updateId),
               logger: ctx.logger,
             });
+          } else {
+            // getUpdates returned ok:false (revoked token 401, second-poller
+            // conflict 409, rate limit 429) or an empty body. Telegram answers
+            // these immediately instead of honoring timeout=10, and
+            // ctx.http.fetch does not throw on non-2xx, so without a delay the
+            // loop hot-spins — flooding logs and hammering Telegram. Back off
+            // 5s, mirroring the catch block below (ODIAA-1590).
+            ctx.logger.warn("Telegram getUpdates returned non-ok response", {
+              httpStatus: res.status,
+              errorCode: data.error_code,
+              description: data.description,
+            });
+            await new Promise((r) => setTimeout(r, 5000));
           }
         } catch (err) {
           ctx.logger.error("Telegram polling error", { error: String(err) });
