@@ -98,6 +98,28 @@ describe("handleCommand", () => {
     expect(sentMessages[0].text).toContain("Paperclip Bot Commands");
   });
 
+  // /start is Telegram's implicit entry point (rendered as a button on every new
+  // chat). It must alias /help rather than fall through to "Unknown command".
+  // Ported from mvanhorn 2f362c2 / test 79cfc56 (PR #80). ODIAA-1591.
+  it("routes /start to the help command list (first-run entry point)", async () => {
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "123", "start", "");
+    expect(sentMessages.length).toBe(1);
+    expect(sentMessages[0].text).toContain("Paperclip Bot Commands");
+  });
+
+  it("never replies 'Unknown command' to /start", async () => {
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "123", "start", "");
+    expect(sentMessages[0].text).not.toContain("Unknown command");
+  });
+
+  it("passes messageThreadId for /start in forum topics", async () => {
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "123", "start", "", 42);
+    expect(sentMessages[0].options).toMatchObject({ messageThreadId: 42 });
+  });
+
   it("routes /status command and shows agent/issue counts", async () => {
     const ctx = mockCtx();
     await handleCommand(ctx, "token", "123", "status", "");
