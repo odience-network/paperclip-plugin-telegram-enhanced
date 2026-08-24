@@ -64,6 +64,11 @@ export async function handleCommand(
     case "approve":
       await handleApprove(ctx, token, chatId, args, messageThreadId, baseUrl, boardApiToken, cfAccessHeaders);
       break;
+    // /start is Telegram's own entry point (the client renders it as a button on
+    // every new chat), so alias it to /help to return the command list instead of
+    // falling through to the "Unknown command" reply. Deliberately NOT added to
+    // BOT_COMMANDS since Telegram treats /start as implicit.
+    case "start":
     case "help":
       await handleHelp(ctx, token, chatId, messageThreadId);
       break;
