@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/status` and every daily digest structurally reported "Active agents: 0/N" (ODIAA-1606).**
+  Both the `/status` command and the daily/bidaily/tridaily digest counted agents with
+  `status === "active"`, but agents report `running`/`idle` (and `paused`/`error` when
+  unavailable) — `active` is a valid value in the SDK union but is not emitted by current
+  hosts. The filter matched nothing, so the count read zero regardless of activity: a wrong
+  readout that looks authoritative. Counting now goes through a shared `src/agent-status.ts`
+  predicate that decides availability with a *positive* filter over the statuses that mean an
+  agent can take work (`idle`/`running`/`active`), which also fails safe — `terminated` and
+  `pending_approval` are no longer miscounted as available, and a status added to the union
+  later reads as unavailable rather than silently inflating the count. `/status` now reports
+  `running` and `available` separately and flags `paused/error` only when present; the digest's
+  never-seen "Top performer" line is relabelled "Working" since the agent list is unranked.
+  Ported from upstream mvanhorn PR #87 (commits `bd3b2c5`, `657a8c3`, `79e322e`).
+
 ## [0.4.1] — 2026-08-12
 
 Follow-up to the 0.4.0 company-scoped config work: the settings page itself was still
