@@ -56,6 +56,17 @@ function runButton(agentId: string, runId: string | null, publicUrl?: string): {
   return null;
 }
 
+function isUuidLike(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+// When an agent notification has no human name we otherwise fall back to the raw
+// agent UUID, which reads as noise in a chat. Render a compact "Agent <short>" label
+// instead; callers keep the raw id for correlation where it matters.
+function displayAgentName(value: string): string {
+  return isUuidLike(value) ? `Agent ${value.slice(0, 8)}` : value;
+}
+
 /**
  * Build the text for a resolved approval/decision card.
  *
@@ -418,7 +429,8 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
 export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
   const agentId = String(p.agentId ?? event.entityId);
-  const agentName = String(p.agentName ?? p.name ?? agentId);
+  const rawAgentName = String(p.agentName ?? p.name ?? agentId);
+  const agentName = displayAgentName(rawAgentName);
   const errorMessage = String(p.error ?? p.message ?? "Unknown error");
   const runId = p.runId ? String(p.runId) : null;
   const companyName = p.companyName ? String(p.companyName) : null;
@@ -429,6 +441,10 @@ export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): For
     `${esc("❌")} ${bold(classifyAgentError(errorMessage))}`,
     `Agent: ${bold(agentName)}`,
   ];
+  // The compact label hides the identifier it was derived from, and the "View Agent"
+  // button only exists when a public base URL is configured. Keep the full id in a
+  // metadata line so error notifications stay correlatable without one.
+  if (agentName !== rawAgentName) lines.push(`Agent ID: ${code(rawAgentName)}`);
   if (companyName) lines.push(`Company: ${esc(companyName)}`);
   if (issueIdentifier) {
     lines.push(
@@ -457,7 +473,7 @@ export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): For
 export function formatAgentRunStarted(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
   const agentId = String(p.agentId ?? event.entityId);
-  const agentName = String(p.agentName ?? agentId);
+  const agentName = displayAgentName(String(p.agentName ?? agentId));
   const runId = p.runId ? String(p.runId) : null;
 
   const buttons: Array<{ text: string; url: string }> = [];
@@ -481,7 +497,7 @@ export function formatAgentRunStarted(event: PluginEvent, opts?: IssueLinksOpts)
 export function formatAgentRunFinished(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
   const agentId = String(p.agentId ?? event.entityId);
-  const agentName = String(p.agentName ?? agentId);
+  const agentName = displayAgentName(String(p.agentName ?? agentId));
   const runId = p.runId ? String(p.runId) : null;
 
   const buttons: Array<{ text: string; url: string }> = [];
