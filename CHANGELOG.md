@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The ACP bridge no longer uses a Telegram chat id as a Paperclip company id
+  (ODIAA-1687).** `resolveCompanyIdFromChat` used to fall back to the raw `chatId`
+  when a chat was not linked to a company. A chat id can never address a company,
+  so every caller then spent a fake id on a host call that could only fail —
+  silently, because nothing on that path throws or logs. The discussion loop made
+  it worse: it re-resolved per turn, so one unlinked chat burned a fake id on every
+  remaining turn of an agent-to-agent conversation. The function now returns
+  `string | null`, and each call site handles the null: `/acp spawn|cancel|close`
+  and inbound routing reply "use /connect", and the discussion loop pauses rather
+  than continuing. The loop also now takes the host's own `companyId` from the ACP
+  output event envelope instead of re-deriving it from chat state. `companyName`
+  stays as a fallback for chats linked by older versions. Same confidentiality
+  bug class as ODIAA-1178, closing the residual `acp-bridge.ts` fallback that port
+  deliberately left. Ported from mvanhorn `bd9a3c8` (Vagif Veliev). Covered by
+  `tests/acp-bridge-company-resolution.test.ts` (8 tests).
+
 ## [0.4.1] — 2026-08-12
 
 Follow-up to the 0.4.0 company-scoped config work: the settings page itself was still
