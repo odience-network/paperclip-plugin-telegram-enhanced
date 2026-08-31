@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { escapeMarkdownV2, truncateAtWord } from "../src/telegram-api.js";
+import { escapeMarkdownV2, truncateAtWord, capListMessage, TELEGRAM_MAX_MESSAGE_LENGTH } from "../src/telegram-api.js";
 
 describe("escapeMarkdownV2", () => {
   it("escapes underscores", () => {
@@ -104,5 +104,55 @@ describe("truncateAtWord", () => {
   it("handles text with trailing space at boundary", () => {
     const result = truncateAtWord("aa bb cc dd ee ff", 8);
     expect(result).toBe("aa bb cc...");
+  });
+});
+
+describe("capListMessage", () => {
+  it("keeps every item when the whole list fits", () => {
+    const header = ["*Agents*", ""];
+    const items = ["🟢 Builder", "🟡 Tester", "🔴 Broken"];
+    const result = capListMessage(header, items);
+    expect(result).toBe([...header, ...items].join("\n"));
+    expect(result).not.toContain("more");
+  });
+
+  it("returns just the header when there are no items", () => {
+    expect(capListMessage(["*Agents*"], [])).toBe("*Agents*");
+  });
+
+  it("truncates and appends a footer when items overflow the limit", () => {
+    const header = ["*Agents*", ""];
+    const items = Array.from({ length: 500 }, (_, i) => `🟢 Agent ${i} with a moderately long name`);
+    const result = capListMessage(header, items, {
+      moreLabel: (n) => `…and ${n} more`,
+    });
+    expect(result.length).toBeLessThanOrEqual(TELEGRAM_MAX_MESSAGE_LENGTH);
+    expect(result).toContain("Agent 0 ");
+    // Footer reports exactly the number of items that were dropped.
+    const kept = result.split("\n").filter((l) => l.startsWith("🟢 Agent ")).length;
+    expect(result).toContain(`…and ${items.length - kept} more`);
+  });
+
+  it("respects a custom maxLength and reserves footer room", () => {
+    const header = ["H"];
+    const items = ["aaaa", "bbbb", "cccc", "dddd"];
+    const result = capListMessage(header, items, {
+      maxLength: 20,
+      moreLabel: (n) => `+${n}`,
+    });
+    expect(result.length).toBeLessThanOrEqual(20);
+    expect(result).toMatch(/\+\d+$/);
+    expect(result.startsWith("H\naaaa")).toBe(true);
+  });
+
+  it("never crosses the limit even when the footer count grows a digit", () => {
+    const header = ["H"];
+    // Craft items so stopping flips the omitted count from 9 to 10 (extra digit).
+    const items = Array.from({ length: 40 }, () => "x".repeat(10));
+    const result = capListMessage(header, items, {
+      maxLength: 60,
+      moreLabel: (n) => `…and ${n} more`,
+    });
+    expect(result.length).toBeLessThanOrEqual(60);
   });
 });

@@ -1,5 +1,5 @@
 import type { PluginContext, PluginEvent, Agent, Issue, Project } from "@paperclipai/plugin-sdk";
-import { sendMessage, escapeMarkdownV2, sendChatAction } from "./telegram-api.js";
+import { sendMessage, escapeMarkdownV2, sendChatAction, capListMessage } from "./telegram-api.js";
 import { METRIC_NAMES } from "./constants.js";
 import { handleAcpCommand } from "./acp-bridge.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi, type CfAccessHeaders } from "./paperclip-api.js";
@@ -208,18 +208,23 @@ async function handleAgents(
 
     const hasLinks = isExternalUrl(publicUrl);
     const statusEmoji: Record<string, string> = { active: "🟢", error: "🔴", paused: "🟡", idle: "⚪", running: "🔵" };
-    const lines = [escapeMarkdownV2("🤖") + " *Agents*", ""];
-    for (const agent of agents) {
+    const header = [escapeMarkdownV2("🤖") + " *Agents*", ""];
+    const items = agents.map((agent: Agent) => {
       const emoji = statusEmoji[agent.status] ?? "⚪";
       if (hasLinks) {
         const url = `${publicUrl}/agents/${agent.id}`;
-        lines.push(`${escapeMarkdownV2(emoji)} [${escapeMarkdownV2(agent.name)}](${url}) \\- ${escapeMarkdownV2(agent.status)}`);
-      } else {
-        lines.push(`${escapeMarkdownV2(emoji)} *${escapeMarkdownV2(agent.name)}* \\- ${escapeMarkdownV2(agent.status)}`);
+        return `${escapeMarkdownV2(emoji)} [${escapeMarkdownV2(agent.name)}](${url}) \\- ${escapeMarkdownV2(agent.status)}`;
       }
-    }
+      return `${escapeMarkdownV2(emoji)} *${escapeMarkdownV2(agent.name)}* \\- ${escapeMarkdownV2(agent.status)}`;
+    });
 
-    await sendMessage(ctx, token, chatId, lines.join("\n"), {
+    // Cap the list so a large company can't blow past Telegram's 4096-char
+    // limit, which would make the API reject the send so nothing renders.
+    const body = capListMessage(header, items, {
+      moreLabel: (omitted) => escapeMarkdownV2(`…and ${omitted} more agent${omitted === 1 ? "" : "s"}`),
+    });
+
+    await sendMessage(ctx, token, chatId, body, {
       parseMode: "MarkdownV2",
       messageThreadId,
     });

@@ -372,6 +372,51 @@ export function truncateAtWord(text: string, maxLen: number): string {
   return (lastSpace > maxLen * 0.7 ? truncated.slice(0, lastSpace) : truncated) + "...";
 }
 
+/** Telegram rejects any sendMessage whose text exceeds 4096 characters. */
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * Build a single message body from header lines plus a variable-length list of
+ * item lines, keeping the total under Telegram's 4096-char message limit.
+ *
+ * If every item fits, all are included. Otherwise as many items as possible are
+ * kept and a footer (e.g. "…and 12 more") is appended so the remainder is
+ * accounted for instead of the whole send being rejected. Footer/newline
+ * overhead is reserved up front so the returned body never crosses the limit.
+ *
+ * Callers own escaping: pass already-escaped lines and a `moreLabel` that
+ * returns an already-escaped footer for the chosen parse mode.
+ */
+export function capListMessage(
+  headerLines: string[],
+  itemLines: string[],
+  options: { maxLength?: number; moreLabel?: (omitted: number) => string } = {},
+): string {
+  const maxLength = options.maxLength ?? TELEGRAM_MAX_MESSAGE_LENGTH;
+  const moreLabel = options.moreLabel ?? ((omitted) => `…and ${omitted} more`);
+
+  const full = [...headerLines, ...itemLines].join("\n");
+  if (full.length <= maxLength) return full;
+
+  const kept: string[] = [];
+  for (let i = 0; i < itemLines.length; i++) {
+    // Would keeping this item still leave room to truncate the rest? The last
+    // item needs no footer; any earlier stop needs a footer for what follows.
+    const omittedAfter = itemLines.length - (i + 1);
+    const withItem =
+      omittedAfter > 0
+        ? [...headerLines, ...kept, itemLines[i]!, moreLabel(omittedAfter)]
+        : [...headerLines, ...kept, itemLines[i]!];
+    if (withItem.join("\n").length > maxLength) {
+      // Can't fit this item; emit a footer covering it and everything after.
+      const omitted = itemLines.length - kept.length;
+      return [...headerLines, ...kept, moreLabel(omitted)].join("\n");
+    }
+    kept.push(itemLines[i]!);
+  }
+  return [...headerLines, ...kept].join("\n");
+}
+
 function stripMarkdown(text: string): string {
   return text
     .replace(/\\([_*\[\]()~`>#+\-=|{}.!\\])/g, "$1")

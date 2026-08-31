@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/agents` silently failed for large companies (ODIAA-1689, upstream mvanhorn PR #94 /
+  67d1b7b).** The command listed every agent in one message with no length guard, so a
+  company with many agents produced a body over Telegram's hard 4096-character message
+  limit. Telegram then rejected the whole `sendMessage`, so the list never rendered. The
+  list is now capped by a shared `capListMessage()` helper: it keeps as many agents as fit
+  under the limit and appends an `…and N more agents` footer for the remainder, reserving
+  the footer's own length so the emitted body never crosses 4096. (`/status` and the daily
+  digest were already bounded and are unaffected.)
+
 ## [0.4.1] — 2026-08-12
 
 Follow-up to the 0.4.0 company-scoped config work: the settings page itself was still
