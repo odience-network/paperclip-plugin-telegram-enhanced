@@ -69,6 +69,12 @@ curl -X POST "$API/api/companies/$COMPANY_ID/tools/profiles/$PROFILE_ID/bind" \
 
 `defaultAction: "deny"` plus `tool_name` includes keeps the profile scoped to these six tools; it does not widen access to any other plugin or MCP tool.
 
+#### Use `tool_name` entries, not `application` entries
+
+Paperclip backfills every installed plugin into the tool **applications** list, so the profile wizard offers `paperclip-plugin-telegram-enhanced` as a selectable application. Selecting it looks correct and saves without error, but it never grants anything: an `application` entry matches on `entry.applicationId === ctx.applicationId`, and the policy only resolves `ctx.applicationId` from a catalog entry or a tool connection. Plugin tools have neither — their descriptors carry `name`, `displayName`, `description`, `parametersSchema` and `pluginId`, but no application id — so `ctx.applicationId` stays `null` and the entry can never match.
+
+A profile whose only entry is the plugin application therefore still denies with `deny_default`, and `GET /api/plugins/tools` still returns `[]`, which is indistinguishable from having created no profile at all. Select **Tool name** as the selector type and add the six namespaced names above.
+
 ### 3. Calling convention
 
 ```bash

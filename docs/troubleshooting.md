@@ -64,6 +64,11 @@ The plugin is `ready` and the manifest declares the tools, but the Tool Gateway 
 
 A board user must create a tool profile that includes the plugin's namespaced tool names and bind it to the company (or to individual agents). See [Making the tools callable from an agent run](agent-tools.md#making-the-tools-callable-from-an-agent-run).
 
+**A profile can exist and still deny.** Check the profile's entries before assuming none was created — the two ways an existing profile silently fails are:
+
+- The entries use the `application` selector (the wizard offers the plugin as an application, but plugin tools have no application id, so the entry never matches). Use `tool_name` entries.
+- The binding targets a different agent than the one calling. An `agent` binding grants only that agent; every other agent still sees `[]`.
+
 If discovery works but `POST /api/plugins/tools/execute` returns `deny_run_context_mismatch`, `runContext.projectId` doesn't match the project of the issue the run is checked out on — an issue with no project always fails this check.
 
 ---
