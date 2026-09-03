@@ -14,6 +14,83 @@ The plugin gives your Paperclip agents tools to escalate to humans, collaborate 
 
 ---
 
+## Making the tools callable from an agent run
+
+Declaring a tool in the manifest is not enough for an agent to reach it. Two separate host mechanisms have to line up.
+
+### 1. Registration (automatic)
+
+Paperclip reads `manifest.tools` when the plugin reaches `ready` and registers each entry with the plugin tool dispatcher under its **namespaced name**:
+
+```
+paperclip-plugin-telegram-enhanced:send_to_telegram
+paperclip-plugin-telegram-enhanced:send_file_to_telegram
+paperclip-plugin-telegram-enhanced:escalate_to_human
+paperclip-plugin-telegram-enhanced:handoff_to_agent
+paperclip-plugin-telegram-enhanced:discuss_with_agent
+paperclip-plugin-telegram-enhanced:register_watch
+```
+
+The worker's `ctx.tools.register(...)` handlers (which need the `agent.tools.register` capability) supply the implementations that the dispatcher routes to. Nothing else is required from the plugin.
+
+### 2. Tool-access policy (operator setup, required)
+
+Agents reach the tools over the control-plane API — `GET /api/plugins/tools` to discover and `POST /api/plugins/tools/execute` to invoke — and **both go through the Tool Gateway's access policy**. The policy's default is deny: if no tool profile, explicit grant, or allow policy covers a tool, discovery silently omits it and execution fails with `403 deny_default`.
+
+The symptom of a missing profile is that `GET /api/plugins/tools` returns `[]` even though the plugin is `ready` and the manifest declares tools.
+
+A board user (this is not agent-writable) enables them once per company, either in **Tools → Access → Profiles** in the dashboard or via the API:
+
+```bash
+# 1. Create a profile that allows exactly the plugin's tools.
+curl -X POST "$API/api/companies/$COMPANY_ID/tools/profiles" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "profileKey": "telegram-plugin-agent-tools",
+        "name": "Telegram Plugin Agent Tools",
+        "status": "active",
+        "defaultAction": "deny",
+        "entries": [
+          { "selectorType": "tool_name", "effect": "include", "toolName": "paperclip-plugin-telegram-enhanced:send_to_telegram" },
+          { "selectorType": "tool_name", "effect": "include", "toolName": "paperclip-plugin-telegram-enhanced:send_file_to_telegram" },
+          { "selectorType": "tool_name", "effect": "include", "toolName": "paperclip-plugin-telegram-enhanced:escalate_to_human" },
+          { "selectorType": "tool_name", "effect": "include", "toolName": "paperclip-plugin-telegram-enhanced:handoff_to_agent" },
+          { "selectorType": "tool_name", "effect": "include", "toolName": "paperclip-plugin-telegram-enhanced:discuss_with_agent" },
+          { "selectorType": "tool_name", "effect": "include", "toolName": "paperclip-plugin-telegram-enhanced:register_watch" }
+        ]
+      }'
+
+# 2. Bind it. targetType "company" covers every agent; use "agent" with an
+#    agent id to enable one agent at a time.
+curl -X POST "$API/api/companies/$COMPANY_ID/tools/profiles/$PROFILE_ID/bind" \
+  -H 'Content-Type: application/json' \
+  -d '{ "targetType": "company", "targetId": "'"$COMPANY_ID"'", "priority": 100 }'
+```
+
+`defaultAction: "deny"` plus `tool_name` includes keeps the profile scoped to these six tools; it does not widen access to any other plugin or MCP tool.
+
+### 3. Calling convention
+
+```bash
+curl -X POST "$API/api/plugins/tools/execute" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "tool": "paperclip-plugin-telegram-enhanced:send_to_telegram",
+        "parameters": { "text": "hello", "chatId": "-100...", "threadId": 42 },
+        "runContext": {
+          "agentId": "'"$PAPERCLIP_AGENT_ID"'",
+          "runId": "'"$PAPERCLIP_RUN_ID"'",
+          "companyId": "'"$PAPERCLIP_COMPANY_ID"'",
+          "projectId": "<the project of the issue this run is checked out on>"
+        }
+      }'
+```
+
+`runContext.projectId` is mandatory and is cross-checked against the run's issue. Passing a project that differs from the checked-out issue's project — including passing any project when **the issue has no project at all** — is rejected as `deny_run_context_mismatch`. Give the issue a project before calling these tools from a heartbeat.
+
+---
+
 ## Human-in-the-loop escalation
 
 When an agent is stuck — low confidence, an explicit user request, a policy violation, or unknown intent — it calls `escalate_to_human`. The plugin then:

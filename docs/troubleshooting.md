@@ -58,6 +58,14 @@ See [Notifications & Routing](notifications.md#forum-topic-routing).
 - Set `transcriptionApiKeyRef` to a secret reference for an OpenAI API key (used by Whisper).
 - Confirm the media is being routed to an agent thread or a configured Brief Agent intake channel (`briefAgentChatIds`).
 
+## `GET /api/plugins/tools` returns `[]` for an agent
+
+The plugin is `ready` and the manifest declares the tools, but the Tool Gateway denies anything no profile covers, and discovery omits denied tools instead of erroring. Execution of the same tool fails with `403 deny_default`.
+
+A board user must create a tool profile that includes the plugin's namespaced tool names and bind it to the company (or to individual agents). See [Making the tools callable from an agent run](agent-tools.md#making-the-tools-callable-from-an-agent-run).
+
+If discovery works but `POST /api/plugins/tools/execute` returns `deny_run_context_mismatch`, `runContext.projectId` doesn't match the project of the issue the run is checked out on — an issue with no project always fails this check.
+
 ---
 
 ← Back to [Documentation](README.md)
