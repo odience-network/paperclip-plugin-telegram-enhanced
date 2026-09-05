@@ -4,6 +4,20 @@ Every plugin setting, its default, and what it controls. Only `telegramBotTokenR
 
 > Set these in the Telegram plugin settings page or via the plugin config API. After changing values, save and (if needed) restart the plugin.
 
+## Configuration scope
+
+Plugin configuration is stored **per company**, and the worker keeps it that
+way: every notification toggle, filter, and chat/topic route is read from the
+config of the company the notification is about, and `/status` reports that
+same company's flags. A company whose config has never been saved runs on the
+defaults below — never on another company's settings.
+
+Three values describe the instance rather than a company, because there is one
+bot connection and one board behind it: the bot token (Bot Connection, or the
+legacy `telegramBotTokenRef`), `paperclipBaseUrl`, and `paperclipPublicUrl`.
+Set them once. If several companies have saved configs, a company that leaves
+one of these at its default will not overwrite a value another company set.
+
 ## Core
 
 | Setting | Required | Default | Description |

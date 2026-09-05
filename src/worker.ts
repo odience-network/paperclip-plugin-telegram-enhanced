@@ -376,6 +376,16 @@ function getBoardAccessRegistration(
   };
 }
 
+// Config keys that describe the instance rather than a company: one bot
+// connection, one board URL pair. Every company's stored config carries them,
+// so the worker keeps the customised value rather than the last-replayed one
+// (ODIAA-1930). Everything else a company can set is read per company.
+const INSTANCE_WIDE_STRING_KEYS = [
+  "telegramBotTokenRef",
+  "paperclipBaseUrl",
+  "paperclipPublicUrl",
+] as const satisfies ReadonlyArray<keyof TelegramConfig & keyof typeof DEFAULT_CONFIG>;
+
 // --- Instance-wide bot connection (ODIAA-720) -----------------------------
 // The plugin runs instance-wide (one worker/config for all companies), so the
 // Telegram bot must be configured once for the whole instance — not as a
@@ -652,9 +662,10 @@ function validateConfiguredTopicIds(config: Record<string, unknown>): string[] {
 
 /**
  * Project the live worker config onto the flags `/status` reports (ODIAA-1927).
- * Reading the same mutable the delivery-time gates read is the point: if an
- * operator turns "task complete" off and `/status` still shows it on, the saved
- * setting never reached the worker, rather than the gate ignoring it.
+ * Callers must pass the same per-company config the delivery-time gates read
+ * — `configFor(companyId)` (ODIAA-1930) — because that is the whole point: if
+ * an operator turns "task complete" off and `/status` still shows it on, the
+ * saved setting never reached the worker, rather than the gate ignoring it.
  */
 export function notificationFlagsOf(config: TelegramConfig): NotificationFlags {
   return {
@@ -1149,9 +1160,38 @@ export const plugin = definePlugin({
     // *gated* on config at registration time: every handler registers
     // unconditionally (the SDK requires registration to be synchronous within
     // setup) and reads these mutables through its closure at call time.
+    //
+    // `config` below is the *primary* config: it backs the genuinely
+    // instance-wide reads (bot token ref, base URLs, inbound polling, the
+    // allowlists that guard one bot connection). Everything a company can set
+    // for itself — every notifyOn* gate, the chat/topic routing those gates
+    // deliver through — is keyed per company in `configByCompany` and read via
+    // `configFor` (ODIAA-1930). One worker serves every company, so a single
+    // mutable silently collapses onto whichever company's config the host
+    // replayed last.
     let config: TelegramConfig = { ...DEFAULT_CONFIG } as unknown as TelegramConfig;
     let baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     let publicUrl = config.paperclipPublicUrl || baseUrl;
+
+    const configByCompany = new Map<string, TelegramConfig>();
+    // Set only by an instance/global save (`companyId: null`). Hosts before
+    // 2026.824.0 dropped the company scope before calling `onConfigChanged`, so
+    // on those every delivery lands here and keeps the old single-tenant
+    // behaviour instead of stranding every company on DEFAULT_CONFIG.
+    let unscopedConfig: TelegramConfig | null = null;
+
+    /**
+     * The configuration a company-scoped read must use. Falls back to an
+     * unscoped delivery, then to DEFAULT_CONFIG — never to another company's
+     * config, which is the collapse this indirection exists to prevent.
+     */
+    const configFor = (companyId?: string | null): TelegramConfig => {
+      if (companyId) {
+        const scoped = configByCompany.get(companyId);
+        if (scoped) return scoped;
+      }
+      return unscopedConfig ?? (DEFAULT_CONFIG as unknown as TelegramConfig);
+    };
 
     // Live bot token, resolved lazily. The instance-wide connection (ODIAA-720)
     // is stored in plugin *state*, which — unlike config — does NOT restart the
@@ -1277,7 +1317,28 @@ export const plugin = definePlugin({
       next: Record<string, unknown>,
       companyId: string | null,
     ): Promise<void> => {
-      config = { ...DEFAULT_CONFIG, ...next } as unknown as TelegramConfig;
+      const merged = { ...DEFAULT_CONFIG, ...next } as unknown as TelegramConfig;
+      if (companyId) {
+        configByCompany.set(companyId, merged);
+      } else {
+        unscopedConfig = merged;
+      }
+
+      // Promote the delivery to the primary config, but keep an instance-wide
+      // value another company's row actually customised. The host replays one
+      // `configChanged` per stored row in arbitrary order, and most rows are
+      // untouched seeded defaults — without this the effective base URL would
+      // depend on which row happened to land last (ODIAA-1930).
+      const previous = config;
+      // Copied, not aliased: `merged` is the company's stored config and must
+      // not pick up another company's instance-wide values below.
+      config = { ...merged };
+      for (const key of INSTANCE_WIDE_STRING_KEYS) {
+        if (merged[key] === DEFAULT_CONFIG[key] && previous[key] !== DEFAULT_CONFIG[key]) {
+          config[key] = previous[key];
+        }
+      }
+
       baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
       publicUrl = config.paperclipPublicUrl || baseUrl;
 
@@ -1350,7 +1411,8 @@ export const plugin = definePlugin({
             lastUpdateId = await processTelegramUpdateBatch({
               updates: data.result,
               lastUpdateId,
-              handleUpdate: (update) => handleUpdate(ctx, token, config, update, baseUrl, publicUrl),
+              handleUpdate: (update) =>
+                handleUpdate(ctx, token, config, update, baseUrl, publicUrl, undefined, configFor),
               persistOffset: (updateId) => persistTelegramUpdateOffset(ctx, updateId),
               logger: ctx.logger,
             });
@@ -1413,10 +1475,13 @@ export const plugin = definePlugin({
         overrideTopicId && typeof overrideTopicId === "object" ? overrideTopicId : undefined;
       const resolvedTopicId: string | undefined =
         overrideTopicId && typeof overrideTopicId === "string" ? overrideTopicId : undefined;
+      // Delivery routing follows the notifying company's own config, not
+      // whichever company was replayed last (ODIAA-1930).
+      const eventConfig = configFor(event.companyId);
       const chatId = await resolveChat(
         ctx,
         event.companyId,
-        overrideChatId || config.defaultChatId,
+        overrideChatId || eventConfig.defaultChatId,
       );
       if (!chatId) return;
       const linksOpts = await resolveIssueLinksOpts(event.companyId);
@@ -1424,7 +1489,7 @@ export const plugin = definePlugin({
 
       let messageThreadId = parseTopicId(resolvedTopicId);
       if (!messageThreadId) {
-        messageThreadId = await resolveNotificationThreadId(ctx, chatId, event, config.topicRouting);
+        messageThreadId = await resolveNotificationThreadId(ctx, chatId, event, eventConfig.topicRouting);
       }
 
       if (messageThreadId) {
@@ -1528,16 +1593,17 @@ export const plugin = definePlugin({
     // delivered any company config (ODIAA-1379), and the SDK only accepts
     // registrations made synchronously inside setup(), so a registration-time
     // gate would permanently disable the notification instead of following the
-    // operator's saved setting.
+    // operator's saved setting. Each gate reads `configFor(event.companyId)` so
+    // it follows the notifying company's saved setting (ODIAA-1930).
     ctx.events.on("issue.created", async (event: PluginEvent) => {
-      if (!config.notifyOnIssueCreated) return;
+      if (!configFor(event.companyId).notifyOnIssueCreated) return;
       await notify(event, formatIssueCreated);
     });
 
     {
       const doneDedupe = makeUpdateDedupe();
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
-        if (!config.notifyOnIssueDone) return;
+        if (!configFor(event.companyId).notifyOnIssueDone) return;
         const payload = event.payload as Record<string, unknown>;
         if (payload.status !== "done") return;
         if (!doneDedupe(`done|${event.entityId}`)) return;
@@ -1568,7 +1634,8 @@ export const plugin = definePlugin({
       const assignmentDedupe = makeUpdateDedupe();
 
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
-        if (!config.notifyOnIssueAssigned) return;
+        const eventConfig = configFor(event.companyId);
+        if (!eventConfig.notifyOnIssueAssigned) return;
         const payload = event.payload as Record<string, unknown>;
         const prev = (payload._previous as Record<string, unknown> | undefined) ?? {};
 
@@ -1578,7 +1645,10 @@ export const plugin = definePlugin({
           "assigneeAgentId" in payload && payload.assigneeAgentId !== prev.assigneeAgentId;
         if (!userChanged && !agentChanged) return;
 
-        if (config.onlyNotifyIfAssignedTo && payload.assigneeUserId !== config.onlyNotifyIfAssignedTo) {
+        if (
+          eventConfig.onlyNotifyIfAssignedTo &&
+          payload.assigneeUserId !== eventConfig.onlyNotifyIfAssignedTo
+        ) {
           return;
         }
 
@@ -1608,8 +1678,9 @@ export const plugin = definePlugin({
     }
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
-      if (!config.notifyOnApprovalCreated) return;
-      if (!shouldNotifyApproval(event, config.onlyNotifyBoardApprovals)) return;
+      const eventConfig = configFor(event.companyId);
+      if (!eventConfig.notifyOnApprovalCreated) return;
+      if (!shouldNotifyApproval(event, eventConfig.onlyNotifyBoardApprovals)) return;
       const payload = event.payload as Record<string, unknown>;
       // Enrich with linked issue details (event only has issueIds)
       const issueIds = Array.isArray(payload.issueIds) ? payload.issueIds as string[] : [];
@@ -1649,13 +1720,14 @@ export const plugin = definePlugin({
           ? `${approvalType} — ${agentLabel}`
           : approvalType;
       }
-      await notify(event, formatApprovalCreated, config.approvalsChatId, config.approvalsTopicId);
+      await notify(event, formatApprovalCreated, eventConfig.approvalsChatId, eventConfig.approvalsTopicId);
     });
 
     {
       const agentErrorDedupe = makeUpdateDedupe(AGENT_ERROR_DEDUPLICATION_WINDOW_MS, 1000);
       ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
-        if (!config.notifyOnAgentError) return;
+        const eventConfig = configFor(event.companyId);
+        if (!eventConfig.notifyOnAgentError) return;
         const payload = event.payload as Record<string, unknown>;
         const agentId = String(payload.agentId ?? event.entityId);
         if (payload.agentId && !payload.agentName) {
@@ -1682,7 +1754,7 @@ export const plugin = definePlugin({
         const errorMessage = normalizeAgentErrorMessage(payload.error ?? payload.message);
         const dedupeKey = ["agent.run.failed", event.companyId, agentId, errorMessage].join(":");
         if (!agentErrorDedupe(dedupeKey)) return;
-        await notify(event, formatAgentError, config.errorsChatId, config.errorsTopicId, dedupeKey);
+        await notify(event, formatAgentError, eventConfig.errorsChatId, eventConfig.errorsTopicId, dedupeKey);
       });
     }
 
@@ -1702,7 +1774,7 @@ export const plugin = definePlugin({
       event: PluginEvent,
       formatter: typeof formatAgentRunStarted,
     ) => {
-      const opsDestination = await resolveOpsDestinationForEvent(ctx, config, event);
+      const opsDestination = await resolveOpsDestinationForEvent(ctx, configFor(event.companyId), event);
       if (opsDestination) {
         ctx.logger.info("Telegram ops notification routed", {
           eventType: event.eventType,
@@ -1716,12 +1788,12 @@ export const plugin = definePlugin({
     };
 
     ctx.events.on("agent.run.started", async (event: PluginEvent) => {
-      if (!config.notifyOnAgentRunStarted) return;
+      if (!configFor(event.companyId).notifyOnAgentRunStarted) return;
       await enrichAgentName(event);
       await notifyOps(event, formatAgentRunStarted);
     });
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
-      if (!config.notifyOnAgentRunFinished) return;
+      if (!configFor(event.companyId).notifyOnAgentRunFinished) return;
       await enrichAgentName(event);
       await notifyOps(event, formatAgentRunFinished);
     });
@@ -1733,7 +1805,7 @@ export const plugin = definePlugin({
     {
       const blockedDedupe = makeUpdateDedupe();
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
-        if (!config.notifyOnIssueBlocked) return;
+        if (!configFor(event.companyId).notifyOnIssueBlocked) return;
         const payload = event.payload as Record<string, unknown>;
         // Cheap pre-gate so we never fetch the issue for non-blocked updates.
         if (payload.status !== "blocked") return;
@@ -1781,9 +1853,10 @@ export const plugin = definePlugin({
     // Forward issue.comment.created only when a configured board username is
     // @-mentioned (word-boundary aware, case-insensitive).
     ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
-      if (!config.notifyOnBoardMention) return;
+      const eventConfig = configFor(event.companyId);
+      if (!eventConfig.notifyOnBoardMention) return;
       // Re-parsed per delivery: the username list arrives with the config.
-      const boardUsernames = parseBoardUsernames(config.boardUsernames);
+      const boardUsernames = parseBoardUsernames(eventConfig.boardUsernames);
       if (boardUsernames.length === 0) return;
       if (!shouldNotifyBoardMention(event, true, boardUsernames)) return;
       const payload = event.payload as Record<string, unknown>;
@@ -1885,8 +1958,9 @@ export const plugin = definePlugin({
         });
         const targetUserId = target?.userId ?? null;
 
+        const eventConfig = configFor(event.companyId);
         const { ownerUserId, targetChatId, needsSetupNotice } =
-          resolveInteractionRouting(targetUserId, config.userChatMappings);
+          resolveInteractionRouting(targetUserId, eventConfig.userChatMappings);
 
         if (targetChatId) {
           ctx.logger.info("Routing interaction to identified owner chat", {
@@ -1914,7 +1988,7 @@ export const plugin = definePlugin({
           const noticeChatId = await resolveChat(
             ctx,
             event.companyId,
-            config.approvalsChatId || config.defaultChatId,
+            eventConfig.approvalsChatId || eventConfig.defaultChatId,
           );
           if (noticeChatId) {
             const ident = issue?.identifier ?? issueId;
@@ -1935,7 +2009,7 @@ export const plugin = definePlugin({
         await notify(
           event,
           formatInteractionCreated,
-          targetChatId ?? (config.approvalsChatId || config.defaultChatId),
+          targetChatId ?? (eventConfig.approvalsChatId || eventConfig.defaultChatId),
           {
             entityType: "interaction",
             issueId,
@@ -1965,7 +2039,7 @@ export const plugin = definePlugin({
         scopeId: companyId,
         stateKey: "telegram-chat",
       });
-      return { chatId: saved ?? config.defaultChatId };
+      return { chatId: saved ?? configFor(companyId).defaultChatId };
     });
 
     ctx.actions.register("set-chat", async (params) => {
@@ -2019,7 +2093,14 @@ export const plugin = definePlugin({
 
       const companies = await ctx.companies.list();
       for (const company of companies) {
-        const chatId = await resolveChat(ctx, company.id, config.digestChatId || config.defaultChatId);
+        // The digest *schedule* is instance-wide (one job), but where each
+        // company's digest lands is that company's own setting (ODIAA-1930).
+        const companyConfig = configFor(company.id);
+        const chatId = await resolveChat(
+          ctx,
+          company.id,
+          companyConfig.digestChatId || companyConfig.defaultChatId,
+        );
         if (!chatId) continue;
 
         try {
@@ -2078,7 +2159,7 @@ export const plugin = definePlugin({
             for (const i of blocked.slice(0, 10)) lines.push(formatIssueItem(i));
           }
 
-          const digestThreadId = await resolveDigestThreadId(ctx, token, chatId, config.digestTopicId);
+          const digestThreadId = await resolveDigestThreadId(ctx, token, chatId, companyConfig.digestTopicId);
 
           await sendMessage(ctx, token, chatId, lines.join("\n"), {
             parseMode: "MarkdownV2",
@@ -2096,7 +2177,7 @@ export const plugin = definePlugin({
             ctx,
             token,
             chatId,
-            config.errorsTopicId || config.digestTopicId,
+            companyConfig.errorsTopicId || companyConfig.digestTopicId,
           );
 
           await sendMessage(ctx, token, chatId, text, {
@@ -2404,15 +2485,30 @@ export const plugin = definePlugin({
   // host from restarting the worker on every operator save — applyConfig
   // recomputes everything config-derived in place instead.
   //
-  // Deliberately single-tenant (no `multiCompanyConfig`): the bot connection is
-  // instance-wide and chats map to companies at runtime, so the host's
-  // fail-closed CROSS_TENANT_CONFIG guard is the behaviour we want if two
-  // companies are ever configured with different settings.
+  // Multi-company (ODIAA-1930). One worker serves every company on the
+  // instance, so its settings are keyed per company: `applyConfig` stores each
+  // delivery in `configByCompany` and every company-scoped read goes through
+  // `configFor(companyId)`.
+  //
+  // This was previously declared single-tenant on the grounds that the bot
+  // connection is instance-wide and chats map to companies at runtime — which
+  // is the argument for the opposite conclusion. The host's fail-closed
+  // CROSS_TENANT_CONFIG guard then *rejected* the second company's delivery, so
+  // on an instance with several configured companies the operator's saved
+  // settings never reached the worker at all: whichever row the startup replay
+  // delivered first won, and every later save for a different company was
+  // refused. Declaring the plugin multi-company without the per-company keying
+  // below would be the regression the guard exists to prevent (last-write-wins
+  // collapse), so the two changes belong together.
   //
   // `context` is declared optional on purpose: SDKs up to 2026.722.0 type (and
   // call) this hook with the config alone, while newer hosts thread the company
-  // scope through. Optional keeps it assignable to both, and the companyId is
-  // only used for logging.
+  // scope through. Optional keeps it assignable to both; a delivery that
+  // carries no scope is stored as the unscoped config, which every company
+  // falls back to — that is exactly the old single-tenant behaviour on a host
+  // too old to say which company it meant.
+  multiCompanyConfig: true,
+
   async onConfigChanged(
     newConfig: Record<string, unknown>,
     context?: { companyId?: string | null },
@@ -2437,6 +2533,11 @@ export async function handleUpdate(
   baseUrl: string,
   publicUrl?: string,
   boardApiToken?: string,
+  // Resolves the config of the company a chat is linked to (ODIAA-1930).
+  // `config` above stays the instance-wide view — one bot connection, one
+  // allowlist — while company-scoped answers such as `/status`'s notification
+  // flags must mirror what the delivery gates actually read for that company.
+  configFor: (companyId?: string | null) => TelegramConfig = () => config,
 ): Promise<void> {
   if (!isTelegramUpdateAllowed(config, update)) {
     const fromId = update.message?.from?.id ?? update.callback_query?.from.id;
@@ -2521,7 +2622,7 @@ export async function handleUpdate(
     // Built-in commands
     const boardApiToken = command === "approve" ? await resolveBoardApiToken(ctx, config, companyId) : undefined;
     const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, config) : undefined;
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(config));
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(configFor(companyId)));
     return;
   }
 
