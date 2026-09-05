@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-09-05
+
+The 0.4.3 attribution fix was correct but inert on installs whose host still
+holds an older manifest: the capabilities it depends on were never granted, and
+the bot then blamed the sender's identity for a host permission problem.
+
+### Fixed
+
+- **A host capability denial is no longer reported as an unrecognised sender
+  (ODIAA-1927).** `access.members.read`, `issue.comments.create_human_attributed`
+  and `issues.wakeup` were added to the manifest in 0.4.3, but Paperclip only
+  re-reads a plugin manifest when the plugin is activated — so on an install
+  upgraded in place, every one of them is still denied. The reply then landed
+  unattributed and the bot told the sender to add a `telegramActorMappings`
+  entry, which cannot help: the attributed write is refused whichever user is
+  named. The notice now distinguishes the two causes and, for a denial, names
+  the missing capabilities and the fix (an instance admin disables and re-enables
+  the plugin, which makes the host re-read the manifest).
+
+### Added
+
+- **`/status` reports whether replies can be attributed at all (ODIAA-1927).** A
+  new `💬 Reply attribution: …` line probes the capability the inbound path hangs
+  on. Without it a denial is invisible from Telegram — replies still arrive, just
+  as inert notes nobody is woken by — and this is the quickest way to confirm a
+  plugin reload actually took effect.
+
 ## [0.4.4] — 2026-09-05
 
 ### Added

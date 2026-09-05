@@ -4,6 +4,7 @@ import { METRIC_NAMES } from "./constants.js";
 import { handleAcpCommand } from "./acp-bridge.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi, type CfAccessHeaders } from "./paperclip-api.js";
 import { formatCompanyChoices, listCompaniesResilient, resolveCompanyInput } from "./company-directory.js";
+import { probeReplyAttribution, type ReplyAttributionReadiness } from "./inbound-attribution.js";
 
 type BotCommand = {
   command: string;
@@ -54,6 +55,26 @@ function formatNotificationFlags(flags: NotificationFlags): string {
   const enabled = NOTIFICATION_LABELS.filter(([key]) => flags[key]).map(([, label]) => label);
   const summary = enabled.length > 0 ? enabled.join(", ") : "none";
   return `${escapeMarkdownV2("🔔")} Notifications on: ${escapeMarkdownV2(summary)}`;
+}
+
+/**
+ * Say whether a reply typed in this chat can be posted as its author
+ * (ODIAA-1927).
+ *
+ * Without this line a capability denial is undetectable from Telegram: replies
+ * still land, silently, as notes nobody is woken by. With it, one `/status`
+ * settles whether an install has the grants the inbound path needs.
+ */
+export function formatReplyAttribution(readiness: ReplyAttributionReadiness): string {
+  const detail =
+    readiness.state === "ready"
+      ? readiness.humanMembers === 1
+        ? "on (replies post as you)"
+        : `on (${readiness.humanMembers} board members — map yours in telegramActorMappings)`
+      : readiness.state === "capability_denied"
+        ? "off — plugin not granted access.members.read; an admin must disable + enable the plugin"
+        : `unknown — ${readiness.error}`;
+  return `${escapeMarkdownV2("💬")} Reply attribution: ${escapeMarkdownV2(detail)}`;
 }
 
 export const BOT_COMMANDS: BotCommand[] = [
@@ -157,6 +178,7 @@ async function handleStatus(
     if (notificationFlags) {
       lines.push(formatNotificationFlags(notificationFlags));
     }
+    lines.push(formatReplyAttribution(await probeReplyAttribution(ctx, companyId)));
 
     const inlineKeyboard = isExternalUrl(publicUrl)
       ? [[{ text: "Open Dashboard ↗", url: publicUrl! }]]
