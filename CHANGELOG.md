@@ -6,6 +6,44 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-09-05
+
+The 0.4.2 fix got replies onto the task; this one gets them *read*. A board member
+answering a "task complete" card saw their message filed as a system message that
+nothing acted on.
+
+### Fixed
+
+- **An inbound reply is posted as the board member who wrote it, not as the
+  plugin (ODIAA-1927).** The plugin posted every relayed reply under its own
+  identity. An agent-attributed comment renders as a system message and — by
+  host design — never wakes the assignee, so an answer typed in Telegram was
+  delivered and then ignored. Replies now go through
+  `ctx.issues.createComment(..., { actorUserId })`, which the host treats like a
+  comment typed in the web app (it independently re-verifies the user is an
+  active, non-viewer human member of the company before applying the
+  attribution). The board member is identified, in descending authority, from
+  `telegramActorMappings`, from `userChatMappings` reversed for a private chat
+  whose id is the sender's own id, or — for the single-human board that most
+  installs are — from the company's sole active human member. Ambiguity is never
+  guessed at: two humans and no mapping leaves the comment unattributed, and the
+  sender is told once a day that their replies are not being attributed and how
+  to fix it. If the host refuses the attribution (capability not granted, user
+  not an eligible member) the reply is still posted unattributed rather than
+  lost. New capabilities: `issue.comments.create_human_attributed`,
+  `access.members.read`, `issues.wakeup`.
+
+- **A reply to a finished task reopens it and wakes its agent (ODIAA-1927).**
+  The host's comment-relay wake deliberately skips `done`/`cancelled` issues,
+  which is precisely the case a reply to a completion notification lands in.
+  A human-attributed reply on a closed issue with an agent assignee now moves it
+  back to `todo` and requests a wakeup — the same rule the web app applies to a
+  board comment on closed work. Open issues are untouched (the host already
+  wakes them), and an unattributed comment never reopens anything.
+  Covered by `tests/inbound-reply-attribution.test.ts`.
+
+- `PLUGIN_VERSION` was still reporting `0.4.1` after the 0.4.2 release.
+
 ## [0.4.2] — 2026-09-05
 
 Two board-reported failures in the same round trip: a reply typed in Telegram never
