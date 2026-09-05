@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/status` reports which notifications the worker actually has enabled
+  (ODIAA-1927).** A board member turned "task complete" notifications off and
+  kept receiving them, and there was no way from the chat to tell whether the
+  setting had failed to save or failed to reach the worker. `/status` now ends
+  with a `🔔 Notifications on: …` line built from the same live config object the
+  delivery-time gates read, so the two cases are distinguishable without board
+  access to the plugin config API. The delivery gate itself was verified to
+  honour a delivered `notifyOnIssueDone: false`; a regression test now covers it.
+
 ## [0.4.3] — 2026-09-05
 
 The 0.4.2 fix got replies onto the task; this one gets them *read*. A board member

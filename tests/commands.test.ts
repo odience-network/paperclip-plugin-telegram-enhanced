@@ -105,6 +105,54 @@ describe("handleCommand", () => {
     expect(sentMessages[0].text).toContain("Paperclip Status");
   });
 
+  it("/status lists only the notifications the live worker has enabled (ODIAA-1927)", async () => {
+    const ctx = mockCtx();
+    await handleCommand(
+      ctx, "token", "123", "status", "", undefined, undefined, undefined, "co-1",
+      undefined, undefined, undefined,
+      {
+        issueCreated: true,
+        issueDone: false,
+        issueAssigned: false,
+        issueBlocked: false,
+        boardMention: false,
+        approvalCreated: true,
+        agentError: true,
+        agentRunStarted: false,
+        agentRunFinished: false,
+      },
+    );
+    expect(sentMessages[0].text).toContain("Notifications on: task created, approvals, agent errors");
+    expect(sentMessages[0].text).not.toContain("task complete");
+  });
+
+  it("/status says 'none' when every notification is off (ODIAA-1927)", async () => {
+    const ctx = mockCtx();
+    await handleCommand(
+      ctx, "token", "123", "status", "", undefined, undefined, undefined, "co-1",
+      undefined, undefined, undefined,
+      {
+        issueCreated: false,
+        issueDone: false,
+        issueAssigned: false,
+        issueBlocked: false,
+        boardMention: false,
+        approvalCreated: false,
+        agentError: false,
+        agentRunStarted: false,
+        agentRunFinished: false,
+      },
+    );
+    expect(sentMessages[0].text).toContain("Notifications on: none");
+  });
+
+  it("/status omits the notification line when no flags are passed", async () => {
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "123", "status", "");
+    expect(sentMessages[0].text).toContain("Paperclip Status");
+    expect(sentMessages[0].text).not.toContain("Notifications on:");
+  });
+
   it("uses a resolved company id for group chat commands", async () => {
     const ctx = mockCtx();
     await handleCommand(ctx, "token", "-1003800613668", "status", "", undefined, undefined, undefined, "co-1");

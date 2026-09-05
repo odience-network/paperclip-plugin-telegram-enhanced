@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
-import { BOT_CONNECTION_SCOPE, plugin } from "../src/worker.js";
+import { BOT_CONNECTION_SCOPE, notificationFlagsOf, plugin } from "../src/worker.js";
 
 // ODIAA-1379 — company-scoped plugin configuration.
 //
@@ -118,6 +118,63 @@ describe("onConfigChanged delivery", () => {
     });
     await harness.emit("issue.created", { title: "Delivered" }, { companyId: COMPANY_ID });
     expect(sentMessages(fetchMock)).toHaveLength(1);
+  });
+
+  it("suppresses task-complete notifications once the operator turns them off (ODIAA-1927)", async () => {
+    const { harness, fetchMock } = await startWorker({ withBotToken: true });
+
+    await plugin.definition.onConfigChanged?.({
+      defaultChatId: "-1001",
+      notifyOnIssueDone: false,
+    });
+    await harness.emit(
+      "issue.updated",
+      { status: "done", title: "Suppressed" },
+      { companyId: COMPANY_ID, entityId: "issue-off" },
+    );
+    expect(sentMessages(fetchMock)).toHaveLength(0);
+
+    await plugin.definition.onConfigChanged?.({
+      defaultChatId: "-1001",
+      notifyOnIssueDone: true,
+    });
+    await harness.emit(
+      "issue.updated",
+      { status: "done", title: "Delivered" },
+      { companyId: COMPANY_ID, entityId: "issue-on" },
+    );
+    expect(sentMessages(fetchMock)).toHaveLength(1);
+  });
+
+  it("reports the delivered notification flags, not the defaults (ODIAA-1927)", async () => {
+    await startWorker();
+
+    // The `/status` readout is only diagnostic if it maps each flag to the key
+    // the delivery-time gate reads — a crossed key would report "off" for a
+    // notification that still fires.
+    expect(
+      notificationFlagsOf({
+        notifyOnIssueCreated: true,
+        notifyOnIssueDone: false,
+        notifyOnIssueAssigned: false,
+        notifyOnIssueBlocked: true,
+        notifyOnBoardMention: false,
+        notifyOnApprovalCreated: true,
+        notifyOnAgentError: true,
+        notifyOnAgentRunStarted: false,
+        notifyOnAgentRunFinished: false,
+      } as never),
+    ).toEqual({
+      issueCreated: true,
+      issueDone: false,
+      issueAssigned: false,
+      issueBlocked: true,
+      boardMention: false,
+      approvalCreated: true,
+      agentError: true,
+      agentRunStarted: false,
+      agentRunFinished: false,
+    });
   });
 
   it("falls back to DEFAULT_CONFIG for keys the operator never saved", async () => {

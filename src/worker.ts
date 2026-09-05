@@ -41,7 +41,12 @@ import {
   respondInteraction,
   isAlreadyResolvedInteractionError,
 } from "./interactions-api.js";
-import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
+import {
+  handleCommand,
+  resolveNotificationThreadId,
+  BOT_COMMANDS,
+  type NotificationFlags,
+} from "./commands.js";
 import {
   routeMessageToAgent,
   handleHandoffToolCall,
@@ -641,6 +646,26 @@ function validateConfiguredTopicIds(config: Record<string, unknown>): string[] {
     }
   }
   return errors;
+}
+
+/**
+ * Project the live worker config onto the flags `/status` reports (ODIAA-1927).
+ * Reading the same mutable the delivery-time gates read is the point: if an
+ * operator turns "task complete" off and `/status` still shows it on, the saved
+ * setting never reached the worker, rather than the gate ignoring it.
+ */
+export function notificationFlagsOf(config: TelegramConfig): NotificationFlags {
+  return {
+    issueCreated: config.notifyOnIssueCreated,
+    issueDone: config.notifyOnIssueDone,
+    issueAssigned: config.notifyOnIssueAssigned,
+    issueBlocked: config.notifyOnIssueBlocked,
+    boardMention: config.notifyOnBoardMention,
+    approvalCreated: config.notifyOnApprovalCreated,
+    agentError: config.notifyOnAgentError,
+    agentRunStarted: config.notifyOnAgentRunStarted,
+    agentRunFinished: config.notifyOnAgentRunFinished,
+  };
 }
 
 async function resolveDigestThreadId(
@@ -2494,7 +2519,7 @@ export async function handleUpdate(
     // Built-in commands
     const boardApiToken = command === "approve" ? await resolveBoardApiToken(ctx, config, companyId) : undefined;
     const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, config) : undefined;
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders);
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(config));
     return;
   }
 

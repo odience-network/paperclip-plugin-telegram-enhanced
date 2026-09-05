@@ -19,6 +19,43 @@ type TopicMappingRecord = {
 type TopicMappingValue = string | TopicMappingRecord;
 type TopicMap = Record<string, TopicMappingValue>;
 
+/**
+ * The subset of the live worker config that decides which notifications reach a
+ * chat. `/status` echoes it back so an operator can tell "the toggle never
+ * saved" apart from "the toggle saved but the worker never received it"
+ * (ODIAA-1927): these values come from the same mutable the delivery-time gates
+ * read, not from the settings store.
+ */
+export type NotificationFlags = {
+  issueCreated: boolean;
+  issueDone: boolean;
+  issueAssigned: boolean;
+  issueBlocked: boolean;
+  boardMention: boolean;
+  approvalCreated: boolean;
+  agentError: boolean;
+  agentRunStarted: boolean;
+  agentRunFinished: boolean;
+};
+
+const NOTIFICATION_LABELS: Array<[keyof NotificationFlags, string]> = [
+  ["issueCreated", "task created"],
+  ["issueDone", "task complete"],
+  ["issueAssigned", "task assigned"],
+  ["issueBlocked", "task blocked"],
+  ["boardMention", "board mention"],
+  ["approvalCreated", "approvals"],
+  ["agentError", "agent errors"],
+  ["agentRunStarted", "run started"],
+  ["agentRunFinished", "run finished"],
+];
+
+function formatNotificationFlags(flags: NotificationFlags): string {
+  const enabled = NOTIFICATION_LABELS.filter(([key]) => flags[key]).map(([, label]) => label);
+  const summary = enabled.length > 0 ? enabled.join(", ") : "none";
+  return `${escapeMarkdownV2("🔔")} Notifications on: ${escapeMarkdownV2(summary)}`;
+}
+
 export const BOT_COMMANDS: BotCommand[] = [
   { command: "create", description: "Create a new task (assigned to CEO agent)" },
   { command: "status", description: "Company health: active agents, open issues" },
@@ -46,6 +83,7 @@ export async function handleCommand(
   boardApiToken?: string,
   maxAgentsPerThread?: number,
   cfAccessHeaders?: CfAccessHeaders,
+  notificationFlags?: NotificationFlags,
 ): Promise<void> {
   await ctx.metrics.write(METRIC_NAMES.commandsHandled, 1);
 
@@ -54,7 +92,7 @@ export async function handleCommand(
       await handleCreate(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, companyId);
       break;
     case "status":
-      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl, companyId);
+      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl, companyId, notificationFlags);
       break;
     case "issues":
       await handleIssues(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, companyId);
@@ -98,6 +136,7 @@ async function handleStatus(
   messageThreadId?: number,
   publicUrl?: string,
   resolvedCompanyId?: string,
+  notificationFlags?: NotificationFlags,
 ): Promise<void> {
   await sendChatAction(ctx, token, chatId);
 
@@ -114,6 +153,10 @@ async function handleStatus(
       `${escapeMarkdownV2("🤖")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
       `${escapeMarkdownV2("📋")} Recent issues: *${escapeMarkdownV2(String(issues.length))}* \\(${escapeMarkdownV2(String(doneIssues.length))} done\\)`,
     ];
+
+    if (notificationFlags) {
+      lines.push(formatNotificationFlags(notificationFlags));
+    }
 
     const inlineKeyboard = isExternalUrl(publicUrl)
       ? [[{ text: "Open Dashboard ↗", url: publicUrl! }]]
