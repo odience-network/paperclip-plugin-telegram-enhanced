@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-05
+
+Two board-reported failures in the same round trip: a reply typed in Telegram never
+reached the task, and the `/connect` the bot told you to run could not work from the
+place bot commands actually run. Also ships the ACP-bridge company-id fix.
+
 ### Fixed
 
 - **Replies to notification cards reach Paperclip again, and an undeliverable
