@@ -118,7 +118,7 @@ describe("routeInboundReply org routing (ODIAA-936)", () => {
       "-100777",
       "hi",
     );
-    expect(outcome).toEqual({ routed: "none" });
+    expect(outcome).toEqual({ routed: "none", reason: "inbound-disabled" });
     expect(commentCalls).toHaveLength(0);
   });
 
@@ -127,14 +127,14 @@ describe("routeInboundReply org routing (ODIAA-936)", () => {
     const nonReply = makeReply("hi");
     delete (nonReply as { reply_to_message?: unknown }).reply_to_message;
     const outcome = await routeInboundReply(ctx, "token", INBOUND_CONFIG, nonReply, "-100777", "hi");
-    expect(outcome).toEqual({ routed: "none" });
+    expect(outcome).toEqual({ routed: "none", reason: "not-a-bot-reply" });
     expect(commentCalls).toHaveLength(0);
   });
 
   it("does nothing when the replied-to message mapping has expired", async () => {
     const { ctx, commentCalls } = makeCtx({});
     const outcome = await routeInboundReply(ctx, "token", INBOUND_CONFIG, makeReply("hi"), "-100777", "hi");
-    expect(outcome).toEqual({ routed: "none" });
+    expect(outcome).toEqual({ routed: "none", reason: "mapping-expired" });
     expect(commentCalls).toHaveLength(0);
   });
 
@@ -147,7 +147,52 @@ describe("routeInboundReply org routing (ODIAA-936)", () => {
       throw new Error("RPC down");
     };
     const outcome = await routeInboundReply(ctx, "token", INBOUND_CONFIG, makeReply("hi"), "-100777", "hi");
-    expect(outcome).toEqual({ routed: "none" });
+    expect(outcome).toEqual({ routed: "none", reason: "delivery-failed" });
+  });
+
+  it("routes a reply to a non-issue card via the issueId carried on the mapping (ODIAA-1927)", async () => {
+    // agent.run.failed cards are entityType "heartbeat_run": the issue they are
+    // about only exists on the mapping's issueId. Replies to them used to be
+    // dropped in silence, which is what "the bot ignores my answers" looked like.
+    const stateStore: Record<string, unknown> = {
+      "msg_-100777_157": {
+        entityType: "heartbeat_run",
+        entityId: "run-77",
+        issueId: "iss-579",
+        companyId: "co-originating",
+        eventType: "agent.run.failed",
+      },
+    };
+    const { ctx, commentCalls, metricCalls } = makeCtx(stateStore);
+
+    const outcome = await routeInboundReply(
+      ctx,
+      "token",
+      INBOUND_CONFIG,
+      makeReply("retry it please"),
+      "-100777",
+      "retry it please",
+    );
+
+    expect(outcome).toEqual({ routed: "issue", entityId: "iss-579", companyId: "co-originating" });
+    expect(commentCalls).toEqual([
+      { entityId: "iss-579", text: "retry it please", companyId: "co-originating" },
+    ]);
+    expect(metricCalls).toEqual([{ name: "telegram_inbound_routed", value: 1 }]);
+  });
+
+  it("reports no-target when the mapping names no issue at all", async () => {
+    const stateStore: Record<string, unknown> = {
+      "msg_-100777_157": {
+        entityType: "digest",
+        entityId: "digest-1",
+        companyId: "co-originating",
+      },
+    };
+    const { ctx, commentCalls } = makeCtx(stateStore);
+    const outcome = await routeInboundReply(ctx, "token", INBOUND_CONFIG, makeReply("hi"), "-100777", "hi");
+    expect(outcome).toEqual({ routed: "none", reason: "no-target" });
+    expect(commentCalls).toHaveLength(0);
   });
 
   it("routes an escalation reply down the escalation branch, not the issue branch", async () => {

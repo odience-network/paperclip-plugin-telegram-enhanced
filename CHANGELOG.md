@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Replies to notification cards reach Paperclip again, and an undeliverable
+  reply is answered instead of dropped (ODIAA-1927).** Inbound routing only
+  understood two kinds of outbound card: `escalation` and `issue`. Everything
+  else — most importantly `agent.run.failed`, whose entity is a `heartbeat_run`
+  and which carries its issue as `payload.issueId` — matched neither branch, so
+  a board member's reply was read and then silently discarded (the
+  `telegram_inbound_routed` metric had never once been written). Outbound
+  mappings now persist the issue the event is *about*, `routeInboundReply`
+  falls back to that `issueId`, and every reply that still cannot be delivered
+  gets an explanation in-chat (too old to answer / not linked to a task /
+  delivery failed / inbound disabled) plus a `telegram_inbound_unrouted`
+  metric. Ordinary chatter that is not a reply to the bot stays untouched.
+  Covered by `tests/inbound-reply-routing.test.ts` and
+  `tests/inbound-reply-acknowledgement.test.ts`.
+
 - **`/connect` no longer fails with `not allowed to perform "companies.list"`
   (ODIAA-1927).** Bot commands run from the long-polling loop, a *proactive*
   worker→host context with no host-issued invocation scope. The host resolves

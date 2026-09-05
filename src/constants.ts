@@ -78,6 +78,7 @@ export const METRIC_NAMES = {
   failed: "telegram_notification_failures",
   commandsHandled: "telegram_commands_handled",
   inboundRouted: "telegram_inbound_routed",
+  inboundUnrouted: "telegram_inbound_unrouted",
   escalationsCreated: "telegram_escalations_created",
   escalationsResolved: "telegram_escalations_resolved",
   escalationsTimedOut: "telegram_escalations_timed_out",
