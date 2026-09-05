@@ -37,7 +37,19 @@ function mockCtx(): PluginContext {
     },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     companies: { get: vi.fn().mockResolvedValue(null) },
-    issues: { createComment: vi.fn(async () => {}) },
+    issues: {
+      createComment: vi.fn(async () => {}),
+      get: vi.fn(async () => ({ id: "iss-579", status: "in_progress", assigneeAgentId: "agent-1" })),
+      update: vi.fn(async () => {}),
+      requestWakeup: vi.fn(async () => ({ queued: true, runId: null })),
+    },
+    access: {
+      members: {
+        list: vi.fn(async () => [
+          { principalType: "user", principalId: "local-board", status: "active" },
+        ]),
+      },
+    },
   } as unknown as PluginContext;
 }
 
@@ -103,7 +115,32 @@ describe("unroutable inbound replies (ODIAA-1927)", () => {
 
     await handleUpdate(ctx, "token", config, replyUpdate("retry please"), "http://localhost:3100");
 
-    expect(ctx.issues.createComment).toHaveBeenCalledWith("iss-579", "retry please", "co-1");
+    expect(ctx.issues.createComment).toHaveBeenCalledWith("iss-579", "retry please", "co-1", {
+      actorUserId: "local-board",
+    });
     expect(sentMessages).toHaveLength(0);
+  });
+
+  it("warns once a day when a delivered reply could not be attributed to a user", async () => {
+    stateStore["msg_-100777_157"] = {
+      entityType: "heartbeat_run",
+      entityId: "run-77",
+      issueId: "iss-579",
+      companyId: "co-1",
+    };
+    const ctx = mockCtx();
+    // Two humans and no mapping table: attribution has nothing unambiguous to
+    // go on, so the reply lands as a system message the assignee never sees.
+    (ctx.access.members.list as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { principalType: "user", principalId: "user-a", status: "active" },
+      { principalType: "user", principalId: "user-b", status: "active" },
+    ]);
+
+    await handleUpdate(ctx, "token", config, replyUpdate("retry please"), "http://localhost:3100");
+    await handleUpdate(ctx, "token", config, replyUpdate("still waiting"), "http://localhost:3100");
+
+    expect(ctx.issues.createComment).toHaveBeenCalledWith("iss-579", "retry please", "co-1");
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0].text).toContain("telegramActorMappings");
   });
 });

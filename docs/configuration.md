@@ -71,6 +71,26 @@ Route each notification type to its own chat or forum topic. Anything left unset
 
 > If both allowlists are set, **both must match**. See [Getting Started](getting-started.md#7-secure-inbound-interactions).
 
+## Inbound replies and who they are posted as
+
+Replying to a notification card posts your message as a comment on the task it came
+from. The plugin posts it **as you** whenever it can identify you — that is what makes
+it a real comment (one the assigned agent is woken by, and that reopens a finished
+task) instead of a system message nothing acts on.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `telegramActorMappings` | `{}` | Stringified numeric Telegram `from.id` → Paperclip user ID, e.g. `{"134628202": "local-board"}`. The authoritative link, and the only one that grants decision (approve/reject) ownership. |
+| `userChatMappings` | `{}` | Paperclip user ID → Telegram chat ID. Routes owner-targeted decision cards, and is read in reverse to identify the sender of a **private**-chat reply. |
+
+With neither set, a company that has exactly one active human member attributes replies
+to that member. Anything ambiguous (two humans, no mapping) is left unattributed, and the
+sender is told once a day that their replies are not being attributed.
+
+> Attribution decides **who a comment is from**. It never grants authority: approving or
+> rejecting a decision card still requires an explicit `telegramActorMappings` entry, and
+> the host re-verifies that the user is an active, non-viewer member of the company.
+
 ## Board access (approvals)
 
 | Setting | Default | Description |

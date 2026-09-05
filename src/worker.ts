@@ -76,6 +76,11 @@ import {
   evaluateDecisionActor,
 } from "./decision-routing.js";
 import {
+  isAttributionRejection,
+  resolveInboundActor,
+  type InboundAttribution,
+} from "./inbound-attribution.js";
+import {
   shouldNotifyIssueBlocked,
   shouldNotifyBoardMention,
   parseBoardUsernames,
@@ -2586,6 +2591,49 @@ export async function handleUpdate(
 
   const outcome = await routeInboundReply(ctx, token, config, msg, chatId, text);
   await acknowledgeUnroutedReply(ctx, token, config, msg, chatId, outcome);
+  await noticeUnattributedReply(ctx, token, msg, chatId, outcome);
+}
+
+/** How long to stay quiet after telling one sender their replies are unattributed. */
+const UNATTRIBUTED_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Tell a sender we could not match them to a Paperclip user (ODIAA-1927).
+ *
+ * Their reply *is* on the task, but as an unattributed note: it renders as a
+ * system message and the assignee is not woken by it. That difference is
+ * invisible from Telegram, so we say it once per sender per day — enough to act
+ * on, quiet enough not to nag a chat where nobody intends to link accounts.
+ */
+async function noticeUnattributedReply(
+  ctx: PluginContext,
+  token: string,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  chatId: string,
+  outcome: InboundReplyOutcome,
+): Promise<void> {
+  if (outcome.routed !== "issue" || outcome.attributedUserId) return;
+
+  const stateKey = `inbound_attr_notice_${chatId}_${msg.from?.id ?? "unknown"}`;
+  try {
+    const last = await ctx.state.get({ scopeKind: "instance", stateKey }) as { at?: number } | null;
+    if (last?.at && Date.now() - last.at < UNATTRIBUTED_NOTICE_WINDOW_MS) return;
+    await ctx.state.set({ scopeKind: "instance", stateKey }, { at: Date.now() });
+  } catch {
+    // An unreadable/unwritable state store must not cost the notice, but it
+    // must not turn into a message on every single reply either — stay quiet.
+    return;
+  }
+
+  await sendMessage(
+    ctx,
+    token,
+    chatId,
+    "Your reply was posted on the task, but I couldn't match your Telegram account to a Paperclip user, "
+      + "so it was filed as an unattributed note and won't wake the assigned agent. "
+      + `Add "${msg.from?.id ?? "<your-telegram-id>"}": "<paperclip-user-id>" to telegramActorMappings in the plugin settings to fix that.`,
+    { messageThreadId: msg.message_thread_id, replyToMessageId: msg.message_id },
+  ).catch((err) => ctx.logger.warn("Failed to send unattributed-reply notice", { error: String(err) }));
 }
 
 /**
@@ -2636,8 +2684,94 @@ export type InboundReplyDropReason =
 
 export type InboundReplyOutcome =
   | { routed: "escalation"; entityId: string }
-  | { routed: "issue"; entityId: string; companyId: string }
+  | {
+    routed: "issue";
+    entityId: string;
+    companyId: string;
+    /** Board user the comment was posted as, or null when it stayed a system message. */
+    attributedUserId: string | null;
+  }
   | { routed: "none"; reason: InboundReplyDropReason };
+
+/**
+ * Post the reply as the board member when we could identify them, and fall back
+ * to an unattributed comment rather than losing it (ODIAA-1927).
+ *
+ * The fallback matters on installs whose host predates
+ * `issue.comments.create_human_attributed`, or where the resolved user turns out
+ * not to be an active non-viewer member: the host rejects the attribution, and a
+ * delivered-but-unattributed reply beats a dropped one. Returns whether the
+ * comment ended up human-attributed.
+ */
+async function createInboundComment(
+  ctx: PluginContext,
+  issueId: string,
+  body: string,
+  companyId: string,
+  attribution: InboundAttribution,
+): Promise<boolean> {
+  if (!attribution.userId) {
+    await ctx.issues.createComment(issueId, body, companyId);
+    return false;
+  }
+
+  try {
+    await ctx.issues.createComment(issueId, body, companyId, { actorUserId: attribution.userId });
+    return true;
+  } catch (err) {
+    if (!isAttributionRejection(err)) throw err;
+    ctx.logger.warn("Host refused human attribution for a Telegram reply; posting unattributed", {
+      issueId,
+      actorUserId: attribution.userId,
+      attributionSource: attribution.source,
+      error: String(err),
+    });
+    await ctx.issues.createComment(issueId, body, companyId);
+    return false;
+  }
+}
+
+/**
+ * Give a human-attributed reply on a finished task the same effect it has in the
+ * web app: reopen the issue and wake its agent (ODIAA-1927).
+ *
+ * The host wakes the assignee for a plugin-relayed human comment, but skips it
+ * for `done`/`cancelled` issues — and a reply to a "task complete" card is the
+ * single most common inbound message there is, so without this the answer sits
+ * in the thread unread. `routes/issues.ts` moves a closed issue back to `todo`
+ * on a human comment under the same conditions (agent assignee, closed status),
+ * so this mirrors that rule rather than inventing one.
+ *
+ * Best effort throughout: the comment is already committed, so nothing here may
+ * turn a delivered reply into a failed one.
+ */
+async function resumeClosedIssueForHumanReply(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+): Promise<void> {
+  try {
+    const issue = await ctx.issues.get(issueId, companyId);
+    if (!issue?.assigneeAgentId) return;
+    if (issue.status !== "done" && issue.status !== "cancelled") return;
+
+    await ctx.issues.update(issueId, { status: "todo" }, companyId);
+    await ctx.issues.requestWakeup(issueId, companyId, {
+      reason: "issue_commented",
+      contextSource: "plugin:telegram.inbound_reply",
+    });
+    ctx.logger.info("Reopened a closed issue for an inbound Telegram reply", {
+      issueId,
+      previousStatus: issue.status,
+      assigneeAgentId: issue.assigneeAgentId,
+    });
+  } catch (err) {
+    ctx.logger.warn("Could not reopen a closed issue for an inbound Telegram reply", {
+      issueId,
+      error: String(err),
+    });
+  }
+}
 
 /**
  * Route an inbound Telegram reply (a board member replying to a bot message)
@@ -2704,19 +2838,44 @@ export async function routeInboundReply(
 
   if (issueId) {
     try {
+      // Post as the board member, not as the plugin (ODIAA-1927). An
+      // agent-attributed comment renders as a system message and never wakes
+      // anyone, which is exactly why replies looked like they were ignored.
+      const attribution = await resolveInboundActor(ctx, config, mapping.companyId, {
+        fromId: msg.from?.id,
+        chatId,
+        chatType: msg.chat?.type,
+      });
+
       // Use the SDK (not ctx.http.fetch) because the plugin sandbox blocks
       // outbound fetches to private IPs like 127.0.0.1 for SSRF protection.
       // The SDK's createComment goes through the plugin RPC bridge instead.
       // companyId comes from the outbound mapping, NOT resolveCompanyId(chatId):
       // this is the org-routing invariant guarded by ODIAA-936.
-      await ctx.issues.createComment(issueId, text, mapping.companyId);
+      const attributed = await createInboundComment(
+        ctx,
+        issueId,
+        text,
+        mapping.companyId,
+        attribution,
+      );
+      if (attributed) {
+        await resumeClosedIssueForHumanReply(ctx, issueId, mapping.companyId);
+      }
       await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
       ctx.logger.info("Routed Telegram reply to issue comment", {
         issueId,
         entityType: mapping.entityType,
         from: msg.from?.username,
+        attributedTo: attributed ? attribution.userId : null,
+        attributionSource: attributed ? attribution.source : "unresolved",
       });
-      return { routed: "issue", entityId: issueId, companyId: mapping.companyId };
+      return {
+        routed: "issue",
+        entityId: issueId,
+        companyId: mapping.companyId,
+        attributedUserId: attributed ? attribution.userId : null,
+      };
     } catch (err) {
       ctx.logger.error("Failed to route inbound message", {
         issueId,
