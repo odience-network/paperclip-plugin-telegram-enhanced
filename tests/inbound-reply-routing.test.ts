@@ -83,6 +83,7 @@ describe("routeInboundReply org routing (ODIAA-936)", () => {
       entityId: "iss-579",
       companyId: "co-originating",
       attributedUserId: null,
+      attributionBlockedBy: "identity",
     });
     expect(commentCalls).toHaveLength(1);
     // The invariant: companyId comes from the mapping, not from the chat.
@@ -184,6 +185,7 @@ describe("routeInboundReply org routing (ODIAA-936)", () => {
       entityId: "iss-579",
       companyId: "co-originating",
       attributedUserId: null,
+      attributionBlockedBy: "identity",
     });
     expect(commentCalls).toEqual([
       { entityId: "iss-579", text: "retry it please", companyId: "co-originating" },

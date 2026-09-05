@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { routeInboundReply } from "../src/worker.js";
+import { routeInboundReply, unattributedReplyNotice } from "../src/worker.js";
+import { formatReplyAttribution } from "../src/commands.js";
 import {
   isAttributionRejection,
   pickSoleHumanMember,
+  probeReplyAttribution,
   resolveConfiguredActor,
 } from "../src/inbound-attribution.js";
 
@@ -21,6 +23,7 @@ const CHAT = "-100777";
 
 function makeCtx(options: {
   members?: Array<{ principalType: string; principalId: string; status: string }>;
+  membersError?: Error;
   issue?: { status: string; assigneeAgentId: string | null } | null;
   createComment?: (...args: unknown[]) => Promise<void>;
 } = {}) {
@@ -50,6 +53,7 @@ function makeCtx(options: {
     access: {
       members: {
         async list() {
+          if (options.membersError) throw options.membersError;
           return options.members ?? [
             { principalType: "user", principalId: "local-board", status: "active" },
             { principalType: "agent", principalId: "agent-1", status: "active" },
@@ -126,6 +130,63 @@ describe("inbound reply attribution (ODIAA-1927)", () => {
     expect(commentCalls).toHaveLength(1); // the attributed attempt threw before recording
     expect(commentCalls[0].options).toBeUndefined();
     expect(outcome).toMatchObject({ routed: "issue", attributedUserId: null });
+  });
+
+  it("separates a host capability denial from an unrecognised sender", async () => {
+    const { ctx, commentCalls } = makeCtx({
+      membersError: new Error(
+        'Plugin "500d5962" is missing required capability "access.members.read" for method "access.members.list"',
+      ),
+    });
+
+    const outcome = await routeInboundReply(ctx, "token", CONFIG, makeReply(), CHAT, "please continue");
+
+    expect(commentCalls[0].options).toBeUndefined();
+    expect(outcome).toMatchObject({
+      routed: "issue",
+      attributedUserId: null,
+      attributionBlockedBy: "capability",
+    });
+  });
+
+  it("calls an ambiguous board an identity problem, not a capability one", async () => {
+    const { ctx } = makeCtx({
+      members: [
+        { principalType: "user", principalId: "user-a", status: "active" },
+        { principalType: "user", principalId: "user-b", status: "active" },
+      ],
+    });
+
+    const outcome = await routeInboundReply(ctx, "token", CONFIG, makeReply(), CHAT, "please continue");
+
+    expect(outcome).toMatchObject({ attributionBlockedBy: "identity" });
+  });
+
+  it("blames the capability when the host refuses the attributed write itself", async () => {
+    const rejectAttributed = vi.fn(async (_id: unknown, _t: unknown, _c: unknown, opts?: unknown) => {
+      if (opts) {
+        throw new Error(
+          'Plugin "500d5962" is missing required capability "issue.comments.create_human_attributed" for method "issue.comments.create_human_attributed"',
+        );
+      }
+    });
+    const { ctx } = makeCtx({ createComment: rejectAttributed as never });
+
+    const outcome = await routeInboundReply(ctx, "token", CONFIG, makeReply(), CHAT, "please continue");
+
+    expect(outcome).toMatchObject({ attributionBlockedBy: "capability" });
+  });
+
+  it("blames identity when the mapped user is not an active member", async () => {
+    const rejectAttributed = vi.fn(async (_id: unknown, _t: unknown, _c: unknown, opts?: unknown) => {
+      if (opts) throw new Error("user-mapped is not an active human member of this company");
+    });
+    const { ctx } = makeCtx({ createComment: rejectAttributed as never });
+    const config = { enableInbound: true, telegramActorMappings: { "42": "user-mapped" } } as never;
+
+    const outcome = await routeInboundReply(ctx, "token", config, makeReply(), CHAT, "please continue");
+
+    expect(outcome).toMatchObject({ attributionBlockedBy: "identity" });
   });
 
   it("reports a genuine delivery failure instead of silently degrading", async () => {
@@ -222,5 +283,62 @@ describe("actor resolution rules", () => {
     expect(isAttributionRejection(new Error('actorUserId "u1" is not an active human member of this company'))).toBe(true);
     expect(isAttributionRejection(new Error('actorUserId "u1" has viewer (read-only) access and cannot take this write action'))).toBe(true);
     expect(isAttributionRejection(new Error("connection reset"))).toBe(false);
+  });
+});
+
+/**
+ * The remedy printed into the chat has to match the cause. The 0.4.4 notice
+ * always told the sender to edit `telegramActorMappings`, which on an install
+ * whose host never granted the new capabilities is advice that cannot work:
+ * the attributed write is refused whichever user we name.
+ */
+describe("what the sender is told (ODIAA-1927)", () => {
+  it("names the grants and the reload when the host denied the capability", () => {
+    const notice = unattributedReplyNotice("capability", 134628202);
+
+    expect(notice).toContain("access.members.read");
+    expect(notice).toContain("issue.comments.create_human_attributed");
+    expect(notice).toContain("disable it, then enable it");
+    expect(notice).not.toContain('"134628202"');
+  });
+
+  it("keeps the mapping advice when the sender is genuinely unrecognised", () => {
+    const notice = unattributedReplyNotice("identity", 134628202);
+
+    expect(notice).toContain('"134628202": "<paperclip-user-id>"');
+    expect(notice).toContain("telegramActorMappings");
+    expect(notice).not.toContain("disable it, then enable it");
+  });
+});
+
+describe("/status reply-attribution readout (ODIAA-1927)", () => {
+  it("reports a capability denial as the actionable thing it is", async () => {
+    const { ctx } = makeCtx({
+      membersError: new Error(
+        'Plugin "500d5962" is missing required capability "access.members.read" for method "access.members.list"',
+      ),
+    });
+
+    const readiness = await probeReplyAttribution(ctx, "co-1");
+
+    expect(readiness).toEqual({ state: "capability_denied" });
+    expect(formatReplyAttribution(readiness)).toContain("disable \\+ enable");
+  });
+
+  it("reports a working single-member board as ready", async () => {
+    const { ctx } = makeCtx();
+
+    const readiness = await probeReplyAttribution(ctx, "co-1");
+
+    expect(readiness).toEqual({ state: "ready", humanMembers: 1 });
+    expect(formatReplyAttribution(readiness)).toContain("replies post as you");
+  });
+
+  it("does not claim readiness when the probe failed for another reason", async () => {
+    const { ctx } = makeCtx({ membersError: new Error("connection reset") });
+
+    const readiness = await probeReplyAttribution(ctx, "co-1");
+
+    expect(readiness).toEqual({ state: "unknown", error: "connection reset" });
   });
 });

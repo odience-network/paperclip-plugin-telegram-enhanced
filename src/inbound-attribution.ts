@@ -44,6 +44,7 @@ export type InboundAttributionSource =
   | "actor_mapping"
   | "user_chat_mapping"
   | "sole_human_member"
+  | "capability_denied"
   | "unresolved";
 
 export type InboundAttribution = {
@@ -53,6 +54,33 @@ export type InboundAttribution = {
 };
 
 const UNRESOLVED: InboundAttribution = { userId: null, source: "unresolved" };
+const CAPABILITY_DENIED: InboundAttribution = { userId: null, source: "capability_denied" };
+
+/**
+ * The capabilities a fully working inbound reply needs, in the order a failure
+ * bites. Named here so the operator-facing text can list what to grant instead
+ * of leaving them to diff two manifests.
+ */
+export const REPLY_ATTRIBUTION_CAPABILITIES = [
+  "access.members.read",
+  "issue.comments.create_human_attributed",
+  "issues.wakeup",
+] as const;
+
+/**
+ * Did the host refuse this call because the plugin was never granted the
+ * capability (as opposed to the call itself failing)?
+ *
+ * The host's `CapabilityDeniedError` crosses the RPC bridge as
+ * `Plugin "<id>" is missing required capability "<cap>" for method "<method>"`.
+ * That distinction is the whole point: a denial is fixed by an instance admin
+ * reloading the plugin so the host re-reads its manifest, and telling the sender
+ * to edit `telegramActorMappings` instead sends them somewhere that cannot help.
+ */
+export function isCapabilityDenied(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return /missing required capability/i.test(message);
+}
 
 export type InboundAttributionConfig = {
   telegramActorMappings?: TelegramActorMappings;
@@ -123,7 +151,9 @@ export function resolveConfiguredActor(
  *
  * Never throws. A denied or failing `access.members.list` (capability not
  * granted, host older than the API) degrades to an unattributed comment, which
- * is exactly the pre-ODIAA-1927 behavior — a reply must still land.
+ * is exactly the pre-ODIAA-1927 behavior — a reply must still land. A capability
+ * denial is reported as its own source so the sender gets the remedy that
+ * actually applies.
  */
 export async function resolveInboundActor(
   ctx: PluginContext,
@@ -143,9 +173,40 @@ export async function resolveInboundActor(
       companyId,
       error: String(err),
     });
+    if (isCapabilityDenied(err)) return CAPABILITY_DENIED;
   }
 
   return UNRESOLVED;
+}
+
+/** What `/status` can say about whether inbound replies can be attributed. */
+export type ReplyAttributionReadiness =
+  | { state: "ready"; humanMembers: number }
+  | { state: "capability_denied" }
+  | { state: "unknown"; error: string };
+
+/**
+ * Probe the one call the whole attribution path hangs on (ODIAA-1927).
+ *
+ * `access.members.list` is the first capability an inbound reply needs, so its
+ * verdict is a faithful proxy for "can a reply be posted as you at all". `/status`
+ * reports it because a capability denial is otherwise invisible from Telegram:
+ * the reply still lands, just as an inert note nobody is woken by.
+ */
+export async function probeReplyAttribution(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<ReplyAttributionReadiness> {
+  try {
+    const members = await ctx.access.members.list({ companyId });
+    const humans = (members as CompanyMemberLike[]).filter(
+      (member) => member.principalType === "user" && member.status === "active",
+    );
+    return { state: "ready", humanMembers: humans.length };
+  } catch (err) {
+    if (isCapabilityDenied(err)) return { state: "capability_denied" };
+    return { state: "unknown", error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**

@@ -82,6 +82,8 @@ import {
 } from "./decision-routing.js";
 import {
   isAttributionRejection,
+  isCapabilityDenied,
+  REPLY_ATTRIBUTION_CAPABILITIES,
   resolveInboundActor,
   type InboundAttribution,
 } from "./inbound-attribution.js";
@@ -2629,6 +2631,11 @@ const UNATTRIBUTED_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
  * system message and the assignee is not woken by it. That difference is
  * invisible from Telegram, so we say it once per sender per day — enough to act
  * on, quiet enough not to nag a chat where nobody intends to link accounts.
+ *
+ * The remedy depends on the cause, and getting that wrong wastes the reader's
+ * time: a host capability denial cannot be fixed by editing
+ * `telegramActorMappings`, because the attributed-comment call is refused no
+ * matter which user we name. Say which of the two it is.
  */
 async function noticeUnattributedReply(
   ctx: PluginContext,
@@ -2654,11 +2661,31 @@ async function noticeUnattributedReply(
     ctx,
     token,
     chatId,
-    "Your reply was posted on the task, but I couldn't match your Telegram account to a Paperclip user, "
-      + "so it was filed as an unattributed note and won't wake the assigned agent. "
-      + `Add "${msg.from?.id ?? "<your-telegram-id>"}": "<paperclip-user-id>" to telegramActorMappings in the plugin settings to fix that.`,
+    unattributedReplyNotice(outcome.attributionBlockedBy, msg.from?.id),
     { messageThreadId: msg.message_thread_id, replyToMessageId: msg.message_id },
   ).catch((err) => ctx.logger.warn("Failed to send unattributed-reply notice", { error: String(err) }));
+}
+
+/** The notice text for each cause. Exported so the wording is testable. */
+export function unattributedReplyNotice(
+  blockedBy: AttributionBlocker,
+  fromId?: number,
+): string {
+  const preamble =
+    "Your reply was posted on the task, but it was filed as an unattributed note "
+    + "and won't wake the assigned agent. ";
+
+  if (blockedBy === "capability") {
+    return preamble
+      + "This install hasn't granted me the permissions that need — "
+      + `${REPLY_ATTRIBUTION_CAPABILITIES.join(", ")}. `
+      + "Editing telegramActorMappings won't help here. An instance admin needs to reload the "
+      + "plugin (disable it, then enable it) so Paperclip re-reads the plugin manifest and grants them.";
+  }
+
+  return preamble
+    + "I couldn't match your Telegram account to a Paperclip user. "
+    + `Add "${fromId ?? "<your-telegram-id>"}": "<paperclip-user-id>" to telegramActorMappings in the plugin settings to fix that.`;
 }
 
 /**
@@ -2699,6 +2726,17 @@ async function acknowledgeUnroutedReply(
   );
 }
 
+/**
+ * What stopped a delivered reply from being attributed to its author.
+ *
+ * `"capability"` — the host denied `access.members.read` or
+ * `issue.comments.create_human_attributed`; an instance admin must reload the
+ * plugin so the host re-reads its manifest.
+ * `"identity"` — the capabilities are there, but we could not say which
+ * Paperclip user this Telegram sender is.
+ */
+export type AttributionBlocker = "capability" | "identity" | null;
+
 /** Why a reply could not be delivered — surfaced to the user (ODIAA-1927). */
 export type InboundReplyDropReason =
   | "inbound-disabled"
@@ -2715,6 +2753,12 @@ export type InboundReplyOutcome =
     companyId: string;
     /** Board user the comment was posted as, or null when it stayed a system message. */
     attributedUserId: string | null;
+    /**
+     * Why attribution did not happen, when it did not. `"capability"` means the
+     * host refused the call outright — no configuration on this side can fix it,
+     * so the sender must be told something different (ODIAA-1927).
+     */
+    attributionBlockedBy: AttributionBlocker;
   }
   | { routed: "none"; reason: InboundReplyDropReason };
 
@@ -2734,15 +2778,18 @@ async function createInboundComment(
   body: string,
   companyId: string,
   attribution: InboundAttribution,
-): Promise<boolean> {
+): Promise<{ attributed: boolean; blockedBy: AttributionBlocker }> {
   if (!attribution.userId) {
     await ctx.issues.createComment(issueId, body, companyId);
-    return false;
+    return {
+      attributed: false,
+      blockedBy: attribution.source === "capability_denied" ? "capability" : "identity",
+    };
   }
 
   try {
     await ctx.issues.createComment(issueId, body, companyId, { actorUserId: attribution.userId });
-    return true;
+    return { attributed: true, blockedBy: null };
   } catch (err) {
     if (!isAttributionRejection(err)) throw err;
     ctx.logger.warn("Host refused human attribution for a Telegram reply; posting unattributed", {
@@ -2752,7 +2799,10 @@ async function createInboundComment(
       error: String(err),
     });
     await ctx.issues.createComment(issueId, body, companyId);
-    return false;
+    // We knew who they were; the host would not accept it. Only a capability
+    // denial is actionable by the operator — a membership rejection means the
+    // mapped user is not an active non-viewer member of this company.
+    return { attributed: false, blockedBy: isCapabilityDenied(err) ? "capability" : "identity" };
   }
 }
 
@@ -2877,7 +2927,7 @@ export async function routeInboundReply(
       // The SDK's createComment goes through the plugin RPC bridge instead.
       // companyId comes from the outbound mapping, NOT resolveCompanyId(chatId):
       // this is the org-routing invariant guarded by ODIAA-936.
-      const attributed = await createInboundComment(
+      const { attributed, blockedBy } = await createInboundComment(
         ctx,
         issueId,
         text,
@@ -2894,12 +2944,14 @@ export async function routeInboundReply(
         from: msg.from?.username,
         attributedTo: attributed ? attribution.userId : null,
         attributionSource: attributed ? attribution.source : "unresolved",
+        attributionBlockedBy: blockedBy,
       });
       return {
         routed: "issue",
         entityId: issueId,
         companyId: mapping.companyId,
         attributedUserId: attributed ? attribution.userId : null,
+        attributionBlockedBy: blockedBy,
       };
     } catch (err) {
       ctx.logger.error("Failed to route inbound message", {
