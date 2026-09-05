@@ -18,6 +18,15 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.update",
     "issue.comments.read",
     "issue.comments.create",
+    // Post an inbound Telegram reply as the board member who wrote it, so it is
+    // a real comment instead of a system message the assignee never sees
+    // (ODIAA-1927). The host re-verifies the user is an active human member.
+    "issue.comments.create_human_attributed",
+    // Identify that board member: a single-human company needs no mapping table.
+    "access.members.read",
+    // Wake the assignee when such a reply reopens a finished task — the host's
+    // comment-relay wake deliberately skips done/cancelled issues.
+    "issues.wakeup",
     "agents.read",
     "agents.invoke",
     "agent.sessions.create",
