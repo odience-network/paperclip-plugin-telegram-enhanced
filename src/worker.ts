@@ -211,6 +211,20 @@ type StoredMessageMapping = {
   ownerUserId?: string;
 };
 
+/**
+ * The issue an event concerns, when the event's own entity is something else.
+ * `agent.run.failed` / heartbeat events carry `payload.issueId`; issue events
+ * already have it as `entityId`.
+ */
+function extractPayloadIssueId(event: PluginEvent): string | undefined {
+  if (String(event.entityType ?? "") === "issue" && event.entityId) {
+    return String(event.entityId);
+  }
+  const payload = event.payload as Record<string, unknown> | undefined;
+  const issueId = payload?.issueId;
+  return typeof issueId === "string" && issueId.length > 0 ? issueId : undefined;
+}
+
 function pendingDecisionKey(chatId: string): string {
   return `pending_decision_${chatId}`;
 }
@@ -1420,11 +1434,17 @@ export const plugin = definePlugin({
       );
 
       if (messageId) {
+        // Carry the issue the event is *about*, even when the entity is not the
+        // issue itself (agent.run.failed is a heartbeat_run whose payload names
+        // the issue). Without it a reply to those cards had nowhere to go and
+        // was dropped silently (ODIAA-1927).
+        const payloadIssueId = extractPayloadIssueId(event);
         const storedMapping: StoredMessageMapping = {
           entityId: String(event.entityId ?? ""),
           entityType: String(event.entityType ?? "unknown"),
           companyId: event.companyId,
           eventType: event.eventType,
+          ...(payloadIssueId ? { issueId: payloadIssueId } : {}),
           ...(mappingOverride ?? {}),
         };
         try {
@@ -2564,13 +2584,60 @@ export async function handleUpdate(
     }
   }
 
-  await routeInboundReply(ctx, token, config, msg, chatId, text);
+  const outcome = await routeInboundReply(ctx, token, config, msg, chatId, text);
+  await acknowledgeUnroutedReply(ctx, token, config, msg, chatId, outcome);
 }
+
+/**
+ * Tell the board member when their reply went nowhere.
+ *
+ * Silently swallowing an unroutable reply is what made ODIAA-1927 look like
+ * "the plugin never receives my answers": the message was read, matched no
+ * target, and nothing was ever said about it. Only replies genuinely aimed at
+ * one of our cards get a response — ordinary chatter stays untouched.
+ */
+async function acknowledgeUnroutedReply(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  chatId: string,
+  outcome: InboundReplyOutcome,
+): Promise<void> {
+  if (outcome.routed !== "none") return;
+  if (outcome.reason === "not-a-bot-reply") return;
+  if (outcome.reason === "inbound-disabled" && !msg.reply_to_message?.from?.is_bot) return;
+
+  const notice =
+    outcome.reason === "inbound-disabled"
+      ? "Inbound replies are turned off for this bot. Enable “enableInbound” in the plugin settings to send replies back to Paperclip."
+      : outcome.reason === "mapping-expired"
+        ? "I can't tell which task this reply belongs to — that notification is too old to answer. Reply to a recent card, or use /create to open a new task."
+        : outcome.reason === "delivery-failed"
+          ? "I couldn't deliver your reply to Paperclip just now. Please try again in a moment."
+          : "That notification isn't linked to a task I can comment on, so your reply wasn't delivered. Use /create to open a task instead.";
+
+  await ctx.metrics.write(METRIC_NAMES.inboundUnrouted, 1).catch(() => {});
+  await sendMessage(ctx, token, chatId, notice, {
+    messageThreadId: msg.message_thread_id,
+    replyToMessageId: msg.message_id,
+  }).catch((err) =>
+    ctx.logger.warn("Failed to acknowledge unrouted reply", { error: String(err) }),
+  );
+}
+
+/** Why a reply could not be delivered — surfaced to the user (ODIAA-1927). */
+export type InboundReplyDropReason =
+  | "inbound-disabled"
+  | "not-a-bot-reply"
+  | "mapping-expired"
+  | "no-target"
+  | "delivery-failed";
 
 export type InboundReplyOutcome =
   | { routed: "escalation"; entityId: string }
   | { routed: "issue"; entityId: string; companyId: string }
-  | { routed: "none" };
+  | { routed: "none"; reason: InboundReplyDropReason };
 
 /**
  * Route an inbound Telegram reply (a board member replying to a bot message)
@@ -2595,17 +2662,24 @@ export async function routeInboundReply(
   chatId: string,
   text: string,
 ): Promise<InboundReplyOutcome> {
-  if (!config.enableInbound || !msg.reply_to_message?.from?.is_bot) {
-    return { routed: "none" };
+  if (!config.enableInbound) {
+    return { routed: "none", reason: "inbound-disabled" };
+  }
+  if (!msg.reply_to_message?.from?.is_bot) {
+    return { routed: "none", reason: "not-a-bot-reply" };
   }
 
   const replyToId = msg.reply_to_message.message_id;
   const mapping = await ctx.state.get({
     scopeKind: "instance",
     stateKey: `msg_${chatId}_${replyToId}`,
-  }) as { entityId: string; entityType: string; companyId: string } | null;
+  }) as StoredMessageMapping | null;
 
-  if (mapping && mapping.entityType === "escalation") {
+  if (!mapping) {
+    return { routed: "none", reason: "mapping-expired" };
+  }
+
+  if (mapping.entityType === "escalation") {
     const escalationManager = new EscalationManager();
     const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
     await escalationManager.respond(ctx, token, mapping.entityId, {
@@ -2622,30 +2696,42 @@ export async function routeInboundReply(
     return { routed: "escalation", entityId: mapping.entityId };
   }
 
-  if (mapping && mapping.entityType === "issue") {
+  // An issue card carries the issue as its entity; other cards (agent.run.failed
+  // and friends, whose entity is a heartbeat_run) carry it as `issueId`. Both are
+  // replyable — before ODIAA-1927 only the first was, so replies to the most
+  // common notification in practice were dropped without a word.
+  const issueId = mapping.entityType === "issue" ? mapping.entityId : mapping.issueId;
+
+  if (issueId) {
     try {
       // Use the SDK (not ctx.http.fetch) because the plugin sandbox blocks
       // outbound fetches to private IPs like 127.0.0.1 for SSRF protection.
       // The SDK's createComment goes through the plugin RPC bridge instead.
       // companyId comes from the outbound mapping, NOT resolveCompanyId(chatId):
       // this is the org-routing invariant guarded by ODIAA-936.
-      await ctx.issues.createComment(mapping.entityId, text, mapping.companyId);
+      await ctx.issues.createComment(issueId, text, mapping.companyId);
       await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
       ctx.logger.info("Routed Telegram reply to issue comment", {
-        issueId: mapping.entityId,
+        issueId,
+        entityType: mapping.entityType,
         from: msg.from?.username,
       });
-      return { routed: "issue", entityId: mapping.entityId, companyId: mapping.companyId };
+      return { routed: "issue", entityId: issueId, companyId: mapping.companyId };
     } catch (err) {
       ctx.logger.error("Failed to route inbound message", {
-        issueId: mapping.entityId,
+        issueId,
         error: String(err),
       });
-      return { routed: "none" };
+      return { routed: "none", reason: "delivery-failed" };
     }
   }
 
-  return { routed: "none" };
+  ctx.logger.info("Inbound Telegram reply had no routable target", {
+    entityType: mapping.entityType,
+    entityId: mapping.entityId,
+    eventType: mapping.eventType,
+  });
+  return { routed: "none", reason: "no-target" };
 }
 
 /**
