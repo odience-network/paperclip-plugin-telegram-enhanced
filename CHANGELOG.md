@@ -8,6 +8,22 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **`/connect` no longer fails with `not allowed to perform "companies.list"`
+  (ODIAA-1927).** Bot commands run from the long-polling loop, a *proactive*
+  worker→host context with no host-issued invocation scope. The host resolves
+  such calls against the plugin's configured companies only when the call names
+  exactly one company, and deliberately never grants the wildcard
+  `companies.list` — so `/connect`, which was built entirely on that call, kept
+  answering `Failed to connect: … the worker referenced a missing, expired, or
+  unknown invocation scope`. Company lookups now go through a new company
+  directory (`src/company-directory.ts`): companies seen from invocation-scoped
+  contexts are cached in instance state, `/connect <name>` resolves against that
+  cache, and `/connect <uuid>` confirms the company with a single-company
+  `companies.get` — the call the proactive gate does admit. A failed outbound
+  chat mapping now warns instead of aborting the link, and `/status` reports the
+  actual error rather than telling an already-linked chat to run `/connect`.
+  Covered by `tests/company-directory.test.ts` and `tests/commands.test.ts`.
+
 - **The ACP bridge no longer uses a Telegram chat id as a Paperclip company id
   (ODIAA-1687).** `resolveCompanyIdFromChat` used to fall back to the raw `chatId`
   when a chat was not linked to a company. A chat id can never address a company,

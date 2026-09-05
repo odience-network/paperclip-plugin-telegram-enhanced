@@ -59,6 +59,7 @@ import {
 import { handleCommandsCommand, tryCustomCommand } from "./command-registry.js";
 import { handleRegisterWatch, checkWatches } from "./watch-registry.js";
 import { AGENT_ERROR_DEDUPLICATION_WINDOW_MS, DEFAULT_CONFIG, METRIC_NAMES } from "./constants.js";
+import { rememberCompanies } from "./company-directory.js";
 import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
@@ -1339,6 +1340,14 @@ export const plugin = definePlugin({
         const company = await ctx.companies.get(companyId);
         prefix = company?.issuePrefix ?? "";
         if (prefix) issuePrefixCache.set(companyId, prefix);
+        // Event handlers run inside an invocation scope, so this is one of the
+        // few places we can learn a company's name. Cache it for /connect,
+        // which cannot list companies from the polling loop (ODIAA-1927).
+        if (company?.id) {
+          await rememberCompanies(ctx, [
+            { id: company.id, ...(company.name ? { name: company.name } : {}) },
+          ]);
+        }
       }
       return { baseUrl: publicUrl, issuePrefix: prefix || undefined };
     }

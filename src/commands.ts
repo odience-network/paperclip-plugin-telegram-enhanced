@@ -3,6 +3,7 @@ import { sendMessage, escapeMarkdownV2, sendChatAction } from "./telegram-api.js
 import { METRIC_NAMES } from "./constants.js";
 import { handleAcpCommand } from "./acp-bridge.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi, type CfAccessHeaders } from "./paperclip-api.js";
+import { formatCompanyChoices, listCompaniesResilient, resolveCompanyInput } from "./company-directory.js";
 
 type BotCommand = {
   command: string;
@@ -123,11 +124,21 @@ async function handleStatus(
       messageThreadId,
       inlineKeyboard,
     });
-  } catch {
-    await sendMessage(ctx, token, chatId, escapeMarkdownV2("📊") + " *Paperclip Status*\n\n" + escapeMarkdownV2("Could not fetch status. Make sure this chat is linked to a company with /connect."), {
-      parseMode: "MarkdownV2",
-      messageThreadId,
-    });
+  } catch (err) {
+    // Report the actual failure. Blaming every error on a missing /connect link
+    // sent an already-linked chat chasing a link it had (ODIAA-1927): the real
+    // cause was the company-scoped read failing.
+    const linked = resolvedCompanyId ?? (await resolveCompanyIdOrUndefined(ctx, chatId));
+    const detail = linked
+      ? `Could not fetch status for company ${linked}: ${err instanceof Error ? err.message : String(err)}`
+      : "This chat is not linked to a Paperclip company yet. Use /connect <company> first.";
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      escapeMarkdownV2("📊") + " *Paperclip Status*\n\n" + escapeMarkdownV2(detail),
+      { parseMode: "MarkdownV2", messageThreadId },
+    );
   }
 }
 
@@ -310,33 +321,41 @@ async function handleConnect(
   companyArg: string,
   messageThreadId?: number,
 ): Promise<void> {
+  // `companies.list` is a wildcard call the host refuses from the polling loop
+  // (no invocation scope), so every lookup here goes through the directory,
+  // which falls back to cached companies and to a single-company get. See
+  // company-directory.ts for the full explanation (ODIAA-1927).
   if (!companyArg.trim()) {
-    try {
-      const companies = await ctx.companies.list();
-      const names = companies.map((c) => c.name || c.id).join(", ");
-      await sendMessage(ctx, token, chatId, `Usage: /connect <company-name>\nAvailable: ${names || "none"}`, { messageThreadId });
-    } catch {
-      await sendMessage(ctx, token, chatId, "Usage: /connect <company-name>", { messageThreadId });
-    }
+    const { companies } = await listCompaniesResilient(ctx);
+    const names = formatCompanyChoices(companies);
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      names
+        ? `Usage: /connect <company-name|company-id>\nAvailable: ${names}`
+        : "Usage: /connect <company-id>\n(No company names available here — pass the company UUID.)",
+      { messageThreadId },
+    );
     return;
   }
 
   try {
     const input = companyArg.trim();
-    const companies = await ctx.companies.list();
-    const match = companies.find(
-      (c) =>
-        c.id === input ||
-        c.name?.toLowerCase() === input.toLowerCase(),
-    );
+    const { match, known, error } = await resolveCompanyInput(ctx, input);
 
     if (!match) {
-      const names = companies.map((c) => c.name || c.id).join(", ");
+      const names = formatCompanyChoices(known);
+      const hint = names
+        ? `Available: ${names}`
+        : error
+          ? `Could not look up companies here (${error}). Retry with the company UUID.`
+          : "No companies are known to this chat yet. Retry with the company UUID.";
       await sendMessage(
         ctx,
         token,
         chatId,
-        `Company "${input}" not found. Available: ${names || "none"}`,
+        `Company "${input}" not found. ${hint}`,
         { messageThreadId },
       );
       return;
@@ -348,17 +367,34 @@ async function handleConnect(
       { companyId: match.id, companyName: match.name ?? input, linkedAt: new Date().toISOString() },
     );
 
-    // Outbound: company → chat (for notifications)
-    await ctx.state.set(
-      { scopeKind: "company", scopeId: match.id, stateKey: "telegram-chat" },
-      chatId,
-    );
+    // Outbound: company → chat (for notifications). A company-scoped write needs
+    // that company to be configured for this plugin; if it is not, the chat is
+    // still usable for commands, so keep the link and say what is missing rather
+    // than failing the whole /connect (ODIAA-1927).
+    let outboundError: string | undefined;
+    try {
+      await ctx.state.set(
+        { scopeKind: "company", scopeId: match.id, stateKey: "telegram-chat" },
+        chatId,
+      );
+    } catch (err) {
+      outboundError = err instanceof Error ? err.message : String(err);
+      ctx.logger.warn("Linked chat but could not store outbound chat mapping", {
+        chatId,
+        companyId: match.id,
+        error: outboundError,
+      });
+    }
 
+    const linkedText =
+      `${escapeMarkdownV2("🔗")} ${escapeMarkdownV2("Linked this chat to company:")} *${escapeMarkdownV2(match.name ?? input)}*`;
     await sendMessage(
       ctx,
       token,
       chatId,
-      `${escapeMarkdownV2("🔗")} ${escapeMarkdownV2("Linked this chat to company:")} *${escapeMarkdownV2(match.name ?? input)}*`,
+      outboundError
+        ? `${linkedText}\n${escapeMarkdownV2(`⚠️ Notifications may not reach this chat: ${outboundError}`)}`
+        : linkedText,
       { parseMode: "MarkdownV2", messageThreadId },
     );
 
@@ -817,4 +853,16 @@ async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<str
     throw new Error("This chat is not linked to a Paperclip company. Use /connect first.");
   }
   return companyId;
+}
+
+/** Non-throwing variant, for error paths that need to know whether a link exists. */
+async function resolveCompanyIdOrUndefined(
+  ctx: PluginContext,
+  chatId: string,
+): Promise<string | undefined> {
+  try {
+    return await resolveCompanyId(ctx, chatId);
+  } catch {
+    return undefined;
+  }
 }

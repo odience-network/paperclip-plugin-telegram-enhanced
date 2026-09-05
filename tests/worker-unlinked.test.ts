@@ -81,7 +81,7 @@ describe("handleUpdate — unlinked chat", () => {
       handleUpdate(ctx, "token", config, statusCommandUpdate(5), "http://localhost:3100"),
     ).resolves.toBeUndefined();
     // The company-scoped handler answered with its not-linked guidance...
-    expect(sentMessages.some((m) => m.text.includes("Make sure this chat is linked"))).toBe(true);
+    expect(sentMessages.some((m) => m.text.includes("not linked to a Paperclip company yet"))).toBe(true);
     // ...and the raw chatId never reached the API as a companyId.
     expect(ctx.agents.list).not.toHaveBeenCalledWith(
       expect.objectContaining({ companyId: String(UNLINKED_CHAT) }),

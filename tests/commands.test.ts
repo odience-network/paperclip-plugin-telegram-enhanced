@@ -125,7 +125,7 @@ describe("handleCommand", () => {
     // No stateStore["chat_5851857072"] mapping — simulates an unlinked group chat.
     await handleCommand(ctx, "token", "5851857072", "status", "");
     expect(sentMessages.length).toBe(1);
-    expect(sentMessages[0].text).toContain("Make sure this chat is linked");
+    expect(sentMessages[0].text).toContain("not linked to a Paperclip company yet");
     // The raw chatId must never reach the API as a companyId.
     expect(ctx.agents.list).not.toHaveBeenCalledWith(expect.objectContaining({ companyId: "5851857072" }));
     expect(ctx.issues.list).not.toHaveBeenCalledWith(expect.objectContaining({ companyId: "5851857072" }));
@@ -509,5 +509,38 @@ describe("BOT_COMMANDS", () => {
     expect(names).toContain("connect");
     expect(names).toContain("connect_topic");
     expect(names).toContain("topics");
+  });
+});
+
+describe("/connect without a usable companies.list (ODIAA-1927)", () => {
+  // The polling loop is a proactive context, where the host refuses the
+  // wildcard `companies.list`. /connect must still be able to link a chat.
+  const UUID = "a00e8c2a-f642-4ac9-beca-61e6a9ffff84";
+
+  it("links the chat by company UUID via companies.get", async () => {
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "555", "connect", UUID);
+
+    expect(stateStore["chat_555"]).toMatchObject({ companyId: "123", companyName: "Test Co" });
+    expect(stateStore["telegram-chat"]).toBe("555");
+    expect(sentMessages[0].text).toContain("Linked this chat to company");
+  });
+
+  it("links from the cached directory when the company was seen before", async () => {
+    stateStore["companies_directory_v1"] = [{ id: "co-9", name: "Odience" }];
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "555", "connect", "odience");
+
+    expect(ctx.companies.get).not.toHaveBeenCalled();
+    expect(stateStore["chat_555"]).toMatchObject({ companyId: "co-9", companyName: "Odience" });
+  });
+
+  it("explains what to do instead of failing with a raw scope error", async () => {
+    const ctx = mockCtx();
+    await handleCommand(ctx, "token", "555", "connect", "unknown-co");
+
+    expect(sentMessages[0].text).toContain('Company "unknown-co" not found');
+    expect(sentMessages[0].text).toContain("company UUID");
+    expect(sentMessages[0].text).not.toContain("Failed to connect");
   });
 });
