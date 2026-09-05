@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-09-05
+
+Saved notification settings reached the database and stopped there. On an
+instance with more than one configured company the worker served whichever
+company's row the host replayed first, and every later save for a different
+company was refused outright.
+
+### Fixed
+
+- **The plugin is declared multi-company and keys its configuration per company
+  (ODIAA-1930).** One worker serves every company on the instance, but the
+  plugin declared itself single-tenant, so the SDK's fail-closed
+  `CROSS_TENANT_CONFIG` guard rejected the second company's `configChanged` —
+  both during the startup replay of the stored rows and on every subsequent
+  operator save. The board's settings were written and then discarded, and the
+  worker kept serving another company's config (or `DEFAULT_CONFIG`), which is
+  why `/status` reported "task complete" as on after it had been turned off.
+  Configuration is now stored in a per-company map: the nine `notifyOn*` gates,
+  `onlyNotifyIfAssignedTo`, `onlyNotifyBoardApprovals`, the chat/topic routing
+  those notifications deliver through, the digest destination and `/status` all
+  read the notifying company's own settings. A company the host has never
+  delivered a config for falls back to `DEFAULT_CONFIG`, never to another
+  company's. Declaring `multiCompanyConfig` without this keying would have
+  replaced the refusal with the silent last-write-wins collapse the guard
+  exists to prevent.
+
+- **An instance-wide value customised by one company survives the replay of
+  another company's defaults (ODIAA-1930).** The bot token ref and the
+  `paperclipBaseUrl`/`paperclipPublicUrl` pair describe the instance, not a
+  company, so they stay on a single primary config. Every stored row carries
+  them, and the replay order across rows is arbitrary, so a row left at the
+  default no longer overwrites the one real value — the issue links in every
+  notification are rendered from it.
+
+### Changed
+
+- The `@paperclipai/plugin-sdk` floor moved to `^2026.824.0`, the first release
+  that declares `multiCompanyConfig` and threads the company scope through to
+  `onConfigChanged`. Hosts older than that deliver no company scope; those
+  deliveries are stored as the unscoped config that every company falls back
+  to, which preserves the previous single-tenant behaviour.
+
 ## [0.4.5] — 2026-09-05
 
 The 0.4.3 attribution fix was correct but inert on installs whose host still
