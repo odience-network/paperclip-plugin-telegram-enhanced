@@ -41,7 +41,6 @@ export type RespondInteractionInput = {
   interactionId: string;
   action: InteractionAction;
   boardApiToken: string;
-  actingUserId?: string;
   reason?: string;
   answers?: Array<{ questionId: string; optionIds: string[] }>;
 };
@@ -127,7 +126,6 @@ export async function respondInteraction(
   requireBoardToken(boardApiToken);
 
   const body: Record<string, unknown> = {};
-  if (input.actingUserId) body.actingUserId = input.actingUserId;
   if (action === "reject" && input.reason) body.reason = input.reason;
   if (action === "respond") {
     body.answers = input.answers ?? [];
