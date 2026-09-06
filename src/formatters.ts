@@ -4,10 +4,78 @@ import type { SendMessageOptions } from "./telegram-api.js";
 
 type Payload = Record<string, unknown>;
 
-type FormattedMessage = {
+export type FormattedMessage = {
   text: string;
   options: SendMessageOptions;
+  /**
+   * Follow-up messages carrying the rest of a long body. The caller sends them
+   * as replies to the first message so the whole answer stays one thread.
+   */
+  continuations?: string[];
 };
+
+/**
+ * How much raw body text goes into one Telegram message (ODIAA-1927).
+ *
+ * Telegram hard-caps a message at 4096 characters and MarkdownV2 escaping can
+ * nearly double a body's length, so 1500 raw characters is the widest chunk
+ * that is guaranteed to fit after escaping.
+ */
+const BODY_CHUNK_CHARS = 1500;
+
+/** Stop after this many chunks (~12k characters) and point at the task instead. */
+const MAX_BODY_CHUNKS = 8;
+
+/**
+ * Split a body into escape-safe chunks at the nearest line/word boundary.
+ *
+ * An agent's answer used to be cut at 300 characters, which is what "the reply
+ * is not complete" looked like in chat. Chunking keeps the whole answer while
+ * respecting Telegram's per-message limit. Splitting the *raw* text and
+ * escaping each chunk afterwards is deliberate: splitting escaped text can cut
+ * between a backslash and the character it escapes and break the message.
+ */
+export function chunkBody(
+  body: string,
+  chunkChars = BODY_CHUNK_CHARS,
+  maxChunks = MAX_BODY_CHUNKS,
+): { chunks: string[]; overflowed: boolean } {
+  const chunks: string[] = [];
+  let remaining = body.trim();
+
+  while (remaining.length > 0 && chunks.length < maxChunks) {
+    if (remaining.length <= chunkChars) {
+      chunks.push(remaining);
+      remaining = "";
+      break;
+    }
+    const window = remaining.slice(0, chunkChars);
+    let splitAt = window.lastIndexOf("\n");
+    if (splitAt < chunkChars * 0.5) splitAt = window.lastIndexOf(" ");
+    if (splitAt < chunkChars * 0.5) splitAt = chunkChars;
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).replace(/^\s+/, "");
+  }
+
+  return { chunks, overflowed: remaining.length > 0 };
+}
+
+/**
+ * Render a body as a quoted head plus continuation messages.
+ *
+ * `head` is appended to the first message; `continuations` are sent after it.
+ */
+function renderBody(body: string): { head: string; continuations: string[] } {
+  const { chunks, overflowed } = chunkBody(body);
+  if (chunks.length === 0) return { head: "", continuations: [] };
+
+  const quoted = chunks.map((chunk) => `${esc(">")} ${esc(chunk)}`);
+  if (overflowed) {
+    quoted[quoted.length - 1] += `\n${esc("…(truncated — open the task for the full text)")}`;
+  }
+
+  return { head: `\n${quoted[0]!}`, continuations: quoted.slice(1) };
+}
 
 function esc(s: string): string {
   return escapeMarkdownV2(s);
@@ -229,10 +297,10 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
     `${bold(title)} ${esc("is now done.")}`,
   ];
 
-  if (comment) {
-    const truncated = truncateAtWord(comment, 300);
-    lines.push(`\n${esc(">")} ${esc(truncated)}`);
-  }
+  // The closing comment is the answer the reader is waiting for — deliver all of
+  // it, across follow-up messages when it is long (ODIAA-1927).
+  const body = comment ? renderBody(comment) : null;
+  if (body?.head) lines.push(body.head);
 
   const button = issueButton(identifier, opts);
   return {
@@ -241,6 +309,7 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
       parseMode: "MarkdownV2",
       ...(button ? { inlineKeyboard: [[button]] } : {}),
     },
+    ...(body?.continuations.length ? { continuations: body.continuations } : {}),
   };
 }
 
@@ -287,10 +356,10 @@ export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): F
   if (title) lines.push(bold(title));
   if (authorName) lines.push(`From: ${esc(authorName)}`);
 
-  if (body) {
-    const truncated = truncateAtWord(body, 300);
-    lines.push(`\n${esc(">")} ${esc(truncated)}`);
-  }
+  // A mention is usually an agent answering the reader directly, so the whole
+  // comment goes out — long ones continue in follow-up messages (ODIAA-1927).
+  const rendered = body ? renderBody(body) : null;
+  if (rendered?.head) lines.push(rendered.head);
 
   const button = issueButton(identifier, opts);
   return {
@@ -299,6 +368,7 @@ export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): F
       parseMode: "MarkdownV2",
       ...(button ? { inlineKeyboard: [[button]] } : {}),
     },
+    ...(rendered?.continuations.length ? { continuations: rendered.continuations } : {}),
   };
 }
 

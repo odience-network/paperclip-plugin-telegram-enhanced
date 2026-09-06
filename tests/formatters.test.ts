@@ -95,10 +95,24 @@ describe("formatIssueDone", () => {
     expect(msg.text).toContain("Board prep package completed for Q3");
   });
 
-  it("truncates long comments", () => {
+  // ODIAA-1927: a long completion comment used to be cut at 300 characters,
+  // which read in chat as an answer that never finished.
+  it("delivers a long comment whole instead of truncating it", () => {
     const longComment = Array(80).fill("word").join(" ");
     const msg = formatIssueDone(mockEvent({ comment: longComment }));
-    expect(msg.text).toContain("\\.\\.\\.");
+    expect(msg.text).toContain(longComment);
+    expect(msg.continuations ?? []).toHaveLength(0);
+  });
+
+  it("continues a comment too long for one Telegram message in follow-up messages", () => {
+    const paragraph = Array(200).fill("word").join(" ");
+    const longComment = Array(6).fill(paragraph).join("\n\n");
+    const msg = formatIssueDone(mockEvent({ comment: longComment }));
+
+    expect(msg.continuations?.length).toBeGreaterThan(0);
+    const delivered = [msg.text, ...(msg.continuations ?? [])].join(" ");
+    // Every word survives somewhere in the thread, escaping aside.
+    expect(delivered.split("word").length - 1).toBe(1200);
   });
 
   it("omits comment section when no comment", () => {

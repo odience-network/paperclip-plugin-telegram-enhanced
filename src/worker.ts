@@ -13,6 +13,7 @@ import {
   editMessage,
   answerCallbackQuery,
   setMyCommands,
+  setMessageReaction,
   getMe,
   escapeMarkdownV2,
   isForum,
@@ -35,6 +36,7 @@ import {
   formatResolvedDecision,
   formatInteractionCreated,
   type IssueLinksOpts,
+  type FormattedMessage,
 } from "./formatters.js";
 import {
   fetchInteraction,
@@ -1400,7 +1402,7 @@ export const plugin = definePlugin({
 
     const notify = async (
       event: PluginEvent,
-      formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
+      formatter: (e: PluginEvent, opts?: IssueLinksOpts) => FormattedMessage,
       overrideChatId?: string,
       overrideTopicId?: string | Partial<StoredMessageMapping>,
       deliveryKey?: string,
@@ -1466,6 +1468,18 @@ export const plugin = definePlugin({
       );
 
       if (messageId) {
+        // A body too long for one Telegram message continues in follow-up
+        // messages replying to this one, instead of being cut off (ODIAA-1927).
+        for (const continuation of msg.continuations ?? []) {
+          await sendMessage(ctx, token, chatId, continuation, {
+            ...(msg.options.parseMode ? { parseMode: msg.options.parseMode } : {}),
+            ...(messageThreadId ? { messageThreadId } : {}),
+            replyToMessageId: messageId,
+          }).catch((err) =>
+            ctx.logger.warn("Failed to send notification continuation", { error: String(err) }),
+          );
+        }
+
         // Carry the issue the event is *about*, even when the entity is not the
         // issue itself (agent.run.failed is a heartbeat_run whose payload names
         // the issue). Without it a reply to those cards had nowhere to go and
@@ -2491,8 +2505,18 @@ export async function handleUpdate(
       const companyId = await resolveCompanyIdOrNull(ctx, chatId);
       if (companyId) {
         const replyToId = msg.reply_to_message?.message_id;
-        const routed = await routeMessageToAgent(ctx, token, chatId, threadId, text, replyToId, companyId);
-        if (routed) return;
+        const routed = await routeMessageToAgent(
+          ctx, token, chatId, threadId, text, replyToId, companyId, msg.message_id,
+        );
+        if (routed) {
+          // An agent session can take minutes to answer; say the message landed
+          // now rather than leaving the chat silent (ODIAA-1927).
+          await acknowledgeRoutedReply(
+            ctx, token, chatId, msg,
+            "Got it — passed to the agent. I'll post the answer here when it lands.",
+          );
+          return;
+        }
       } else {
         ctx.logger.debug("Not routing thread message from unlinked chat", { chatId });
       }
@@ -2567,6 +2591,7 @@ export async function handleUpdate(
         }
       }
       const boardApiToken = await resolveBoardApiToken(ctx, config);
+      let respondedToInteraction = false;
       if (boardApiToken) {
         try {
           const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
@@ -2581,6 +2606,7 @@ export async function handleUpdate(
             });
             await clearPendingDecision(ctx, chatId);
             await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+            respondedToInteraction = true;
             ctx.logger.info("Routed Telegram reply to interaction", {
               issueId: mapping.issueId,
               interactionId: mapping.interactionId,
@@ -2602,6 +2628,7 @@ export async function handleUpdate(
             });
             await clearPendingDecision(ctx, chatId);
             await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+            respondedToInteraction = true;
           }
         } catch (err) {
           if (!isAlreadyResolvedInteractionError(err)) {
@@ -2612,17 +2639,95 @@ export async function handleUpdate(
           }
         }
       }
+      if (respondedToInteraction) {
+        // Whatever the agent does next about this issue answers *this* message
+        // (ODIAA-1927), and the sender hears that it landed either way.
+        await anchorEntityToInboundMessage(ctx, chatId, "issue", mapping.issueId, msg);
+        await acknowledgeRoutedReply(
+          ctx, token, chatId, msg,
+          "Got it — your answer is recorded. I'll post what happens next here.",
+        );
+      }
       return;
     }
   }
 
   const outcome = await routeInboundReply(ctx, token, config, msg, chatId, text);
+  if (outcome.routed !== "none" && outcome.entityId) {
+    // The answer to this reply should come back as a reply to *it* (ODIAA-1927).
+    await anchorEntityToInboundMessage(
+      ctx,
+      chatId,
+      outcome.routed === "issue" ? "issue" : "escalation",
+      outcome.entityId,
+      msg,
+    );
+    await acknowledgeRoutedReply(ctx, token, chatId, msg);
+  }
   await acknowledgeUnroutedReply(ctx, token, config, msg, chatId, outcome);
   await noticeUnattributedReply(ctx, token, msg, chatId, outcome);
 }
 
 /** How long to stay quiet after telling one sender their replies are unattributed. */
 const UNATTRIBUTED_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Re-anchor an entity's Telegram thread on the message a board member just sent
+ * (ODIAA-1927).
+ *
+ * Notifications about one entity reply to that entity's anchor so updates stack
+ * as a single thread. Until now the anchor was always the *first* card we ever
+ * sent, so an agent's answer to a board member's question came back as a reply
+ * to a card from hours earlier instead of to the question — the reader had to
+ * work out which of their messages it answered. Moving the anchor to their
+ * message makes the next update land as a reply to what they actually asked,
+ * and keeps the thread intact.
+ */
+export async function anchorEntityToInboundMessage(
+  ctx: PluginContext,
+  chatId: string,
+  entityType: string,
+  entityId: string,
+  msg: NonNullable<TelegramUpdate["message"]>,
+): Promise<void> {
+  if (!entityId) return;
+  try {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `anchor_${chatId}_${entityType}_${entityId}` },
+      { messageId: msg.message_id, messageThreadId: msg.message_thread_id },
+    );
+  } catch (err) {
+    // Threading is a nicety; losing it must never cost the reply itself.
+    ctx.logger.debug("Failed to re-anchor entity thread", { entityId, error: String(err) });
+  }
+}
+
+/**
+ * Tell the sender their message landed (ODIAA-1927).
+ *
+ * An agent can take minutes to answer, and until it does the chat looked
+ * identical to a message that was never received. A reaction on the sender's own
+ * message says "read" without adding a line to the chat; when Telegram refuses
+ * the reaction — older Bot API, missing rights in a group — we say it in words
+ * rather than leaving the sender guessing.
+ */
+export async function acknowledgeRoutedReply(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  note = "Got it — delivered to Paperclip. I'll post the answer here when it lands.",
+): Promise<void> {
+  const reacted = await setMessageReaction(ctx, token, chatId, msg.message_id, "👀");
+  if (reacted) return;
+
+  await sendMessage(ctx, token, chatId, note, {
+    messageThreadId: msg.message_thread_id,
+    replyToMessageId: msg.message_id,
+  }).catch((err) =>
+    ctx.logger.warn("Failed to acknowledge routed reply", { error: String(err) }),
+  );
+}
 
 /**
  * Tell a sender we could not match them to a Paperclip user (ODIAA-1927).

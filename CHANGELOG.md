@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A delivered reply is acknowledged instead of vanishing into silence
+  (ODIAA-1927).** A reply that routed successfully produced no visible response
+  at all, so a chat waiting minutes for an agent looked identical to one whose
+  message was never received. The bot now reacts (👀) to the sender's message as
+  soon as the reply lands, and says so in words when Telegram refuses the
+  reaction (older Bot API, missing group rights).
+- **The answer comes back as a reply to the message that asked for it
+  (ODIAA-1927).** Notifications about one entity thread under that entity's
+  anchor, which was always the *first* card the bot had ever sent about it — so
+  an agent's answer arrived under an hours-old card instead of under the
+  question. A delivered reply now moves the anchor to the sender's message, and
+  a message routed to a native agent session anchors the issue it creates.
+- **A long answer is delivered whole rather than cut at 300 characters
+  (ODIAA-1927).** Completion comments and board mentions were truncated at a
+  fixed 300 characters, which read as an answer that stopped mid-sentence. The
+  body is now split at line/word boundaries into messages that each fit
+  Telegram's 4096-character limit, with the continuations replying to the first
+  message so the whole answer stays one thread. Bodies beyond ~12k characters
+  still end with a pointer to the task.
+
 ## [0.4.5] — 2026-09-05
 
 The 0.4.3 attribution fix was correct but inert on installs whose host still

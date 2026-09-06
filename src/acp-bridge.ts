@@ -589,6 +589,8 @@ export async function routeMessageToAgent(
   text: string,
   replyToMessageId?: number,
   companyId?: string,
+  /** The id of the message being routed, used to anchor the answer to it. */
+  inboundMessageId?: number,
 ): Promise<boolean> {
   const sessions = await getSessions(ctx, chatId, threadId);
   const activeSessions = sessions.filter((s) => s.status === "active");
@@ -663,6 +665,20 @@ export async function routeMessageToAgent(
         agentId: targetSession.agentId,
       });
       return false;
+    }
+
+    // Anchor the new issue's Telegram thread on the message that asked for it,
+    // so the agent's answer arrives as a reply to the question rather than as a
+    // detached card (ODIAA-1927).
+    if (inboundMessageId) {
+      try {
+        await ctx.state.set(
+          { scopeKind: "instance", stateKey: `anchor_${chatId}_issue_${issueId}` },
+          { messageId: inboundMessageId, messageThreadId: threadId },
+        );
+      } catch {
+        // Threading is a nicety; losing it must not fail the delivery.
+      }
     }
   } else {
     // ACP transport - emit event, companyId is SECOND arg

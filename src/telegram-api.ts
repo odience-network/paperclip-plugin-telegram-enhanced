@@ -309,6 +309,43 @@ export async function setMyCommands(
   }
 }
 
+/**
+ * React to a message (ODIAA-1927).
+ *
+ * A reaction is the quietest possible "your message landed": it needs no chat
+ * real estate and it attaches to the sender's own message, so a board member who
+ * replies and then waits minutes for an agent can still see we read it. Returns
+ * false when the reaction is refused — old Bot API, missing rights, banned
+ * emoji — so the caller can fall back to saying it in words.
+ */
+export async function setMessageReaction(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  messageId: number,
+  emoji: string,
+): Promise<boolean> {
+  try {
+    const res = await ctx.http.fetch(`${TELEGRAM_API}/bot${token}/setMessageReaction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: [{ type: "emoji", emoji }],
+      }),
+    });
+    const data = (await res.json()) as { ok: boolean; description?: string };
+    if (!data.ok) {
+      ctx.logger.debug("Telegram setMessageReaction refused", { error: data.description });
+    }
+    return data.ok === true;
+  } catch (err) {
+    ctx.logger.debug("Telegram setMessageReaction failed", { error: String(err) });
+    return false;
+  }
+}
+
 export async function sendChatAction(
   ctx: PluginContext,
   token: string,
