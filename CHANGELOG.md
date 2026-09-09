@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **Patched dev-dependency floors for esbuild and nanoid (ODIAA-2066).**
+  `esbuild` was resolving to `0.27.4`, which is exposed to
+  [GHSA-g7r4-m6w7-qqqr](https://github.com/advisories/GHSA-g7r4-m6w7-qqqr) (a
+  path-traversal issue in esbuild's local dev server); the devDependency floor
+  is now `^0.28.1`. `nanoid` was resolving transitively to `3.3.11`, exposed to
+  [CVE-2026-73086](https://github.com/advisories/GHSA-xwg4-73v4-xw9w) (a High
+  severity integer overflow that can corrupt nanoid's random pool and make
+  later IDs predictable) plus two lower-severity DoS advisories patched at
+  `3.3.16`/`3.3.18`; it's now pinned via `overrides` to `3.3.18`. Both are
+  build/test-only tooling, not shipped in `dist/`, but pinning removes the
+  exposure from local builds and CI. Same pins as upstream mvanhorn's v0.8.1
+  (`8c7ca69`), applied here as a direct devDependency bump instead of an
+  `overrides` entry for esbuild — npm rejects an override for a package that
+  is also a direct dependency unless the two specs agree.
+
 ## [0.4.6] — 2026-09-05
 
 Saved notification settings reached the database and stopped there. On an
