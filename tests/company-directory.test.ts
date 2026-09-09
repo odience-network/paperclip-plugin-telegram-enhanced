@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import {
   COMPANY_DIRECTORY_STATE_KEY,
   formatCompanyChoices,
@@ -106,6 +107,40 @@ describe("company directory", () => {
     const merged = await rememberCompanies(ctx, [{ id: "co-1", name: "Odience" }, { id: "co-2" }]);
 
     expect(merged).toEqual([{ id: "co-1", name: "Odience" }, { id: "co-2" }]);
+  });
+
+  it("reports no match, not a throw, when companies.get is scope-denied (revoked access)", async () => {
+    // ODIAA-2064 (mvanhorn cb031d9): a revoked/expired invocation scope means
+    // the company is genuinely unreachable — same as any other miss.
+    const id = "a00e8c2a-f642-4ac9-beca-61e6a9ffff84";
+    const { ctx } = makeCtx({
+      get: async () => {
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+          message: "the worker referenced a missing, expired, or unknown invocation scope",
+        });
+      },
+    });
+
+    const resolution = await resolveCompanyInput(ctx, id);
+    expect(resolution.match).toBeUndefined();
+    expect(resolution.error).toContain("invocation scope");
+  });
+
+  it("rethrows a transient companies.get failure instead of reporting a false not-found", async () => {
+    // ODIAA-2064 (mvanhorn cb031d9): a timeout or other transient host failure
+    // is not a verdict on the company and must not masquerade as "not found".
+    const id = "a00e8c2a-f642-4ac9-beca-61e6a9ffff84";
+    const { ctx } = makeCtx({
+      get: async () => {
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+          message: "Company lookup timed out",
+        });
+      },
+    });
+
+    await expect(resolveCompanyInput(ctx, id)).rejects.toThrow("Company lookup timed out");
   });
 
   it("survives an unreadable state store", async () => {

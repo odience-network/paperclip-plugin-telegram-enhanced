@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   definePlugin,
   runWorker,
@@ -201,6 +202,22 @@ export type TelegramUpdate = {
 };
 
 const TELEGRAM_API = "https://api.telegram.org";
+
+// Captured at module load, before the host ever calls `initialize`/`setup()` —
+// i.e. outside any invocation. The RPC host propagates the *active* invocation
+// id via AsyncLocalStorage to every worker→host call made in its descendants,
+// including ones scheduled from inside a fire-and-forget async chain (Node
+// keeps async_hooks context across promise continuations and timers). Our
+// long-lived poll loop is started once, from inside `setup()`, which itself
+// runs inside the short-lived invocation that first activated the plugin.
+// Without detaching, every RPC the poll loop ever makes carries that
+// invocation's id — which is valid only until the host retires it, after
+// which the id is stale and every company-scoped call the loop makes (not
+// just `companies.list`) is refused as INVOCATION_SCOPE_DENIED. Running the
+// loop's start inside this pre-invocation snapshot keeps it permanently
+// outside any invocation, so its calls are resolved as proactive instead
+// (ported from mvanhorn a83f84d, ODIAA-2064).
+const runOutsideInvocation = AsyncLocalStorage.snapshot();
 
 type StoredMessageMapping = {
   entityId: string;
@@ -1426,8 +1443,11 @@ export const plugin = definePlugin({
 
     // Started unconditionally: the enableCommands/enableInbound gate lives
     // inside the loop so a config delivery can turn inbound on or off without a
-    // worker restart (ODIAA-1379).
-    pollUpdates().catch((err) =>
+    // worker restart (ODIAA-1379). Started via `runOutsideInvocation` so the
+    // loop is never tagged with setup()'s own invocation id (see its
+    // definition above) — otherwise the loop's calls silently stop working
+    // once that invocation retires.
+    runOutsideInvocation(() => pollUpdates()).catch((err) =>
       ctx.logger.error("Polling loop crashed", { error: String(err) }),
     );
 
