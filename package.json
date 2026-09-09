@@ -42,7 +42,7 @@
   "devDependencies": {
     "@paperclipai/plugin-sdk": "^2026.824.0",
     "@paperclipai/shared": "^2026.824.0",
-    "esbuild": "^0.27.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
     "@types/node": "^22.0.0",
@@ -57,5 +57,8 @@
     "type": "git",
     "url": "git+https://github.com/odience-network/paperclip-plugin-telegram-enhanced.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "overrides": {
+    "nanoid": "3.3.18"
+  }
 }
