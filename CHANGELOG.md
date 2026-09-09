@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ctx.events.emit` rejections and synchronous throws were dropped instead of
+  logged (ODIAA-2067).** Every ACP spawn/cancel/close/message/handoff/discuss
+  event and every escalation lifecycle event was emitted fire-and-forget — no
+  `await`, no rejection handler — so a failed host emit vanished silently and
+  the corresponding agent session or escalation reply never happened, with
+  nothing in the logs to explain why. All 13 call sites across `acp-bridge.ts`,
+  `escalation.ts`, and `media-pipeline.ts` now route through a single
+  `emitOrLog` helper (`src/events.ts`) that `await`s the emit inside a
+  `try`/`catch` — a bare `.catch()` only guards a rejected promise, not a proxy
+  that throws synchronously (e.g. an uninitialized transport) — and logs the
+  event, site, and companyId via `ctx.logger.error` on failure. Ported from
+  mvanhorn/paperclip-plugin-telegram 8b508b7 + cdd6d03 (PR #92, Vagif Veliev).
+
 ## [0.4.6] — 2026-09-05
 
 Saved notification settings reached the database and stopped there. On an
