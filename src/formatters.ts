@@ -85,6 +85,20 @@ function classifyAgentError(errorMessage: string): string {
   return "Agent Error";
 }
 
+// Issue-lifecycle notifications (created/assigned/done) are silent for low/medium priority
+// issues so routine churn doesn't buzz the phone; high/critical priority stays loud, and
+// unknown priority defaults to loud so we never silently swallow a notification we can't
+// classify. Approvals and agent errors are always loud, unconditionally.
+//
+// Ported from mvanhorn/paperclip-plugin-telegram (ODIAA-2069, commit f619956) — complementary
+// to our own notification-filters.ts (a different, broader forwarding-gate mechanism); this
+// uses Telegram's native `disableNotification` flag instead of dropping the message outright.
+const SILENT_ISSUE_PRIORITIES = new Set(["low", "medium"]);
+
+function silentForPriority(priority: string | null): boolean {
+  return priority !== null && SILENT_ISSUE_PRIORITIES.has(priority.toLowerCase());
+}
+
 function asPayload(value: unknown): Payload {
   return value && typeof value === "object" ? (value as Payload) : {};
 }
@@ -180,6 +194,7 @@ export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): F
     text: lines.join("\n"),
     options: {
       parseMode: "MarkdownV2",
+      ...(silentForPriority(priority) ? { disableNotification: true } : {}),
       ...(button ? { inlineKeyboard: [[button]] } : {}),
     },
   };
@@ -190,6 +205,7 @@ export function formatIssueAssigned(event: PluginEvent, opts?: IssueLinksOpts): 
   const prev = (p._previous as Payload | undefined) ?? {};
   const identifier = String(p.identifier ?? event.entityId);
   const title = String(p.title ?? "Untitled");
+  const priority = p.priority ? String(p.priority) : null;
   const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
   const prevAssigneeName = prev.assigneeName ? String(prev.assigneeName) : null;
 
@@ -213,6 +229,7 @@ export function formatIssueAssigned(event: PluginEvent, opts?: IssueLinksOpts): 
     text: lines.join("\n"),
     options: {
       parseMode: "MarkdownV2",
+      ...(silentForPriority(priority) ? { disableNotification: true } : {}),
       ...(button ? { inlineKeyboard: [[button]] } : {}),
     },
   };
@@ -222,6 +239,7 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? event.entityId);
   const title = String(p.title ?? "");
+  const priority = p.priority ? String(p.priority) : null;
   const comment = p.comment ? String(p.comment) : null;
 
   const lines: string[] = [
@@ -239,6 +257,7 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
     text: lines.join("\n"),
     options: {
       parseMode: "MarkdownV2",
+      ...(silentForPriority(priority) ? { disableNotification: true } : {}),
       ...(button ? { inlineKeyboard: [[button]] } : {}),
     },
   };

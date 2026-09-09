@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Issue-lifecycle notifications go silent for low/medium priority issues
+  (ODIAA-2069).** `issue.created`, `issue.assigned`, and `issue.done` now set
+  Telegram's native `disableNotification` flag when the issue's priority is
+  `low` or `medium`, so routine churn no longer buzzes the phone. High,
+  critical, and unknown/omitted priority stay loud — an unclassifiable
+  priority deliberately errs toward interrupting rather than being silently
+  downgraded. Approvals and agent errors are untouched and always loud.
+  `issue.updated` payloads are also enriched with priority when the event
+  omits it, mirroring the existing title/assigneeName enrichment. This is
+  complementary to, not a replacement for, the broader forwarding-gate
+  filters in `notification-filters.ts` — it mutes rather than drops the
+  message. Ported from
+  [mvanhorn/paperclip-plugin-telegram@f619956](https://github.com/mvanhorn/paperclip-plugin-telegram/commit/f61995636770367467726d7c4cf4b03b61c0a6e5)
+  (PR #108).
+
 ## [0.4.6] — 2026-09-05
 
 Saved notification settings reached the database and stopped there. On an
