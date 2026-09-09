@@ -1,6 +1,7 @@
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { escapeMarkdownV2, truncateAtWord } from "./telegram-api.js";
 import type { SendMessageOptions } from "./telegram-api.js";
+import { str } from "./coerce.js";
 
 type Payload = Record<string, unknown>;
 
@@ -151,12 +152,12 @@ function parseInteractionQuestions(value: unknown): InteractionQuestion[] {
 
 export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const identifier = String(p.identifier ?? event.entityId);
-  const title = String(p.title ?? "Untitled");
-  const status = p.status ? String(p.status) : null;
-  const priority = p.priority ? String(p.priority) : null;
-  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
-  const projectName = p.projectName ? String(p.projectName) : null;
+  const identifier = str(p.identifier, event.entityId);
+  const title = str(p.title, "Untitled");
+  const status = p.status ? str(p.status) : null;
+  const priority = p.priority ? str(p.priority) : null;
+  const assigneeName = p.assigneeName ? str(p.assigneeName) : null;
+  const projectName = p.projectName ? str(p.projectName) : null;
 
   const lines: string[] = [
     `${esc("📋")} ${bold("Issue Created")}: ${issueLink(identifier, opts)}`,
@@ -171,7 +172,7 @@ export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): F
   if (meta.length > 0) lines.push(meta.join(" \\| "));
 
   if (p.description) {
-    const desc = truncateAtWord(String(p.description), 200);
+    const desc = truncateAtWord(str(p.description), 200);
     lines.push(`\n${esc(">")} ${esc(desc)}`);
   }
 
@@ -188,10 +189,10 @@ export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): F
 export function formatIssueAssigned(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
   const prev = (p._previous as Payload | undefined) ?? {};
-  const identifier = String(p.identifier ?? event.entityId);
-  const title = String(p.title ?? "Untitled");
-  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
-  const prevAssigneeName = prev.assigneeName ? String(prev.assigneeName) : null;
+  const identifier = str(p.identifier, event.entityId);
+  const title = str(p.title, "Untitled");
+  const assigneeName = p.assigneeName ? str(p.assigneeName) : null;
+  const prevAssigneeName = prev.assigneeName ? str(prev.assigneeName) : null;
 
   const lines: string[] = [
     `${esc("🎯")} ${bold("Issue Assigned")}: ${issueLink(identifier, opts)}`,
@@ -220,9 +221,9 @@ export function formatIssueAssigned(event: PluginEvent, opts?: IssueLinksOpts): 
 
 export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const identifier = String(p.identifier ?? event.entityId);
-  const title = String(p.title ?? "");
-  const comment = p.comment ? String(p.comment) : null;
+  const identifier = str(p.identifier, event.entityId);
+  const title = str(p.title);
+  const comment = p.comment ? str(p.comment) : null;
 
   const lines: string[] = [
     `${esc("✅")} ${bold("Issue Completed")}: ${issueLink(identifier, opts)}`,
@@ -246,10 +247,10 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
 
 export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const identifier = String(p.identifier ?? event.entityId);
-  const title = String(p.title ?? "Untitled");
-  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
-  const reason = p.comment ? String(p.comment) : null;
+  const identifier = str(p.identifier, event.entityId);
+  const title = str(p.title, "Untitled");
+  const assigneeName = p.assigneeName ? str(p.assigneeName) : null;
+  const reason = p.comment ? str(p.comment) : null;
 
   const lines: string[] = [
     `${esc("🚫")} ${bold("Issue Blocked")}: ${issueLink(identifier, opts)}`,
@@ -275,11 +276,11 @@ export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): F
 
 export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const identifier = String(p.identifier ?? p.issueIdentifier ?? p.issueId ?? event.entityId);
-  const title = p.title ?? p.issueTitle ? String(p.title ?? p.issueTitle) : null;
+  const identifier = str(p.identifier ?? p.issueIdentifier ?? p.issueId, event.entityId);
+  const title = p.title ?? p.issueTitle ? str(p.title ?? p.issueTitle) : null;
   const author = p.authorName ?? p.author ?? p.userName ?? p.agentName;
-  const authorName = author ? String(author) : null;
-  const body = String(p.body ?? p.comment ?? p.text ?? "");
+  const authorName = author ? str(author) : null;
+  const body = str(p.body ?? p.comment ?? p.text);
 
   const lines: string[] = [
     `${esc("📣")} ${bold("Board Mention")}: ${issueLink(identifier, opts)}`,
@@ -304,9 +305,9 @@ export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): F
 
 export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const interactionId = String(p.interactionId ?? "interaction");
-  const kind = String(p.interactionKind ?? "unknown");
-  const issueIdentifier = String(p.issueIdentifier ?? event.entityId);
+  const interactionId = str(p.interactionId, "interaction");
+  const kind = str(p.interactionKind, "unknown");
+  const issueIdentifier = str(p.issueIdentifier, event.entityId);
   const issueTitle = stringOrNull(p.issueTitle);
   const interaction = asPayload(p.interaction);
   const interactionPayload = asPayload(interaction.payload);
@@ -360,11 +361,11 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
 
 export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const approvalType = String(p.type ?? "unknown");
-  const approvalId = String(p.approvalId ?? event.entityId);
-  const title = String(p.title ?? "Approval Requested");
-  const description = p.description ? String(p.description) : null;
-  const agentName = p.agentName ? String(p.agentName) : null;
+  const approvalType = str(p.type, "unknown");
+  const approvalId = str(p.approvalId, event.entityId);
+  const title = str(p.title, "Approval Requested");
+  const description = p.description ? str(p.description) : null;
+  const agentName = p.agentName ? str(p.agentName) : null;
 
   const lines: string[] = [
     `${esc("🔔")} ${bold("Approval Requested")}`,
@@ -379,12 +380,12 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   if (linkedIssues.length > 0) {
     lines.push(`\n${bold(`Linked Issues (${String(linkedIssues.length)})`)}`);
     for (const issue of linkedIssues.slice(0, 5)) {
-      const issueId = String(issue.identifier ?? "?");
-      const issueParts = [`${issueLink(issueId, opts)} ${esc(String(issue.title ?? ""))}`];
+      const issueId = str(issue.identifier, "?");
+      const issueParts = [`${issueLink(issueId, opts)} ${esc(str(issue.title))}`];
       const issueMeta: string[] = [];
-      if (issue.status) issueMeta.push(String(issue.status));
-      if (issue.priority) issueMeta.push(String(issue.priority));
-      if (issue.assignee) issueMeta.push(`-> ${String(issue.assignee)}`);
+      if (issue.status) issueMeta.push(str(issue.status));
+      if (issue.priority) issueMeta.push(str(issue.priority));
+      if (issue.assignee) issueMeta.push(`-> ${str(issue.assignee)}`);
       if (issueMeta.length > 0) issueParts.push(`\\(${esc(issueMeta.join(" | "))}\\)`);
       lines.push(issueParts.join(" "));
     }
@@ -399,7 +400,7 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
 
   // Add deep link to the first linked issue if available
   if (linkedIssues.length > 0) {
-    const firstIssueId = String(linkedIssues[0]!.identifier ?? "");
+    const firstIssueId = str(linkedIssues[0]!.identifier);
     if (firstIssueId) {
       const btn = issueButton(firstIssueId, opts);
       if (btn) keyboard.push([btn]);
@@ -417,13 +418,13 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
 
 export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const agentId = String(p.agentId ?? event.entityId);
-  const agentName = String(p.agentName ?? p.name ?? agentId);
-  const errorMessage = String(p.error ?? p.message ?? "Unknown error");
-  const runId = p.runId ? String(p.runId) : null;
-  const companyName = p.companyName ? String(p.companyName) : null;
-  const issueIdentifier = p.issueIdentifier ? String(p.issueIdentifier) : null;
-  const issueTitle = p.issueTitle ? String(p.issueTitle) : null;
+  const agentId = str(p.agentId, event.entityId);
+  const agentName = str(p.agentName, str(p.name, agentId));
+  const errorMessage = str(p.error, str(p.message, "Unknown error"));
+  const runId = p.runId ? str(p.runId) : null;
+  const companyName = p.companyName ? str(p.companyName) : null;
+  const issueIdentifier = p.issueIdentifier ? str(p.issueIdentifier) : null;
+  const issueTitle = p.issueTitle ? str(p.issueTitle) : null;
 
   const lines: string[] = [
     `${esc("❌")} ${bold(classifyAgentError(errorMessage))}`,
@@ -456,9 +457,9 @@ export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): For
 
 export function formatAgentRunStarted(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const agentId = String(p.agentId ?? event.entityId);
-  const agentName = String(p.agentName ?? agentId);
-  const runId = p.runId ? String(p.runId) : null;
+  const agentId = str(p.agentId, event.entityId);
+  const agentName = str(p.agentName, agentId);
+  const runId = p.runId ? str(p.runId) : null;
 
   const buttons: Array<{ text: string; url: string }> = [];
   if (opts?.baseUrl && isExternalUrl(opts.baseUrl)) {
@@ -480,9 +481,9 @@ export function formatAgentRunStarted(event: PluginEvent, opts?: IssueLinksOpts)
 
 export function formatAgentRunFinished(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const agentId = String(p.agentId ?? event.entityId);
-  const agentName = String(p.agentName ?? agentId);
-  const runId = p.runId ? String(p.runId) : null;
+  const agentId = str(p.agentId, event.entityId);
+  const agentName = str(p.agentName, agentId);
+  const runId = p.runId ? str(p.runId) : null;
 
   const buttons: Array<{ text: string; url: string }> = [];
   if (opts?.baseUrl && isExternalUrl(opts.baseUrl)) {
