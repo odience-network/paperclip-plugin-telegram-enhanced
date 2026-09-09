@@ -70,6 +70,7 @@ import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
+import { str } from "./coerce.js";
 import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
 import {
   resolveStartupTelegramBotToken,
@@ -622,7 +623,7 @@ function makeUpdateDedupe(windowMs = 5_000, maxEntries = 500) {
 }
 
 function normalizeAgentErrorMessage(input: unknown): string {
-  return String(input ?? "Unknown error")
+  return str(input, "Unknown error")
     .trim()
     .replace(/\s+/g, " ")
     .slice(0, 500);
@@ -1655,10 +1656,10 @@ export const plugin = definePlugin({
         const dedupeKey = [
           "assigned",
           event.entityId,
-          String(prev.assigneeUserId ?? ""),
-          String(payload.assigneeUserId ?? ""),
-          String(prev.assigneeAgentId ?? ""),
-          String(payload.assigneeAgentId ?? ""),
+          str(prev.assigneeUserId),
+          str(payload.assigneeUserId),
+          str(prev.assigneeAgentId),
+          str(payload.assigneeAgentId),
         ].join("|");
         if (!assignmentDedupe(dedupeKey)) return;
 
@@ -1708,14 +1709,14 @@ export const plugin = definePlugin({
       // Enrich agent name
       if (payload.agentId && !payload.agentName) {
         try {
-          const agent = await ctx.agents.get(String(payload.agentId), event.companyId);
+          const agent = await ctx.agents.get(str(payload.agentId), event.companyId);
           if (agent) payload.agentName = agent.name;
         } catch { /* best effort */ }
       }
       // Build a meaningful title if still missing
       if (!payload.title || payload.title === "Approval Requested") {
-        const approvalType = String(payload.type ?? "unknown").replace(/_/g, " ");
-        const agentLabel = payload.agentName ? String(payload.agentName) : null;
+        const approvalType = str(payload.type, "unknown").replace(/_/g, " ");
+        const agentLabel = payload.agentName ? str(payload.agentName) : null;
         payload.title = agentLabel
           ? `${approvalType} — ${agentLabel}`
           : approvalType;
@@ -1729,10 +1730,10 @@ export const plugin = definePlugin({
         const eventConfig = configFor(event.companyId);
         if (!eventConfig.notifyOnAgentError) return;
         const payload = event.payload as Record<string, unknown>;
-        const agentId = String(payload.agentId ?? event.entityId);
+        const agentId = str(payload.agentId, event.entityId);
         if (payload.agentId && !payload.agentName) {
           try {
-            const agent = await ctx.agents.get(String(payload.agentId), event.companyId);
+            const agent = await ctx.agents.get(str(payload.agentId), event.companyId);
             if (agent) payload.agentName = agent.name;
           } catch { /* best effort */ }
         }
@@ -1744,7 +1745,7 @@ export const plugin = definePlugin({
         }
         if (payload.issueId && (!payload.issueIdentifier || !payload.issueTitle)) {
           try {
-            const issue = await ctx.issues.get(String(payload.issueId), event.companyId);
+            const issue = await ctx.issues.get(str(payload.issueId), event.companyId);
             if (issue) {
               payload.issueIdentifier ??= issue.identifier;
               payload.issueTitle ??= issue.title;
@@ -1762,7 +1763,7 @@ export const plugin = definePlugin({
       const payload = event.payload as Record<string, unknown>;
       if (payload.agentId && !payload.agentName) {
         try {
-          const agent = await ctx.agents.get(String(payload.agentId), event.companyId);
+          const agent = await ctx.agents.get(str(payload.agentId), event.companyId);
           if (agent) payload.agentName = agent.name;
         } catch { /* best effort */ }
       }
@@ -1885,8 +1886,8 @@ export const plugin = definePlugin({
       const payload = event.payload as Record<string, unknown>;
       const issueId = String(event.entityId ?? "");
       if (!issueId) return;
-      const interactionId = String(payload.interactionId ?? "");
-      const interactionKind = String(payload.interactionKind ?? "");
+      const interactionId = str(payload.interactionId);
+      const interactionKind = str(payload.interactionKind);
       if (!interactionId) return;
       // Only notify for confirmation-like interactions; ignore other kinds for now.
       if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
@@ -2253,20 +2254,20 @@ export const plugin = definePlugin({
         reason: p.reason as EscalationEvent["reason"],
         context: {
           conversationHistory: [],
-          agentReasoning: String(p.conversationSummary ?? ""),
+          agentReasoning: str(p.conversationSummary),
           suggestedActions: (p.suggestedActions as string[]) ?? [],
-          suggestedReply: p.suggestedReply ? String(p.suggestedReply) : undefined,
+          suggestedReply: p.suggestedReply ? str(p.suggestedReply) : undefined,
           confidenceScore: typeof p.confidenceScore === "number" ? p.confidenceScore : undefined,
         },
         timeout: {
           durationMs: timeoutMs,
           defaultAction,
         },
-        originChatId: p.originChatId ? String(p.originChatId) : undefined,
-        originThreadId: p.originThreadId ? String(p.originThreadId) : undefined,
-        originMessageId: p.originMessageId ? String(p.originMessageId) : undefined,
+        originChatId: p.originChatId ? str(p.originChatId) : undefined,
+        originThreadId: p.originThreadId ? str(p.originThreadId) : undefined,
+        originMessageId: p.originMessageId ? str(p.originMessageId) : undefined,
         transport: p.transport as "native" | "acp" | undefined,
-        sessionId: p.sessionId ? String(p.sessionId) : undefined,
+        sessionId: p.sessionId ? str(p.sessionId) : undefined,
       };
 
       await escalationManager.create(ctx, token, escalationEvent, resolvedEscalationChatId);
