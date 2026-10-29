@@ -305,6 +305,33 @@ describe("onConfigChanged delivery", () => {
       .resolves.toEqual({ chatId: "-100A" });
   });
 
+  it("rejects set-chat instead of storing '[object Object]' or 'undefined' (ODIAA-2068)", async () => {
+    const { harness } = await startWorker();
+
+    // A non-primitive or missing chatId must never reach ctx.state.set — that
+    // is the String()-coercion data-integrity bug this issue covers.
+    await expect(
+      harness.performAction("set-chat", {
+        companyId: COMPANY_ID,
+        chatId: { nested: "value" },
+      }),
+    ).rejects.toThrow("chatId is required");
+    await expect(
+      harness.performAction("set-chat", { companyId: COMPANY_ID }),
+    ).rejects.toThrow("chatId is required");
+    await expect(
+      harness.performAction("set-chat", { chatId: "-100C" }),
+    ).rejects.toThrow("companyId is required");
+
+    expect(
+      harness.getState({
+        scopeKind: "company",
+        scopeId: COMPANY_ID,
+        stateKey: "telegram-chat",
+      }),
+    ).toBeUndefined();
+  });
+
   it("keeps a customised base URL when a defaults row is replayed after it (ODIAA-1930)", async () => {
     const { harness, fetchMock } = await startWorker({ withBotToken: true });
 

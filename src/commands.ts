@@ -5,6 +5,7 @@ import { handleAcpCommand } from "./acp-bridge.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi, type CfAccessHeaders } from "./paperclip-api.js";
 import { formatCompanyChoices, listCompaniesResilient, resolveCompanyInput } from "./company-directory.js";
 import { probeReplyAttribution, type ReplyAttributionReadiness } from "./inbound-attribution.js";
+import { errorMessage, str } from "./coerce.js";
 
 type BotCommand = {
   command: string;
@@ -195,7 +196,7 @@ async function handleStatus(
     // cause was the company-scoped read failing.
     const linked = resolvedCompanyId ?? (await resolveCompanyIdOrUndefined(ctx, chatId));
     const detail = linked
-      ? `Could not fetch status for company ${linked}: ${err instanceof Error ? err.message : String(err)}`
+      ? `Could not fetch status for company ${linked}: ${errorMessage(err)}`
       : "This chat is not linked to a Paperclip company yet. Use /connect <company> first.";
     await sendMessage(
       ctx,
@@ -353,7 +354,7 @@ async function handleApprove(
       ctx,
       token,
       chatId,
-      `Failed to approve ${approvalId}: ${err instanceof Error ? err.message : String(err)}`,
+      `Failed to approve ${approvalId}: ${errorMessage(err)}`,
       { messageThreadId },
     );
   }
@@ -443,7 +444,7 @@ async function handleConnect(
         chatId,
       );
     } catch (err) {
-      outboundError = err instanceof Error ? err.message : String(err);
+      outboundError = errorMessage(err);
       ctx.logger.warn("Linked chat but could not store outbound chat mapping", {
         chatId,
         companyId: match.id,
@@ -469,7 +470,7 @@ async function handleConnect(
       ctx,
       token,
       chatId,
-      `Failed to connect: ${err instanceof Error ? err.message : String(err)}`,
+      `Failed to connect: ${errorMessage(err)}`,
       { messageThreadId },
     );
   }
@@ -537,7 +538,7 @@ async function handleCreate(
       ctx,
       token,
       chatId,
-      `Failed to create task: ${err instanceof Error ? err.message : String(err)}`,
+      `Failed to create task: ${errorMessage(err)}`,
       { messageThreadId },
     );
   }
@@ -880,10 +881,10 @@ async function resolveEventProjectName(
   event: PluginEvent,
 ): Promise<string | undefined> {
   const payload = event.payload as Record<string, unknown>;
-  const payloadProjectName = payload.projectName ? String(payload.projectName) : undefined;
+  const payloadProjectName = payload.projectName ? str(payload.projectName) : undefined;
   if (payloadProjectName) return payloadProjectName;
 
-  const payloadProjectId = payload.projectId ? String(payload.projectId) : undefined;
+  const payloadProjectId = payload.projectId ? str(payload.projectId) : undefined;
   if (payloadProjectId) {
     try {
       const project = await ctx.projects.get(payloadProjectId, event.companyId);
