@@ -2034,7 +2034,11 @@ export const plugin = definePlugin({
     // --- Per-company chat overrides ---
 
     ctx.data.register("chat-mapping", async (params) => {
-      const companyId = String(params.companyId);
+      const record = isRecord(params) ? params : {};
+      const companyId = str(record.companyId);
+      if (!companyId) {
+        throw new Error("companyId is required");
+      }
       const saved = await ctx.state.get({
         scopeKind: "company",
         scopeId: companyId,
@@ -2044,8 +2048,15 @@ export const plugin = definePlugin({
     });
 
     ctx.actions.register("set-chat", async (params) => {
-      const companyId = String(params.companyId);
-      const chatId = String(params.chatId);
+      const record = isRecord(params) ? params : {};
+      const companyId = str(record.companyId);
+      const chatId = str(record.chatId);
+      if (!companyId) {
+        throw new Error("companyId is required");
+      }
+      if (!chatId) {
+        throw new Error("chatId is required");
+      }
       await ctx.state.set(
         { scopeKind: "company", scopeId: companyId, stateKey: "telegram-chat" },
         chatId,
