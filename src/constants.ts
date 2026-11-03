@@ -59,6 +59,14 @@ export const DEFAULT_CONFIG = {
   escalationTimeoutMs: 900000,
   escalationDefaultAction: "defer",
   escalationHoldMessage: "Let me check on that - I'll get back to you shortly.",
+  // Question cards: remind about an unanswered agent question every N minutes,
+  // at most M times. 0 disables reminders.
+  questionReminderMinutes: 120,
+  questionReminderMaxCount: 2,
+  // A plain (non-reply) private message to the bot becomes a task for this
+  // agent. Off by default; empty agent id falls back to the CEO / top agent.
+  createTasksFromMessages: false,
+  intakeAgentId: "",
   // Phase 3: Media Pipeline
   briefAgentId: "",
   briefAgentChatIds: [] as string[],

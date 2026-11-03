@@ -50,6 +50,18 @@ function isLoopbackUrl(url: string): boolean {
 }
 
 /**
+ * An `HttpClientLike` for plugin -> board calls with the same loopback rule as
+ * `fetchPaperclipApi`: the host's `ctx.http` refuses private addresses (SSRF
+ * guard), so a co-located board on localhost is reached with the runtime fetch.
+ */
+export function paperclipHttp(ctx: PluginContext) {
+  return {
+    fetch: (url: string, init: { method: string; headers: Record<string, string>; body?: string }) =>
+      isLoopbackUrl(url) ? fetch(url, init) : ctx.http.fetch(url, init),
+  };
+}
+
+/**
  * Fail-securely detection for a Cloudflare Access login challenge that slipped
  * through as a 2xx (ODIAA-746, follow-up to ODIAA-744/ODIAA-732).
  *
