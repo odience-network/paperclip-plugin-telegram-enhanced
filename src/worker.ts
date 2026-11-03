@@ -1152,6 +1152,16 @@ export async function sendToTelegramTool(
     );
   }
 
+  // A message about a task is answerable: replying to it comments on the task
+  // and wakes its agent, like replying to any other task notification.
+  const aboutIssueId = asNonEmptyString(p.issueId);
+  if (aboutIssueId && result.messageId) {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `msg_${chatId}_${result.messageId}` },
+      { entityId: aboutIssueId, entityType: "issue", companyId: runCtx.companyId, eventType: "agent.message" },
+    ).catch(() => undefined);
+  }
+
   await ctx.activity.log({
     companyId: runCtx.companyId,
     message: "Agent sent content to Telegram",
