@@ -97,3 +97,11 @@ describe("validateSecretRefFields", () => {
     expect(errors[0]).toContain("<object>");
   });
 });
+
+describe("secret_ref bindings", () => {
+  it("accepts the { type: \"secret_ref\", secretId } shape current hosts require", () => {
+    expect(isValidSecretRef({ type: "secret_ref", secretId: VALID_UUID })).toBe(true);
+    expect(isValidSecretRef({ type: "secret_ref", secretId: "nope" })).toBe(false);
+    expect(validateSecretRefFields({ paperclipBoardApiTokenRef: { type: "secret_ref", secretId: VALID_UUID } })).toEqual([]);
+  });
+});
