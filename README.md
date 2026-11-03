@@ -39,6 +39,7 @@ Paperclip agents  ⇄  Telegram bot  ⇄  You
 |---|---|---|
 | 🔔 | **Notifications** | Issue created/done/blocked, board `@`-mentions, approvals, agent errors, and run lifecycle — formatted in MarkdownV2 with a plain-text fallback. |
 | ✅ | **One-tap approvals** | Inline **Approve** / **Reject** buttons on every approval. Act without leaving Telegram. |
+| ❓ | **Agent questions** | Agent questions and confirmations arrive with context and are answered by button or plain reply; cards sync with the board and remind you. |
 | 💬 | **Bot commands** | `/status`, `/issues`, `/agents`, `/approve`, `/connect`, `/topics`, `/acp`, `/commands`, and more. |
 | ↩️ | **Reply routing** | Reply to any notification and it becomes an issue comment or escalation reply. |
 | 🧵 | **Multi-agent threads** | Up to 5 agents per thread with `@mention` routing, handoff, and discuss loops. |

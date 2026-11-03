@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+Agent questions now reach Telegram and can be answered there like a chat.
+
+### Fixed
+
+- **Agent questions and confirmations were never delivered.** The plugin waited
+  for an `issue.interaction.created` event that Paperclip does not emit to
+  plugins (it is not in `PLUGIN_EVENT_TYPES`, and no activity action maps to
+  it). Cards are now delivered when the asking agent's run ends, using
+  `issues.listInteractions` (new `issue.interactions.read` capability). The
+  old subscription stays for hosts that emit the event.
+- **Interaction answers failed on co-located boards.** Calls to
+  `/api/issues/:id/interactions/...` went through `ctx.http`, which refuses
+  loopback addresses. They now use the same loopback rule as approvals.
+- `/create` left tasks unassigned when no agent had the literal role `ceo`; it
+  now falls back to the top-level agent.
+
+### Added
+
+- **Question cards:** who asks, task, project and the agent's comment as
+  context; options as buttons (one tap for single choice, toggles plus
+  Send for multi-select and multi-question cards); free-text answers by plain
+  reply; confirmations by button or reply.
+- Cards update when settled in the board, withdrawn or expired, and unanswered
+  cards are re-pinged (`questionReminderMinutes`, `questionReminderMaxCount`,
+  job `sync-question-cards`).
+- `/pending` lists open question cards and pending approvals.
+- `createTasksFromMessages` + `intakeAgentId`: a plain private message becomes
+  a task, and replying to the confirmation continues on it. `/create` keeps
+  the first line as title and the full text as description.
+
+### Removed
+
+- `formatInteractionCreated` (replaced by question cards; its
+  `question_id=option_id` reply syntax still works).
+
 ## [0.4.6] — 2026-09-05
 
 Saved notification settings reached the database and stopped there. On an

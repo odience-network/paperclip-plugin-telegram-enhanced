@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { handleCommand, BOT_COMMANDS, handleConnectTopic, getTopicForProject, resolveNotificationThreadId } from "../src/commands.js";
+import { handleCommand, BOT_COMMANDS, handleConnectTopic, getTopicForProject, resolveNotificationThreadId, pickIntakeAgent, splitTaskText } from "../src/commands.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
 let sentMessages: Array<{ chatId: string; text: string; options?: Record<string, unknown> }> = [];
@@ -316,11 +316,36 @@ describe("handleCommand", () => {
     expect(sentMessages[0].options).toMatchObject({ messageThreadId: 58 });
   });
 
-  it("/create works without a CEO agent", async () => {
+  it("/create assigns the top-level agent when no agent has the ceo role", async () => {
     const ctx = mockCtx();
     (ctx.agents as unknown) = {
       list: vi.fn().mockResolvedValue([
-        { id: "a1", name: "Builder", status: "active", role: "engineer" },
+        { id: "a2", name: "Helper", status: "active", role: "general", reportsTo: "a1" },
+        { id: "a1", name: "Lead", status: "active", role: "general", reportsTo: null },
+      ]),
+    };
+    (ctx.companies as unknown) = {
+      get: vi.fn().mockResolvedValue({ id: "co-1", name: "MyCompany", issuePrefix: null }),
+    };
+    const createdIssue = { id: "i-new", identifier: "MC-101", title: "Plan the week", status: "backlog" };
+    (ctx.issues as unknown) = {
+      ...ctx.issues,
+      create: vi.fn().mockResolvedValue(createdIssue),
+      update: vi.fn().mockResolvedValue({ ...createdIssue, status: "todo" }),
+    };
+    await handleCommand(ctx, "token", "123", "create", "Plan the week\nInclude the Friday demo.");
+    expect(ctx.issues.create).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Plan the week", description: "Plan the week\nInclude the Friday demo." }),
+    );
+    expect(ctx.issues.update).toHaveBeenCalledWith("i-new", { status: "todo", assigneeAgentId: "a1" }, expect.any(String));
+    expect(sentMessages[0].text).toContain("Lead");
+  });
+
+  it("/create works without any assignable agent", async () => {
+    const ctx = mockCtx();
+    (ctx.agents as unknown) = {
+      list: vi.fn().mockResolvedValue([
+        { id: "a1", name: "Builder", status: "active", role: "engineer", reportsTo: "someone" },
       ]),
     };
     (ctx.companies as unknown) = {
@@ -590,5 +615,30 @@ describe("/connect without a usable companies.list (ODIAA-1927)", () => {
     expect(sentMessages[0].text).toContain('Company "unknown-co" not found');
     expect(sentMessages[0].text).toContain("company UUID");
     expect(sentMessages[0].text).not.toContain("Failed to connect");
+  });
+});
+
+describe("task intake helpers", () => {
+  const agents = [
+    { id: "lead", name: "Lead", status: "idle", role: "general", reportsTo: null },
+    { id: "ceo", name: "Boss", status: "paused", role: "ceo", reportsTo: null },
+    { id: "dev", name: "Dev", status: "idle", role: "engineer", reportsTo: "lead" },
+  ] as unknown as Parameters<typeof pickIntakeAgent>[0];
+
+  it("prefers the configured intake agent, skips paused ones, falls back to the top of the org", () => {
+    expect(pickIntakeAgent(agents, "dev")?.id).toBe("dev");
+    expect(pickIntakeAgent(agents, "missing")?.id).toBe("lead");
+    expect(pickIntakeAgent(agents)?.id).toBe("lead");
+  });
+
+  it("turns a message into a bounded title plus the full text", () => {
+    expect(splitTaskText("  Fix login  ")).toEqual({ title: "Fix login" });
+    expect(splitTaskText("Fix login\nIt 500s on Safari")).toEqual({
+      title: "Fix login",
+      description: "Fix login\nIt 500s on Safari",
+    });
+    const long = splitTaskText("x".repeat(200));
+    expect(long.title.length).toBe(120);
+    expect(long.description).toBe("x".repeat(200));
   });
 });

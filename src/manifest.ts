@@ -18,6 +18,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.update",
     "issue.comments.read",
     "issue.comments.create",
+    // Question cards: find agent questions when a run ends (hosts do not emit
+    // an interaction event to plugins) and notice when they are settled.
+    "issue.interactions.read",
     // Post an inbound Telegram reply as the board member who wrote it, so it is
     // a real comment instead of a system message the assignee never sees
     // (ODIAA-1927). The host re-verifies the user is an active human member.
@@ -72,6 +75,12 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Check Escalation Timeouts",
       description: "Check for timed-out escalations and apply default actions.",
       schedule: "* * * * *",
+    },
+    {
+      jobKey: "sync-question-cards",
+      displayName: "Sync Question Cards",
+      description: "Close Telegram question cards settled in Paperclip and remind about unanswered ones.",
+      schedule: "*/5 * * * *",
     },
     {
       jobKey: "check-watches",

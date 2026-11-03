@@ -16,6 +16,19 @@ How the plugin decides *what* to send and *where* to send it. All messages are f
 
 Toggle each type with the `notifyOn*` settings in the [Configuration Reference](configuration.md#notification-toggles).
 
+## Agent questions
+
+When an agent asks the board something (`ask_user_questions`) or asks for a go-ahead (`request_confirmation`), the plugin sends a **question card**:
+
+- **Context first:** which agent asks, the task (with link), its project, and the comment the question came with.
+- **Options are buttons.** A single question with a single choice is answered with one tap. Multi-select and multi-question cards mark your picks and send them with **Send**.
+- **Your own words:** reply to the card with text. It fills the first unanswered question (or the free-text option you tapped). Replying `question_id=option_id` still works.
+- **Confirmations:** tap Accept / Reject, or reply. `yes`, `ok`, `tak` and similar accept; any other text rejects with that text as the reason.
+- **Stays in sync:** when the question is answered in the board, withdrawn or expires, the card is updated and its buttons removed.
+- **Reminders:** an unanswered card is re-pinged (`questionReminderMinutes`, `questionReminderMaxCount`).
+
+Paperclip (at least up to 2026.1023) does not emit an interaction event to plugins, so the plugin checks the task when the asking agent's run ends (`agent.run.finished` / `failed` / `cancelled`). A card therefore arrives a moment after the run that asked. A sync job every 5 minutes closes settled cards and sends reminders. Requires the `issue.interactions.read` capability; answering requires [board access](getting-started.md#6-enable-approval-buttons-board-access).
+
 ## Interactive approvals
 
 Every approval notification includes inline **Approve** / **Reject** buttons:

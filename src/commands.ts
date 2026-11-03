@@ -79,6 +79,7 @@ export function formatReplyAttribution(readiness: ReplyAttributionReadiness): st
 
 export const BOT_COMMANDS: BotCommand[] = [
   { command: "create", description: "Create a new task (assigned to CEO agent)" },
+  { command: "pending", description: "Questions and approvals waiting for you" },
   { command: "status", description: "Company health: active agents, open issues" },
   { command: "issues", description: "List open issues (optionally by project)" },
   { command: "agents", description: "List agents with current status" },
@@ -475,7 +476,29 @@ async function handleConnect(
   }
 }
 
-async function handleCreate(
+/** Split free text into an issue title (first line, bounded) and the full text as description. */
+export function splitTaskText(text: string): { title: string; description?: string } {
+  const trimmed = text.trim();
+  const firstLine = trimmed.split("\n")[0]!.trim();
+  const title = firstLine.length > 120 ? `${firstLine.slice(0, 117).trimEnd()}...` : firstLine;
+  return title === trimmed ? { title } : { title, description: trimmed };
+}
+
+/**
+ * The agent a new task from Telegram goes to: the configured intake agent, else
+ * the CEO, else the top of the org chart (an agent that reports to nobody) -
+ * companies whose lead agent is not literally role "ceo" still get a working default.
+ */
+export function pickIntakeAgent(agents: Agent[], preferredAgentId?: string): Agent | undefined {
+  const usable = agents.filter((a) => a.status !== "paused" && a.status !== "error");
+  return (
+    (preferredAgentId ? usable.find((a) => a.id === preferredAgentId) : undefined) ??
+    usable.find((a) => a.role === "ceo") ??
+    usable.find((a) => !a.reportsTo)
+  );
+}
+
+export async function handleCreate(
   ctx: PluginContext,
   token: string,
   chatId: string,
@@ -483,8 +506,9 @@ async function handleCreate(
   messageThreadId?: number,
   linkBaseUrl?: string,
   resolvedCompanyId?: string,
+  opts: { intakeAgentId?: string; replyToMessageId?: number } = {},
 ): Promise<void> {
-  const title = titleArg.trim();
+  const { title, description } = splitTaskText(titleArg);
   if (!title) {
     await sendMessage(ctx, token, chatId, "Usage: /create <task title>", { messageThreadId });
     return;
@@ -498,15 +522,19 @@ async function handleCreate(
     const issuePrefix = company?.issuePrefix;
     const projectId = await resolveProjectIdForTopic(ctx, chatId, companyId, messageThreadId);
 
-    // Find the CEO agent to assign to
     const agents = await ctx.agents.list({ companyId });
-    const ceo = agents.find((a: Agent) => a.role === "ceo" && a.status !== "paused" && a.status !== "error");
+    const ceo = pickIntakeAgent(agents, opts.intakeAgentId);
 
     // Create the issue WITHOUT assignee first, then update with both status and assignee.
     // This ordering is load-bearing: the issue_assigned wake only fires when the assignee
     // *transitions* from null to an agent. If we set the assignee at creation time, there's
     // no transition and the agent never gets woken.
-    let issue = await ctx.issues.create({ companyId, title, ...(projectId ? { projectId } : {}) });
+    let issue = await ctx.issues.create({
+      companyId,
+      title,
+      ...(description ? { description } : {}),
+      ...(projectId ? { projectId } : {}),
+    });
     if (ceo) {
       issue = await ctx.issues.update(
         issue.id,
@@ -525,13 +553,24 @@ async function handleCreate(
       : `\`${escapeMarkdownV2(id)}\``;
     const assigneeText = ceo ? ` ${escapeMarkdownV2("→")} *${escapeMarkdownV2(ceo.name)}*` : "";
 
-    await sendMessage(
+    const confirmationId = await sendMessage(
       ctx,
       token,
       chatId,
       `${escapeMarkdownV2("✅")} *Task created*: ${idText}${assigneeText}\n${escapeMarkdownV2(title)}`,
-      { parseMode: "MarkdownV2", messageThreadId },
+      {
+        parseMode: "MarkdownV2",
+        messageThreadId,
+        ...(opts.replyToMessageId ? { replyToMessageId: opts.replyToMessageId } : {}),
+      },
     );
+    // Replying to the confirmation continues the conversation on the task.
+    if (confirmationId) {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: `msg_${chatId}_${confirmationId}` },
+        { entityId: issue.id, entityType: "issue", companyId, eventType: "issue.created" },
+      ).catch(() => undefined);
+    }
   } catch (err) {
     await sendMessage(
       ctx,

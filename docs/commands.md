@@ -11,11 +11,15 @@ Commands you can send to the bot from any allowed chat. Enable them with `enable
 | `/agents` | List agents with status indicators. |
 | `/help` | Display all available commands. |
 
-## Approvals
+## Approvals and questions
 
 | Command | Description |
 |---------|-------------|
 | `/approve <id>` | Approve a pending approval by ID. |
+| `/pending` | List open agent question cards in this chat and pending board approvals. |
+| `/create <title>` | Create a task. A multi-line message keeps the first line as the title and the whole text as the description. Assigned to `intakeAgentId`, else the CEO, else the top-level agent. |
+
+With `createTasksFromMessages` on, a plain private message works like `/create`.
 
 > Tip: most of the time you'll just tap the inline **Approve** button on the notification. `/approve` is handy when you know the ID. Requires [board access](getting-started.md#6-enable-approval-buttons-board-access).
 
