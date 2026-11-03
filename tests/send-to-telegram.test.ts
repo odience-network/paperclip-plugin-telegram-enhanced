@@ -99,6 +99,15 @@ describe("sendToTelegramTool", () => {
     expect(telegramApi.sendDocument).not.toHaveBeenCalled();
   });
 
+  it("makes a message about a task answerable: a reply routes to that task", async () => {
+    const ctx = createContext(async () => ({ ok: true }) as Response);
+    await runSendToTelegram({ text: "Starting XPL-9 (trivial)", issueId: "issue-9" }, defaultConfig, ctx);
+    expect(stateStore["instance::msg_-1001_101"]).toMatchObject({
+      entityId: "issue-9",
+      entityType: "issue",
+    });
+  });
+
   it("sends markdown content as a document", async () => {
     const ctx = createContext(async () => ({ ok: true }) as Response);
     const result = await runSendToTelegram({ markdownContent: "# Report" }, defaultConfig, ctx);
