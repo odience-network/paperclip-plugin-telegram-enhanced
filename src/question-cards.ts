@@ -329,6 +329,62 @@ function truncate(text: string, max: number): string {
   return `${cut.slice(0, lastSpace > max * 0.6 ? lastSpace : max)}…`;
 }
 
+const DETAILS_MAX = 1500;
+const BUTTON_LABEL_MAX = 32;
+
+function removeLast(text: string, token: string): string {
+  const i = text.lastIndexOf(token);
+  return i < 0 ? text : text.slice(0, i) + text.slice(i + token.length);
+}
+
+/** Inline markup reduced to its text: links keep their label, code and bold lose their markers. */
+function plainInline(text: string): string {
+  return text
+    .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/\*\*(.+?)\*\*/g, "$1");
+}
+
+/**
+ * Agent-written markdown as Telegram MarkdownV2. Bold, inline code, headings and list bullets survive; links keep
+ * only their label, because board-relative URLs open nothing on a phone. Everything else is escaped, so stray
+ * markup shows as text instead of breaking the message.
+ */
+export function agentMarkdownToV2(text: string): string {
+  let src = text
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.replace(/^\s{0,3}#{1,6}\s+(.+)$/, "**$1**").replace(/^(\s*)[-*+]\s+/, "$1• "))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+  // Truncation can end inside a pair; drop the unmatched opener instead of showing it literally.
+  if ((src.match(/\*\*/g) ?? []).length % 2) src = removeLast(src, "**");
+  if ((src.match(/`/g) ?? []).length % 2) src = removeLast(src, "`");
+
+  const out: string[] = [];
+  const re = /\*\*(.+?)\*\*|`([^`\n]+)`|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+  let last = 0;
+  for (let m = re.exec(src); m; m = re.exec(src)) {
+    out.push(esc(src.slice(last, m.index)));
+    if (m[1] !== undefined) out.push(`*${esc(plainInline(m[1]))}*`);
+    else if (m[2] !== undefined) out.push("`" + m[2].replace(/[`\\]/g, "\\$&") + "`");
+    else out.push(esc(m[3]!));
+    last = re.lastIndex;
+  }
+  out.push(esc(src.slice(last)));
+  return out.join("");
+}
+
+/** MarkdownV2 text as an expandable block quote: the first line visible, the rest behind a tap. */
+export function expandableQuote(v2: string): string {
+  return `${v2.split("\n").map((line, i) => `${i === 0 ? "**>" : ">"}${line}`).join("\n")}||`;
+}
+
+function buttonLabel(label: string): string {
+  const flat = plainInline(label).trim();
+  return flat.length <= BUTTON_LABEL_MAX ? flat : `${flat.slice(0, BUTTON_LABEL_MAX - 1)}…`;
+}
+
 export type RenderLinks = {
   /** MarkdownV2-ready issue reference (link or code span). */
   issueMd: string;
@@ -344,7 +400,11 @@ function header(card: QuestionCard, links: RenderLinks): string[] {
   if (c.issueTitle) where.push(esc(c.issueTitle));
   lines.push(where.join(" "));
   if (c.projectName) lines.push(`${esc("📁")} ${esc(c.projectName)}`);
-  if (c.excerpt) lines.push(`\n${esc("💬")} _${esc(truncate(c.excerpt, EXCERPT_MAX))}_`);
+  // A confirmation carries its own summary in `details`; the agent's comment would only repeat it.
+  const showExcerpt = c.excerpt && !(card.kind === "request_confirmation" && card.confirm?.details);
+  if (showExcerpt) {
+    lines.push("", expandableQuote(`${esc("💬")} ${agentMarkdownToV2(truncate(c.excerpt!, EXCERPT_MAX))}`));
+  }
   return lines;
 }
 
@@ -354,21 +414,23 @@ export function renderCard(card: QuestionCard, links: RenderLinks): RenderedCard
   const keyboard: InlineButton[][] = [];
 
   if (card.kind === "request_confirmation" && card.confirm) {
-    lines.push("", bold(card.confirm.prompt));
-    if (card.confirm.details) lines.push(esc(truncate(card.confirm.details, 800)));
-    lines.push("", `_${esc("Tap a button, or reply with text to reject with a reason.")}_`);
+    lines.push("", bold(plainInline(card.confirm.prompt)));
+    if (card.confirm.details) {
+      lines.push(expandableQuote(agentMarkdownToV2(truncate(card.confirm.details, DETAILS_MAX))));
+    }
+    lines.push("", `_${esc("Tap a button, or reply with a reason to reject.")}_`);
     keyboard.push([
-      { text: `✅ ${card.confirm.acceptLabel}`, callback_data: `${CALLBACK_PREFIX}:a` },
-      { text: `❌ ${card.confirm.rejectLabel}`, callback_data: `${CALLBACK_PREFIX}:r` },
+      { text: `✅ ${buttonLabel(card.confirm.acceptLabel)}`, callback_data: `${CALLBACK_PREFIX}:a` },
+      { text: `❌ ${buttonLabel(card.confirm.rejectLabel)}`, callback_data: `${CALLBACK_PREFIX}:r` },
     ]);
   } else {
-    if (card.title) lines.push("", bold(card.title));
+    if (card.title) lines.push("", bold(plainInline(card.title)));
     const numbered = card.questions.length > 1;
     card.questions.forEach((q, qi) => {
       const label = numbered ? `${qi + 1}. ${q.prompt}` : q.prompt;
       const mode = q.selectionMode === "multi" ? " (choose any)" : "";
-      lines.push("", `${bold(label)}${esc(mode)}`);
-      if (q.helpText) lines.push(esc(truncate(q.helpText, 300)));
+      lines.push("", `${bold(plainInline(label))}${esc(mode)}`);
+      if (q.helpText) lines.push(agentMarkdownToV2(truncate(q.helpText, 300)));
       const typed = card.texts[q.id];
       if (typed) lines.push(`${esc("✍️")} ${esc(truncate(typed, 300))}`);
       if (q.options.length === 0) lines.push(`_${esc("Reply to this message with your answer.")}_`);
@@ -377,7 +439,7 @@ export function renderCard(card: QuestionCard, links: RenderLinks): RenderedCard
       q.options.slice(0, MAX_OPTIONS_PER_QUESTION).forEach((o, oi) => {
         const mark = chosen.has(o.id) ? "✅ " : o.freeText ? "✍️ " : "";
         const prefix = numbered ? `${qi + 1}: ` : "";
-        keyboard.push([{ text: `${mark}${prefix}${o.label}`, callback_data: optionCallbackData(qi, oi) }]);
+        keyboard.push([{ text: `${mark}${prefix}${buttonLabel(o.label)}`, callback_data: optionCallbackData(qi, oi) }]);
       });
     });
     if (!isOneTap(card)) {

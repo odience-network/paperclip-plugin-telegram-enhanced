@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentMarkdownToV2,
   applyTextAnswer,
   buildAnswers,
   cardFromInteraction,
@@ -181,5 +182,34 @@ describe("reminders", () => {
     expect(isReminderDue({ ...base, reminders: 2 }, 10 * 3_600_000, 60, 2)).toBe(false);
     expect(isReminderDue({ ...base, reminders: 1, lastReminderAt: 60 * 60_000 }, 90 * 60_000, 60, 2)).toBe(false);
     expect(isReminderDue(base, 10 * 3_600_000, 0, 2)).toBe(false);
+  });
+});
+
+describe("agent markdown in cards", () => {
+  it("keeps bold, code and bullets, drops board-relative links to their label", () => {
+    const v2 = agentMarkdownToV2("## Co robimy\n- **Spec rew. 5 ([spec](/XPL/issues/XPL-6#document-spec))** ok\n- `PUT /calibration/settings` (2.0)");
+    expect(v2).toBe("*Co robimy*\n• *Spec rew\\. 5 \\(spec\\)* ok\n• `PUT /calibration/settings` \\(2\\.0\\)");
+  });
+
+  it("drops a pair opener cut off by truncation instead of printing it", () => {
+    expect(agentMarkdownToV2("**Kod klienta w run")).toBe("Kod klienta w run");
+  });
+
+  it("collapses long confirmation details and hides the duplicate agent comment", () => {
+    const card = cardFromInteraction(
+      {
+        id: "int-9", issueId: "iss-1", companyId: "co-1", kind: "request_confirmation",
+        payload: {
+          prompt: "EE-3529: zaczynamy implementację?",
+          detailsMarkdown: "**Co robimy.** Kod klienta\n- punkt 1\n- punkt 2",
+          acceptLabel: "Tak, implementuj (rekomendowane warianty)",
+        },
+      },
+      { ...context, excerpt: "Spec approved przez Anta, długi komentarz" },
+    )!;
+    const { text, keyboard } = renderCard(card, links);
+    expect(text).not.toContain("długi komentarz");
+    expect(text).toContain("**>*Co robimy\\.* Kod klienta\n>• punkt 1\n>• punkt 2||");
+    expect(keyboard[0]![0]!.text.length).toBeLessThanOrEqual(34);
   });
 });
