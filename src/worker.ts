@@ -89,6 +89,7 @@ import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
 import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
 import {
+  resolveSecretRef,
   resolveStartupTelegramBotToken,
   type TelegramRuntimeHealth,
 } from "./runtime-token.js";
@@ -533,7 +534,18 @@ async function resolveBoardApiToken(
   companyId?: string | null,
 ): Promise<string | undefined> {
   const boardAccessState = await loadBoardAccessState(ctx);
-  const candidates: Array<{ source: string; ref: string }> = [];
+  const effectiveCompanyId = companyId ?? boardAccessState.companyId;
+  const candidates: Array<{ source: string; ref: unknown; configPath?: string }> = [];
+
+  // The config ref goes first: on current hosts a secret only resolves for a
+  // plugin when plugin config bound it (at save), which the state ref never is.
+  if (config.paperclipBoardApiTokenRef) {
+    candidates.push({
+      source: "config",
+      ref: config.paperclipBoardApiTokenRef,
+      configPath: "paperclipBoardApiTokenRef",
+    });
+  }
 
   if (
     boardAccessState.paperclipBoardApiTokenRef &&
@@ -545,19 +557,16 @@ async function resolveBoardApiToken(
     });
   }
 
-  if (config.paperclipBoardApiTokenRef) {
-    candidates.push({
-      source: "config",
-      ref: config.paperclipBoardApiTokenRef,
-    });
-  }
-
   const seen = new Set<string>();
   for (const candidate of candidates) {
-    if (seen.has(candidate.ref)) continue;
-    seen.add(candidate.ref);
+    const key = JSON.stringify(candidate.ref);
+    if (seen.has(key)) continue;
+    seen.add(key);
     try {
-      return await ctx.secrets.resolve(candidate.ref);
+      return await resolveSecretRef(ctx, candidate.ref, {
+        companyId: effectiveCompanyId,
+        ...(candidate.configPath ? { configPath: candidate.configPath } : {}),
+      });
     } catch (err) {
       ctx.logger.warn("Failed to resolve board API token secret", {
         source: candidate.source,
@@ -1955,7 +1964,24 @@ export const plugin = definePlugin({
       return context;
     }
 
+    // The host can deliver the same run-end event twice within milliseconds;
+    // both handlers would pass the persisted "delivered" check before either
+    // writes it. One worker process serves the plugin, so an in-memory claim
+    // taken before the first await is enough.
+    const deliveringInteractions = new Set<string>();
+
     async function deliverInteraction(companyId: string, interaction: Record<string, unknown>): Promise<void> {
+      const interactionId = String(interaction.id ?? "");
+      if (!interactionId || deliveringInteractions.has(interactionId)) return;
+      deliveringInteractions.add(interactionId);
+      try {
+        await deliverInteractionUnlocked(companyId, interaction);
+      } finally {
+        deliveringInteractions.delete(interactionId);
+      }
+    }
+
+    async function deliverInteractionUnlocked(companyId: string, interaction: Record<string, unknown>): Promise<void> {
       const issueId = String(interaction.issueId ?? "");
       const interactionId = String(interaction.id ?? "");
       const interactionKind = String(interaction.kind ?? "");

@@ -22,8 +22,23 @@ const FIELDS = [
   { key: "cfAccessClientSecretRef", required: false },
 ] as const;
 
-export function isValidSecretRef(value: unknown): value is string {
-  return typeof value === "string" && UUID_RE.test(value.trim());
+/**
+ * A secret UUID, or the `{ type: "secret_ref", secretId }` binding that hosts
+ * from 2026.8xx require in plugin config (a bare UUID there is rejected at save
+ * and never bound to the plugin, so it can not be resolved).
+ */
+export function isValidSecretRef(value: unknown): boolean {
+  if (typeof value === "string") return UUID_RE.test(value.trim());
+  if (!value || typeof value !== "object") return false;
+  const ref = value as { type?: unknown; secretId?: unknown };
+  return ref.type === "secret_ref" && typeof ref.secretId === "string" && UUID_RE.test(ref.secretId.trim());
+}
+
+/** The shared binding shape for a secret reference given as a UUID or a binding. */
+export function toSecretRefBinding(value: unknown): { type: "secret_ref"; secretId: string } | null {
+  if (!isValidSecretRef(value)) return null;
+  const secretId = typeof value === "string" ? value.trim() : String((value as { secretId: string }).secretId).trim();
+  return { type: "secret_ref", secretId };
 }
 
 function describeBadValue(value: unknown): string {
