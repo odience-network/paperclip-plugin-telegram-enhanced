@@ -38,6 +38,12 @@ hard-cut mid-word (ODIAA-2701).
   to a raw 4096-character hard cut with no regard for word boundaries. Combined
   with the fix above, the splitter now searches for a paragraph/line/word
   boundary inside the element's own content instead.
+- **A reopened MarkdownV2 `pre` block hid its first line (ODIAA-2701).**
+  Reopening a split code block with a bare ` ``` ` left Telegram's parser
+  reading the continuation's first line as the (invisible) language tag
+  instead of content — a second, more subtle case of the silent text loss
+  this issue exists to stop. The fence now reopens as ` ```\n ` so the blank
+  language line is explicit and the real content starts on its own line.
 
 ## [0.4.7] — 2026-11-04
 

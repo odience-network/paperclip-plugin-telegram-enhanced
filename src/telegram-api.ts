@@ -579,13 +579,19 @@ function findMarkdownV2Structure(text: string): SplitStructure {
   const n = text.length;
   let i = 0;
 
-  function pushElement(openStart: number, openEnd: number, closeStart: number, closeEnd: number) {
+  function pushElement(
+    openStart: number,
+    openEnd: number,
+    closeStart: number,
+    closeEnd: number,
+    reopenText?: string,
+  ) {
     spans.push([openStart, openEnd]);
     spans.push([closeStart, closeEnd]);
     elements.push({
       start: openStart,
       end: closeEnd,
-      openText: text.slice(openStart, openEnd),
+      openText: reopenText ?? text.slice(openStart, openEnd),
       closeText: text.slice(closeStart, closeEnd),
       contentStart: openEnd,
       contentEnd: closeStart,
@@ -618,7 +624,10 @@ function findMarkdownV2Structure(text: string): SplitStructure {
       const marker = isPre ? "```" : "`";
       const end = text.indexOf(marker, i + markerLen);
       if (end !== -1) {
-        pushElement(i, i + markerLen, end, end + markerLen);
+        // Reopening a pre block with a bare "```" would make Telegram treat the
+        // continuation chunk's first line as the (now content-shadowing) language
+        // tag, silently hiding it — force an empty language line instead.
+        pushElement(i, i + markerLen, end, end + markerLen, isPre ? "```\n" : undefined);
         i = end + markerLen;
         continue;
       }

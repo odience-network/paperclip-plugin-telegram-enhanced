@@ -279,6 +279,22 @@ describe("splitTelegramMessage", () => {
       .split(" ");
     expect(reconstructed).toEqual(words);
   });
+
+  it("reopens a long MarkdownV2 pre block with a blank language line, so the continuation's first line isn't swallowed as a language tag", () => {
+    const words = Array.from({ length: 1200 }, (_, i) => `line${i}`);
+    const text = "```" + words.join(" ") + "```";
+
+    const chunks = splitTelegramMessage(text, "MarkdownV2");
+
+    expect(chunks.length).toBeGreaterThan(1);
+    // Telegram reads the text right after an opening ``` up to the first "\n" as
+    // the (invisible) language tag. A reopened fence must put that "\n" in
+    // immediately, before any real content, or the first line of the
+    // continuation silently disappears from the rendered message.
+    for (const chunk of chunks.slice(1)) {
+      expect(chunk.startsWith("```\n")).toBe(true);
+    }
+  });
 });
 
 describe("sendMessageWithResult", () => {
