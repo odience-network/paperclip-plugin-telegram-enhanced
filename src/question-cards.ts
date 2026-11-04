@@ -72,7 +72,6 @@ export type InteractionAnswer = { questionId: string; optionIds: string[]; other
 type InlineButton = { text: string; callback_data?: string; url?: string };
 export type RenderedCard = { text: string; keyboard: InlineButton[][] };
 
-const MAX_OPTIONS_PER_QUESTION = 12;
 const EXCERPT_MAX = 500;
 
 // --- Parsing --------------------------------------------------------------
@@ -87,6 +86,27 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function parseOptions(raw: unknown): CardOption[] {
+  const options: CardOption[] = [];
+  for (const rawOption of Array.isArray(raw) ? raw : []) {
+    const o = record(rawOption);
+    const optionId = str(o.id);
+    if (!optionId) continue;
+    options.push({
+      id: optionId,
+      // A free-text option may come without a label; show something tappable.
+      label: str(o.label) ?? (o.freeText === true ? "Other (type answer)" : optionId),
+      ...(o.freeText === true ? { freeText: true } : {}),
+    });
+  }
+  return options;
+}
+
+/**
+ * Legacy shape: `payload.questions[]` with a `selectionMode` per question.
+ * Used only when `payload.questionSet` is absent (older interactions, or a
+ * caller that never sent the current schema).
+ */
 export function parseCardQuestions(payload: unknown): CardQuestion[] {
   const raw = record(payload).questions;
   if (!Array.isArray(raw)) return [];
@@ -96,25 +116,44 @@ export function parseCardQuestions(payload: unknown): CardQuestion[] {
     const id = str(q.id);
     const prompt = str(q.prompt);
     if (!id || !prompt) continue;
-    const options: CardOption[] = [];
-    for (const rawOption of Array.isArray(q.options) ? q.options : []) {
-      const o = record(rawOption);
-      const optionId = str(o.id);
-      if (!optionId) continue;
-      options.push({
-        id: optionId,
-        // A free-text option may come without a label; show something tappable.
-        label: str(o.label) ?? (o.freeText === true ? "Other (type answer)" : optionId),
-        ...(o.freeText === true ? { freeText: true } : {}),
-      });
-    }
     questions.push({
       id,
       prompt,
       ...(str(q.helpText) ? { helpText: str(q.helpText) } : {}),
       selectionMode: q.selectionMode === "multi" ? "multi" : "single",
       required: q.required !== false,
-      options,
+      options: parseOptions(q.options),
+    });
+  }
+  return questions;
+}
+
+/**
+ * Current schema (`paperclip.question_set.v1`): `payload.questionSet.questions[]`,
+ * each with an `answerMode` of `single_select` / `multi_select` / `text`. A
+ * `text` question has no options - it renders and answers exactly like a
+ * select question with none (free-text reply fills it). Returns null when
+ * `questionSet` is absent so the caller can fall back to the legacy shape.
+ */
+export function parseQuestionSetQuestions(payload: unknown): CardQuestion[] | null {
+  const questionSet = record(payload).questionSet;
+  if (!questionSet || typeof questionSet !== "object") return null;
+  const raw = record(questionSet).questions;
+  if (!Array.isArray(raw)) return null;
+  const questions: CardQuestion[] = [];
+  for (const entry of raw) {
+    const q = record(entry);
+    const id = str(q.id);
+    const prompt = str(q.prompt);
+    if (!id || !prompt) continue;
+    const isText = q.answerMode === "text";
+    questions.push({
+      id,
+      prompt,
+      ...(str(q.helpText) ? { helpText: str(q.helpText) } : {}),
+      selectionMode: q.answerMode === "multi_select" ? "multi" : "single",
+      required: q.required !== false,
+      options: isText ? [] : parseOptions(q.options),
     });
   }
   return questions;
@@ -147,7 +186,7 @@ export function cardFromInteraction(
   };
 
   if (kind === "ask_user_questions") {
-    card.questions = parseCardQuestions(payload);
+    card.questions = parseQuestionSetQuestions(payload) ?? parseCardQuestions(payload);
     const submitLabel = str(payload.submitLabel);
     if (submitLabel) card.submitLabel = submitLabel;
   } else {
@@ -391,7 +430,7 @@ export type RenderLinks = {
   issueButton?: { text: string; url: string } | null;
 };
 
-function header(card: QuestionCard, links: RenderLinks): string[] {
+function header(card: QuestionCard, links: RenderLinks, opts: { compact?: boolean } = {}): string[] {
   const c = card.context;
   const who = c.agentName ? `${c.agentName} asks` : "An agent asks";
   const icon = card.kind === "request_confirmation" ? "🟡" : "❓";
@@ -401,21 +440,29 @@ function header(card: QuestionCard, links: RenderLinks): string[] {
   lines.push(where.join(" "));
   if (c.projectName) lines.push(`${esc("📁")} ${esc(c.projectName)}`);
   // A confirmation carries its own summary in `details`; the agent's comment would only repeat it.
-  const showExcerpt = c.excerpt && !(card.kind === "request_confirmation" && card.confirm?.details);
+  const showExcerpt = !opts.compact && c.excerpt && !(card.kind === "request_confirmation" && card.confirm?.details);
   if (showExcerpt) {
     lines.push("", expandableQuote(`${esc("💬")} ${agentMarkdownToV2(truncate(c.excerpt!, EXCERPT_MAX))}`));
   }
   return lines;
 }
 
-/** Render the card body and keyboard for its current answer state. */
-export function renderCard(card: QuestionCard, links: RenderLinks): RenderedCard {
-  const lines = header(card, links);
+/** Telegram rejects a message text over this many characters. */
+export const TELEGRAM_TEXT_LIMIT = 4096;
+
+/**
+ * Build the card body and keyboard. Every question and option always gets a
+ * button - this never drops one. `compact` drops narrative text (the agent's
+ * excerpt, per-question help text, confirmation details) to make room; it
+ * never touches the answerable surface.
+ */
+function renderCardPass(card: QuestionCard, links: RenderLinks, compact: boolean): RenderedCard {
+  const lines = header(card, links, { compact });
   const keyboard: InlineButton[][] = [];
 
   if (card.kind === "request_confirmation" && card.confirm) {
     lines.push("", bold(plainInline(card.confirm.prompt)));
-    if (card.confirm.details) {
+    if (card.confirm.details && !compact) {
       lines.push(expandableQuote(agentMarkdownToV2(truncate(card.confirm.details, DETAILS_MAX))));
     }
     lines.push("", `_${esc("Tap a button, or reply with a reason to reject.")}_`);
@@ -430,13 +477,16 @@ export function renderCard(card: QuestionCard, links: RenderLinks): RenderedCard
       const label = numbered ? `${qi + 1}. ${q.prompt}` : q.prompt;
       const mode = q.selectionMode === "multi" ? " (choose any)" : "";
       lines.push("", `${bold(plainInline(label))}${esc(mode)}`);
-      if (q.helpText) lines.push(agentMarkdownToV2(truncate(q.helpText, 300)));
+      if (q.helpText && !compact) lines.push(agentMarkdownToV2(truncate(q.helpText, 300)));
       const typed = card.texts[q.id];
-      if (typed) lines.push(`${esc("✍️")} ${esc(truncate(typed, 300))}`);
+      if (typed) lines.push(`${esc("✍️")} ${esc(truncate(typed, compact ? 80 : 300))}`);
       if (q.options.length === 0) lines.push(`_${esc("Reply to this message with your answer.")}_`);
 
+      // Every option becomes a button - never capped, so a long list is never
+      // silently dropped. Telegram's own keyboard/text limits are handled by
+      // the overflow fallback in renderCard, not by hiding options here.
       const chosen = new Set(card.selections[q.id] ?? []);
-      q.options.slice(0, MAX_OPTIONS_PER_QUESTION).forEach((o, oi) => {
+      q.options.forEach((o, oi) => {
         const mark = chosen.has(o.id) ? "✅ " : o.freeText ? "✍️ " : "";
         const prefix = numbered ? `${qi + 1}: ` : "";
         keyboard.push([{ text: `${mark}${prefix}${buttonLabel(o.label)}`, callback_data: optionCallbackData(qi, oi) }]);
@@ -450,6 +500,31 @@ export function renderCard(card: QuestionCard, links: RenderLinks): RenderedCard
 
   if (links.issueButton) keyboard.push([links.issueButton]);
   return { text: lines.join("\n"), keyboard };
+}
+
+/**
+ * Render the card body and keyboard for its current answer state.
+ *
+ * A card with many questions or a long agent comment can exceed Telegram's
+ * 4096-character message limit. Rather than silently truncating a question
+ * or option off the end, this drops narrative text first (compact pass),
+ * and if that is still not enough, hard-truncates the text while keeping
+ * every button and adding an explicit "open in Paperclip" link so nothing
+ * answerable is ever lost - only the prose around it is shortened.
+ */
+export function renderCard(card: QuestionCard, links: RenderLinks): RenderedCard {
+  const full = renderCardPass(card, links, false);
+  if (full.text.length <= TELEGRAM_TEXT_LIMIT) return full;
+
+  const compact = renderCardPass(card, links, true);
+  if (compact.text.length <= TELEGRAM_TEXT_LIMIT) return compact;
+
+  // The issue link (when configured) is already in `compact.keyboard` via
+  // `header`/the trailing `links.issueButton` row; every question/option
+  // button is intact too - only the narrative text above is shortened.
+  const overflowNote = `\n\n_${esc(`Open in Paperclip to see all ${card.questions.length} questions.`)}_`;
+  const text = `${truncate(compact.text, TELEGRAM_TEXT_LIMIT - overflowNote.length)}${overflowNote}`;
+  return { text, keyboard: compact.keyboard };
 }
 
 /** Plain summary of what was answered, for the closed card. */
