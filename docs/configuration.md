@@ -113,6 +113,22 @@ sender is told once a day that their replies are not being attributed.
 | `cfAccessClientIdRef` | — | Secret reference to a Cloudflare Access **service-token Client ID**. Sent as the `CF-Access-Client-Id` header on plugin → board calls so approvals/`/approve` work when the board is behind Cloudflare Access. Only used when both this and the secret ref are set. See [Cloudflare Access](cloudflare-access.md). |
 | `cfAccessClientSecretRef` | — | Secret reference to a Cloudflare Access **service-token Client Secret**. Sent as the `CF-Access-Client-Secret` header. Leave both blank when the board is not behind Access. |
 
+## Agent questions (question cards)
+
+Agent questions (`ask_user_questions`) and confirmations (`request_confirmation`) arrive as interactive cards. See [Notifications -> Agent questions](notifications.md#agent-questions). Answering needs [board access](#board-access-approvals).
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `questionReminderMinutes` | `120` | Re-ping an unanswered card every N minutes. `0` disables reminders. |
+| `questionReminderMaxCount` | `2` | Maximum reminders per card. |
+
+## Tasks from plain messages
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `createTasksFromMessages` | `false` | A plain (non-reply, non-command) message in a **private** chat linked with `/connect` becomes a task. Replying to the "Task created" confirmation continues on that task. |
+| `intakeAgentId` | - | Agent that receives those tasks (and `/create` tasks). Empty falls back to the agent with role `ceo`, then to the top of the org chart (an agent that reports to nobody). |
+
 ## Human-in-the-loop escalation
 
 | Setting | Default | Description |

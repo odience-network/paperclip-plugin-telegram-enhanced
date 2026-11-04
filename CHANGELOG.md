@@ -6,15 +6,36 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.4.8] — 2026-11-04
+## [0.5.1] — 2026-11-04
 
-Follow-up to 0.4.7's review: a failed chunk after the first could be reported
-as a clean success, long HTML/MarkdownV2 formatting elements split across
-chunks broke Telegram's parser, and an entity longer than one chunk was
-hard-cut mid-word (ODIAA-2701).
+Notifications and `send_to_telegram` silently cut long text instead of delivering
+it, and a failed send told the agent nothing about why (ODIAA-2701).
 
 ### Fixed
 
+- **Long messages were truncated or rejected instead of delivered (ODIAA-2701).**
+  `sendMessage` sent `text` as-is; anything over Telegram's hard 4096-character
+  limit was rejected outright, and the agent only saw a bare
+  `telegram_send_failed`. `sendMessage` (and `send_to_telegram`) now split long
+  text across multiple messages — on paragraph, then line, then word boundaries —
+  never inside an HTML tag/entity or a MarkdownV2 escape/entity. The inline
+  keyboard, if any, goes on the last chunk only; the original reply-to/topic goes
+  on the first chunk only, and later chunks reply to the previous chunk so they
+  thread together.
+- **Formatters truncated notification text at small, hardcoded limits with no way
+  to read the rest (ODIAA-2701).** Issue-created descriptions, done/blocked
+  comments, board mentions, approval descriptions, and agent error messages were
+  each cut at a different fixed length (200-500 chars) with no "read more" path.
+  They now share one much higher, overridable limit
+  (`formatters.DEFAULT_TEXT_SNIPPET_LIMIT`, 3500 chars), and a cut snippet gets a
+  **Read more** link to the issue (or the approval's first linked issue) instead
+  of just trailing off. (Interaction-card formatting is unchanged here; it's
+  tracked separately.)
+- **A failed Telegram send told the agent nothing about why (ODIAA-2701).**
+  `send_to_telegram` failures now carry Telegram's own `description` in the
+  returned error message (e.g. `telegram_send_failed: Bad Request: ...`) instead
+  of a bare "Telegram send failed.", and the plugin's log line puts that reason
+  in the message text itself rather than only in `meta.error`.
 - **A chunk failure after the first was reported as a plain success
   (ODIAA-2701).** `sendMessageWithResult` returned the first chunk's message id
   with no indication that a later chunk failed, so `send_to_telegram` (which only
@@ -45,37 +66,6 @@ hard-cut mid-word (ODIAA-2701).
   this issue exists to stop. The fence now reopens as ` ```\n ` so the blank
   language line is explicit and the real content starts on its own line.
 
-## [0.4.7] — 2026-11-04
-
-Notifications and `send_to_telegram` silently cut long text instead of delivering
-it, and a failed send told the agent nothing about why (ODIAA-2701).
-
-### Fixed
-
-- **Long messages were truncated or rejected instead of delivered (ODIAA-2701).**
-  `sendMessage` sent `text` as-is; anything over Telegram's hard 4096-character
-  limit was rejected outright, and the agent only saw a bare
-  `telegram_send_failed`. `sendMessage` (and `send_to_telegram`) now split long
-  text across multiple messages — on paragraph, then line, then word boundaries —
-  never inside an HTML tag/entity or a MarkdownV2 escape/entity. The inline
-  keyboard, if any, goes on the last chunk only; the original reply-to/topic goes
-  on the first chunk only, and later chunks reply to the previous chunk so they
-  thread together.
-- **Formatters truncated notification text at small, hardcoded limits with no way
-  to read the rest (ODIAA-2701).** Issue-created descriptions, done/blocked
-  comments, board mentions, approval descriptions, and agent error messages were
-  each cut at a different fixed length (200-500 chars) with no "read more" path.
-  They now share one much higher, overridable limit
-  (`formatters.DEFAULT_TEXT_SNIPPET_LIMIT`, 3500 chars), and a cut snippet gets a
-  **Read more** link to the issue (or the approval's first linked issue) instead
-  of just trailing off. (Interaction-card formatting is unchanged here; it's
-  tracked separately.)
-- **A failed Telegram send told the agent nothing about why (ODIAA-2701).**
-  `send_to_telegram` failures now carry Telegram's own `description` in the
-  returned error message (e.g. `telegram_send_failed: Bad Request: ...`) instead
-  of a bare "Telegram send failed.", and the plugin's log line puts that reason
-  in the message text itself rather than only in `meta.error`.
-
 ### Coordination
 
 - PR [#33](https://github.com/odience-network/paperclip-plugin-telegram-enhanced/pull/33)
@@ -86,6 +76,76 @@ it, and a failed send told the agent nothing about why (ODIAA-2701).
   rebase on top of this, drop its own copy, and import this one. Recommend
   merging #33 as-is afterward — its capped summary is still the better UX for
   `/agents`, distinct from (and compatible with) this PR's splitter.
+
+## [0.5.0] — 2026-11-04
+
+Agent questions now reach Telegram and can be answered there like a chat.
+
+### ⚠️ Upgrade note
+
+This release adds the **`issue.interactions.read`** capability (to look up an
+issue's pending interactions and settle its question cards). **Existing
+installs move to `upgrade_pending`.** A board member must approve the new
+capability — this step is **board-only**; an agent cannot grant it to itself.
+Until approved, the plugin keeps running on its previously-granted
+capabilities and agent questions do not reach Telegram.
+
+### Fixed
+
+- **Agent questions and confirmations were never delivered.** The plugin waited
+  for an `issue.interaction.created` event that Paperclip does not emit to
+  plugins (it is not in `PLUGIN_EVENT_TYPES`, and no activity action maps to
+  it). Cards are now delivered when the asking agent's run ends, using
+  `issues.listInteractions` (new `issue.interactions.read` capability). The
+  old subscription stays for hosts that emit the event. **Push delivery still
+  depends on that host change**, which has not shipped: until it does, a card
+  arrives when the asking agent's run ends, or within the sync job's reach for
+  an already-delivered card - not the instant a board-created interaction is
+  created.
+- **Interaction answers failed on co-located boards.** Calls to
+  `/api/issues/:id/interactions/...` went through `ctx.http`, which refuses
+  loopback addresses. They now use the same loopback rule as approvals.
+- **Question parsing only read the legacy `payload.questions[]` shape.** A
+  real interaction's primary schema is `payload.questionSet.questions[]`
+  (`answerMode`: `single_select` / `multi_select` / `text`). Cards now read
+  `questionSet` first and fall back to the legacy shape only when it is
+  absent, so text questions render and can be answered by a plain reply.
+- **The board API token was read from the instance-wide config, not the
+  interaction's own company.** On a multi-company instance this silently used
+  whichever company's settings the host replayed last - the callback-query,
+  `/approve`, `/pending`, `/status`, question-card and legacy interaction-reply
+  paths are now all scoped to the event/card's own `companyId`.
+- **A missing board token was only a `warn` log.** It is now reported per
+  company in the plugin's health check and in `/status`, so a question/
+  confirmation that cannot be answered from Telegram is visible, not silent.
+- **A question card capped options at 12 per question and truncated agent
+  text with no visible sign anything was cut.** A card now keeps every
+  question and option as a button; if the card still will not fit in
+  Telegram's 4096-character message limit, narrative text (the agent's
+  comment, help text) is dropped first, and only as a last resort is the text
+  hard-truncated with an explicit "Open in Paperclip to see all N questions"
+  link - a question or option is never silently dropped.
+- `/create` left tasks unassigned when no agent had the literal role `ceo`; it
+  now falls back to the top-level agent.
+
+### Added
+
+- **Question cards:** who asks, task, project and the agent's comment as
+  context; options as buttons (one tap for single choice, toggles plus
+  Send for multi-select and multi-question cards); free-text answers by plain
+  reply; confirmations by button or reply.
+- Cards update when settled in the board, withdrawn or expired, and unanswered
+  cards are re-pinged (`questionReminderMinutes`, `questionReminderMaxCount`,
+  job `sync-question-cards`).
+- `/pending` lists open question cards and pending approvals.
+- `createTasksFromMessages` + `intakeAgentId`: a plain private message becomes
+  a task, and replying to the confirmation continues on it. `/create` keeps
+  the first line as title and the full text as description.
+
+### Removed
+
+- `formatInteractionCreated` (replaced by question cards; its
+  `question_id=option_id` reply syntax still works).
 
 ## [0.4.6] — 2026-09-05
 

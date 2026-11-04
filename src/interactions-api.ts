@@ -42,7 +42,7 @@ export type RespondInteractionInput = {
   action: InteractionAction;
   boardApiToken: string;
   reason?: string;
-  answers?: Array<{ questionId: string; optionIds: string[] }>;
+  answers?: Array<{ questionId: string; optionIds: string[]; otherText?: string }>;
 };
 
 export type InteractionRecord = Record<string, unknown>;

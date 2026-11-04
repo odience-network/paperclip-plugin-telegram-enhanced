@@ -35,16 +35,33 @@ import {
   formatIssueBlocked,
   formatBoardMention,
   formatResolvedDecision,
-  formatInteractionCreated,
+  issueButton,
+  issueLink,
   type IssueLinksOpts,
 } from "./formatters.js";
 import {
-  fetchInteraction,
   respondInteraction,
   isAlreadyResolvedInteractionError,
 } from "./interactions-api.js";
 import {
+  cardFromInteraction,
+  addOpenCard,
+  saveCard,
+  renderCard,
+  parseCardCallback,
+  type CardContext,
+} from "./question-cards.js";
+import {
+  awaitingCardRef,
+  handleCardCallback,
+  handleCardText,
+  openCardsForChat,
+  syncCards,
+  type CardFlowDeps,
+} from "./question-card-flow.js";
+import {
   handleCommand,
+  handleCreate,
   resolveNotificationThreadId,
   BOT_COMMANDS,
   type NotificationFlags,
@@ -74,6 +91,7 @@ import { validateSecretRefFields } from "./secret-ref-validation.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
 import { buildDeliveryKey, withIdempotentDelivery } from "./interaction-delivery.js";
 import {
+  resolveSecretRef,
   resolveStartupTelegramBotToken,
   type TelegramRuntimeHealth,
 } from "./runtime-token.js";
@@ -98,6 +116,7 @@ import {
   buildPaperclipAuthHeaders,
   fetchPaperclipApi,
   isAlreadyResolvedConflict,
+  paperclipHttp,
   type CfAccessHeaders,
 } from "./paperclip-api.js";
 
@@ -159,6 +178,10 @@ export type TelegramConfig = {
   escalationTimeoutMs: number;
   escalationDefaultAction: "defer" | "auto_reply" | "close";
   escalationHoldMessage: string;
+  questionReminderMinutes: number;
+  questionReminderMaxCount: number;
+  createTasksFromMessages: boolean;
+  intakeAgentId: string;
   // Phase 3: Media Pipeline
   briefAgentId: string;
   briefAgentChatIds: string[];
@@ -473,6 +496,13 @@ export function getBotConnectionRegistration(
 // (upstream mvanhorn@8a0e579) and ./runtime-token.ts.
 let runtimeHealth: TelegramRuntimeHealth = { status: "ok" };
 
+// Companies for which the last board-API-token lookup (ODIAA-2699) came back
+// empty. A missing token silently stops interaction cards (and `/approve`)
+// from being answerable, so it must be visible in onHealth()/`/status` — not
+// only a `warn` log nobody is watching. Updated by every resolveBoardApiToken
+// call; cleared the moment that company resolves a token again.
+const boardTokenMissingByCompany = new Set<string>();
+
 // Bridge from the definition-level `onConfigChanged` hook into the live worker
 // closure built by `setup()`. The hook is a sibling of `setup` on the plugin
 // definition, so it has no access to setup's `config`/`token`/`baseUrl`
@@ -513,7 +543,18 @@ async function resolveBoardApiToken(
   companyId?: string | null,
 ): Promise<string | undefined> {
   const boardAccessState = await loadBoardAccessState(ctx);
-  const candidates: Array<{ source: string; ref: string }> = [];
+  const effectiveCompanyId = companyId ?? boardAccessState.companyId;
+  const candidates: Array<{ source: string; ref: unknown; configPath?: string }> = [];
+
+  // The config ref goes first: on current hosts a secret only resolves for a
+  // plugin when plugin config bound it (at save), which the state ref never is.
+  if (config.paperclipBoardApiTokenRef) {
+    candidates.push({
+      source: "config",
+      ref: config.paperclipBoardApiTokenRef,
+      configPath: "paperclipBoardApiTokenRef",
+    });
+  }
 
   if (
     boardAccessState.paperclipBoardApiTokenRef &&
@@ -525,19 +566,18 @@ async function resolveBoardApiToken(
     });
   }
 
-  if (config.paperclipBoardApiTokenRef) {
-    candidates.push({
-      source: "config",
-      ref: config.paperclipBoardApiTokenRef,
-    });
-  }
-
   const seen = new Set<string>();
   for (const candidate of candidates) {
-    if (seen.has(candidate.ref)) continue;
-    seen.add(candidate.ref);
+    const key = JSON.stringify(candidate.ref);
+    if (seen.has(key)) continue;
+    seen.add(key);
     try {
-      return await ctx.secrets.resolve(candidate.ref);
+      const token = await resolveSecretRef(ctx, candidate.ref, {
+        companyId: effectiveCompanyId,
+        ...(candidate.configPath ? { configPath: candidate.configPath } : {}),
+      });
+      if (effectiveCompanyId) boardTokenMissingByCompany.delete(effectiveCompanyId);
+      return token;
     } catch (err) {
       ctx.logger.warn("Failed to resolve board API token secret", {
         source: candidate.source,
@@ -547,6 +587,7 @@ async function resolveBoardApiToken(
     }
   }
 
+  if (effectiveCompanyId) boardTokenMissingByCompany.add(effectiveCompanyId);
   return undefined;
 }
 
@@ -1143,6 +1184,16 @@ export async function sendToTelegramTool(
     );
   }
 
+  // A message about a task is answerable: replying to it comments on the task
+  // and wakes its agent, like replying to any other task notification.
+  const aboutIssueId = asNonEmptyString(p.issueId);
+  if (aboutIssueId && result.messageId) {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `msg_${chatId}_${result.messageId}` },
+      { entityId: aboutIssueId, entityType: "issue", companyId: runCtx.companyId, eventType: "agent.message" },
+    ).catch(() => undefined);
+  }
+
   await ctx.activity.log({
     companyId: runCtx.companyId,
     message: "Agent sent content to Telegram",
@@ -1488,10 +1539,10 @@ export const plugin = definePlugin({
       overrideChatId?: string,
       overrideTopicId?: string | Partial<StoredMessageMapping>,
       deliveryKey?: string,
-    ) => {
+    ): Promise<{ chatId: string; messageId: number } | null> => {
       // No bot connected yet — nothing to deliver to. Avoids calling the
       // Telegram API with an empty token before Settings → Bot Connection.
-      if (!token) return;
+      if (!token) return null;
       // overrideTopicId doubles as mappingOverride when it's an object
       const mappingOverride: Partial<StoredMessageMapping> | undefined =
         overrideTopicId && typeof overrideTopicId === "object" ? overrideTopicId : undefined;
@@ -1505,7 +1556,7 @@ export const plugin = definePlugin({
         event.companyId,
         overrideChatId || eventConfig.defaultChatId,
       );
-      if (!chatId) return;
+      if (!chatId) return null;
       const linksOpts = await resolveIssueLinksOpts(event.companyId);
       const msg = formatter(event, linksOpts);
 
@@ -1608,6 +1659,7 @@ export const plugin = definePlugin({
           }
         }
       }
+      return messageId ? { chatId, messageId } : null;
     };
 
     // Every subscription below registers unconditionally and re-checks its
@@ -1899,157 +1951,251 @@ export const plugin = definePlugin({
       await notify(event, formatBoardMention);
     });
 
-    // --- Decision interactions (TWX-46, tue-Jonas/paperclip-plugin-telegram) ---
+    // --- Decision interactions: question cards ---
+    //
+    // Paperclip hosts up to at least 2026.1023 never forward interaction
+    // creation to plugins: it is not in PLUGIN_EVENT_TYPES and no activity
+    // action maps to a plugin event. An agent raises a question inside a run,
+    // so the end of that run is a reliable moment to look - every agent.run.*
+    // terminal event names the run's issue. `issue.interaction.created` stays
+    // subscribed for hosts that do emit it. Delivery is idempotent per
+    // interaction, so overlapping triggers still send a single card.
+    const CARD_KINDS = new Set(["ask_user_questions", "request_confirmation"]);
+    const deliveredKey = (interactionId: string) => ({
+      scopeKind: "instance" as const,
+      stateKey: `qcard_delivered_${interactionId}`,
+    });
 
-    // Subscribe to `issue.interaction.created` events and render decision cards
-    // (request_confirmation, ask_user_questions) with inline Accept/Reject buttons.
-    ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
-      const payload = event.payload as Record<string, unknown>;
-      const issueId = String(event.entityId ?? "");
-      if (!issueId) return;
-      const interactionId = String(payload.interactionId ?? "");
-      const interactionKind = String(payload.interactionKind ?? "");
-      if (!interactionId) return;
-      // Only notify for confirmation-like interactions; ignore other kinds for now.
-      if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
+    async function buildCardContext(
+      companyId: string,
+      issue: Issue | null,
+      interaction: Record<string, unknown>,
+    ): Promise<CardContext> {
+      const context: CardContext = {
+        issueIdentifier: issue?.identifier ?? String(interaction.issueId ?? ""),
+        ...(issue?.title ? { issueTitle: issue.title } : {}),
+      };
+      const agentId = typeof interaction.createdByAgentId === "string" ? interaction.createdByAgentId : null;
+      try {
+        if (agentId) {
+          const agent = await ctx.agents.get(agentId, companyId);
+          if (agent?.name) context.agentName = agent.name;
+        }
+      } catch { /* best effort */ }
+      try {
+        const projectId = (issue as unknown as { projectId?: string | null } | null)?.projectId;
+        if (projectId) {
+          const project = await ctx.projects.get(projectId, companyId);
+          if (project?.name) context.projectName = project.name;
+        }
+      } catch { /* best effort */ }
+      try {
+        if (issue) {
+          // "Why are you asking": the comment the question came with, else the
+          // asking agent's latest comment on the task.
+          const comments = await ctx.issues.listComments(issue.id, companyId);
+          const sourceId = typeof interaction.sourceCommentId === "string" ? interaction.sourceCommentId : null;
+          const source =
+            (sourceId ? comments.find((c) => c.id === sourceId) : undefined) ??
+            comments
+              .filter((c) => agentId !== null && c.authorAgentId === agentId)
+              .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+          if (source?.body) context.excerpt = source.body;
+        }
+      } catch { /* best effort */ }
+      return context;
+    }
 
-      // Board token required to fetch interaction details.
-      const boardApiToken = await resolveBoardApiToken(ctx, config);
-      if (!boardApiToken) {
-        ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
+    // The host can deliver the same run-end event twice within milliseconds;
+    // both handlers would pass the persisted "delivered" check before either
+    // writes it. One worker process serves the plugin, so an in-memory claim
+    // taken before the first await is enough.
+    const deliveringInteractions = new Set<string>();
+
+    async function deliverInteraction(companyId: string, interaction: Record<string, unknown>): Promise<void> {
+      const interactionId = String(interaction.id ?? "");
+      if (!interactionId || deliveringInteractions.has(interactionId)) return;
+      deliveringInteractions.add(interactionId);
+      try {
+        await deliverInteractionUnlocked(companyId, interaction);
+      } finally {
+        deliveringInteractions.delete(interactionId);
+      }
+    }
+
+    async function deliverInteractionUnlocked(companyId: string, interaction: Record<string, unknown>): Promise<void> {
+      const issueId = String(interaction.issueId ?? "");
+      const interactionId = String(interaction.id ?? "");
+      const interactionKind = String(interaction.kind ?? "");
+      if (!token || !issueId || !interactionId || !CARD_KINDS.has(interactionKind)) return;
+      if (interaction.status !== undefined && interaction.status !== "pending") return;
+      if (await ctx.state.get(deliveredKey(interactionId))) return;
+
+      const issue = await ctx.issues.get(issueId, companyId).catch(() => null);
+      const card = cardFromInteraction(
+        { ...interaction, companyId },
+        await buildCardContext(companyId, issue, interaction),
+      );
+      if (!card) return;
+
+      // User-scoped routing (ODIAA-938 / TWX-525): when the interaction names a
+      // target user and that user has a Telegram chat mapping, route the card to
+      // the owner's chat and stamp `ownerUserId` so the callback/reply guards can
+      // verify the actor. Owner resolution (TWX-940 / ODIAA-937): the interaction
+      // record/payload first, then the issue assignee. Decisions with no target
+      // keep the broadcast to the shared approvals chat.
+      const target = resolveInteractionTargetUserId({
+        eventPayload: {},
+        interactionRecord: interaction,
+        interactionPayload:
+          interaction.payload && typeof interaction.payload === "object"
+            ? (interaction.payload as Record<string, unknown>)
+            : {},
+        issueAssigneeUserId:
+          (issue as unknown as { assigneeUserId?: string | null } | null)?.assigneeUserId ?? null,
+      });
+      const targetUserId = target?.userId ?? null;
+      const eventConfig = configFor(companyId);
+      const { ownerUserId, targetChatId, needsSetupNotice } =
+        resolveInteractionRouting(targetUserId, eventConfig.userChatMappings);
+
+      if (needsSetupNotice) {
+        // Owner is known but has no Telegram chat configured. Never broadcast an
+        // actionable card into the shared chat - that would leak the decision and
+        // let anyone there act on it (ODIAA-942 Finding 4, fail-closed).
+        ctx.logger.warn("Interaction owner has no Telegram chat mapping; sending admin setup notice", {
           issueId,
           interactionId,
           interactionKind,
+          targetUserId,
+          targetSource: target?.source,
         });
+        const noticeChatId = await resolveChat(
+          ctx,
+          companyId,
+          eventConfig.approvalsChatId || eventConfig.defaultChatId,
+        );
+        if (noticeChatId) {
+          await sendMessage(
+            ctx,
+            token,
+            noticeChatId,
+            escapeMarkdownV2(
+              `⚠️ Decision needed for ${card.context.issueIdentifier} but its owner has no Telegram chat configured. `
+              + `Add a userChatMappings entry for this user and act from the Paperclip board.`,
+            ),
+            { parseMode: "MarkdownV2" },
+          );
+        }
+        await ctx.state.set(deliveredKey(interactionId), { at: Date.now(), notice: true });
         return;
       }
 
-      try {
-        const [issue, interaction] = await Promise.all([
-          ctx.issues.get(issueId, event.companyId),
-          fetchInteraction(ctx.http, {
-            baseUrl: baseUrl.replace(/\/$/, ""),
-            issueId,
-            interactionId,
-            boardApiToken,
-          }),
-        ]);
-        if (!interaction) return;
-        payload.interaction = interaction;
-        payload.issueIdentifier = issue?.identifier ?? issueId;
-        payload.issueTitle = issue?.title ?? null;
-        payload.interactionKind = interactionKind;
+      const linksOpts = await resolveIssueLinksOpts(companyId);
+      card.links = {
+        issueMd: issueLink(card.context.issueIdentifier, linksOpts),
+        issueButton: issueButton(card.context.issueIdentifier, linksOpts),
+      };
+      if (ownerUserId) card.ownerUserId = ownerUserId;
+      const rendered = renderCard(card, card.links);
 
-        // Extract questions for ask_user_questions so the callback handler
-        // can validate and map answers by question ID.
-        const interactionPayload = (interaction.payload && typeof interaction.payload === "object")
-          ? interaction.payload as Record<string, unknown>
-          : {};
-        const interactionQuestions: StoredMessageMapping["interactionQuestions"] =
-          interactionKind === "ask_user_questions" && Array.isArray(interactionPayload.questions)
-            ? (interactionPayload.questions as Array<Record<string, unknown>>)
-                .map((q) => {
-                  const id = typeof q.id === "string" ? q.id : "";
-                  const selectionMode: "single" | "multi" = q.selectionMode === "multi" ? "multi" : "single";
-                  const options = Array.isArray(q.options)
-                    ? (q.options as Array<Record<string, unknown>>)
-                        .filter((o) => typeof o.id === "string" && typeof o.label === "string")
-                        .map((o) => ({ id: o.id as string, label: o.label as string }))
-                    : [];
-                  return id && options.length > 0 ? { id, selectionMode, options } : null;
-                })
-                .filter((q): q is NonNullable<typeof q> => q !== null)
-            : undefined;
-
-        // User-scoped routing (ODIAA-938 / TWX-525): when the interaction names a
-        // target user and that user has a Telegram chat mapping, route the decision
-        // card to the owner's chat and stamp `ownerUserId` so the callback/native
-        // guards can verify the actor. Decisions with no target keep the legacy
-        // broadcast to the shared approvals chat.
-        // Identify the decision owner (TWX-940 / ODIAA-937): event target first,
-        // then the interaction record/payload, and finally the issue assignee so a
-        // card addressed to a specific person is never broadcast to the shared
-        // approvals chat just because the host event omitted `targetUserId`.
-        const interactionRecord = interaction as Record<string, unknown>;
-        const target = resolveInteractionTargetUserId({
-          eventPayload: payload,
-          interactionRecord,
-          interactionPayload,
-          issueAssigneeUserId:
-            (issue as unknown as { assigneeUserId?: string | null } | null)?.assigneeUserId ?? null,
-        });
-        const targetUserId = target?.userId ?? null;
-
-        const eventConfig = configFor(event.companyId);
-        const { ownerUserId, targetChatId, needsSetupNotice } =
-          resolveInteractionRouting(targetUserId, eventConfig.userChatMappings);
-
-        if (targetChatId) {
-          ctx.logger.info("Routing interaction to identified owner chat", {
-            issueId,
-            interactionId,
-            interactionKind,
-            targetUserId,
-            targetSource: target?.source,
-          });
-        }
-
-        if (needsSetupNotice) {
-          // Owner is known but has no Telegram chat configured. Do NOT fall back to
-          // broadcasting an actionable decision card into the shared approvals chat —
-          // that would both leak the decision and let anyone there act on it. Send a
-          // non-actionable admin setup notice instead and stop (ODIAA-942 Finding 4,
-          // fail-closed). The board remains the way to act until a mapping exists.
-          ctx.logger.warn("Interaction owner has no Telegram chat mapping; sending admin setup notice", {
-            issueId,
-            interactionId,
-            interactionKind,
-            targetUserId,
-            targetSource: target?.source,
-          });
-          const noticeChatId = await resolveChat(
-            ctx,
-            event.companyId,
-            eventConfig.approvalsChatId || eventConfig.defaultChatId,
-          );
-          if (noticeChatId) {
-            const ident = issue?.identifier ?? issueId;
-            await sendMessage(
-              ctx,
-              token,
-              noticeChatId,
-              escapeMarkdownV2(
-                `⚠️ Decision needed for ${ident} but its owner has no Telegram chat configured. `
-                + `Add a userChatMappings entry for this user and act from the Paperclip board.`,
-              ),
-              { parseMode: "MarkdownV2" },
-            );
-          }
-          return;
-        }
-
-        await notify(
-          event,
-          formatInteractionCreated,
-          targetChatId ?? (eventConfig.approvalsChatId || eventConfig.defaultChatId),
-          {
-            entityType: "interaction",
-            issueId,
-            issueIdentifier: issue?.identifier ?? issueId,
-            interactionId,
-            interactionKind,
-            ...(interactionQuestions ? { interactionQuestions } : {}),
-            ...(ownerUserId ? { ownerUserId } : {}),
-          },
-        );
-      } catch (err) {
-        ctx.logger.error("Failed to dispatch interaction notification", {
+      const event = {
+        eventId: `interaction:${interactionId}`,
+        eventType: "issue.interaction.created",
+        occurredAt: new Date().toISOString(),
+        entityId: issueId,
+        entityType: "issue",
+        companyId,
+        payload: { interactionId, interactionKind, issueId },
+      } as unknown as PluginEvent;
+      const delivered = await notify(
+        event,
+        () => ({
+          text: rendered.text,
+          options: { parseMode: "MarkdownV2", inlineKeyboard: rendered.keyboard },
+        }),
+        targetChatId ?? (eventConfig.approvalsChatId || eventConfig.defaultChatId),
+        {
+          entityType: "interaction",
           issueId,
+          issueIdentifier: card.context.issueIdentifier,
           interactionId,
           interactionKind,
+          ...(ownerUserId ? { ownerUserId } : {}),
+        },
+        `interaction:${interactionId}`,
+      );
+      if (!delivered) return;
+
+      const ref = { chatId: delivered.chatId, messageId: delivered.messageId };
+      card.chatId = ref.chatId;
+      card.messageId = ref.messageId;
+      card.deliveredAt = Date.now();
+      await saveCard(ctx, ref, card);
+      await addOpenCard(ctx, ref);
+      await ctx.state.set(deliveredKey(interactionId), { at: card.deliveredAt });
+    }
+
+    async function deliverPendingInteractions(companyId: string, issueId: string): Promise<void> {
+      if (!token) return;
+      let interactions: Array<Record<string, unknown>>;
+      try {
+        interactions = (await ctx.issues.listInteractions(issueId, companyId)) as unknown as Array<
+          Record<string, unknown>
+        >;
+      } catch (err) {
+        ctx.logger.warn("Could not list issue interactions for Telegram delivery", {
+          issueId,
           error: String(err),
         });
+        return;
       }
+      for (const interaction of interactions) {
+        if (interaction.status !== "pending" || !CARD_KINDS.has(String(interaction.kind))) continue;
+        try {
+          await deliverInteraction(companyId, interaction);
+        } catch (err) {
+          ctx.logger.error("Failed to dispatch interaction notification", {
+            issueId,
+            interactionId: interaction.id,
+            error: String(err),
+          });
+        }
+      }
+    }
+
+    const syncDeps = (): CardFlowDeps => ({ ctx, token, baseUrl });
+
+    const onRunEnded = async (event: PluginEvent) => {
+      const issueId = extractPayloadIssueId(event);
+      if (!issueId || !token) return;
+      await deliverPendingInteractions(event.companyId, issueId);
+      await syncCards(syncDeps(), { issueId });
+    };
+    ctx.events.on("agent.run.finished", onRunEnded);
+    ctx.events.on("agent.run.failed", onRunEnded);
+    ctx.events.on("agent.run.cancelled", onRunEnded);
+    // An answer given in the board wakes the agent: close the stale card then.
+    ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+      const issueId = extractPayloadIssueId(event);
+      if (issueId && token) await syncCards(syncDeps(), { issueId });
+    });
+    ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
+      const issueId = String(event.entityId ?? "");
+      if (issueId) await deliverPendingInteractions(event.companyId, issueId);
+    });
+
+    ctx.jobs.register("sync-question-cards", async () => {
+      if (!token) return;
+      await syncCards(syncDeps(), {
+        reminder: (card) => {
+          const c = configFor(card.companyId);
+          return {
+            everyMinutes: Number(c.questionReminderMinutes ?? 0),
+            maxCount: Number(c.questionReminderMaxCount ?? 0),
+          };
+        },
+      });
     });
 
     // --- Per-company chat overrides ---
@@ -2540,7 +2686,16 @@ export const plugin = definePlugin({
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
-    return runtimeHealth;
+    if (boardTokenMissingByCompany.size === 0) return runtimeHealth;
+    // A missing board token for even one company means that company's
+    // interaction cards and /approve cannot be answered from Telegram — never
+    // silently drop this to a `warn` log (ODIAA-2699).
+    const companyIds = Array.from(boardTokenMissingByCompany);
+    return {
+      status: runtimeHealth.status === "error" ? "error" : "degraded",
+      message: runtimeHealth.message ?? `Board API token not configured for ${companyIds.length} compan${companyIds.length === 1 ? "y" : "ies"} — question/confirmation cards cannot be answered from Telegram for them.`,
+      details: { ...runtimeHealth.details, boardTokenMissingCompanyIds: companyIds },
+    };
   },
 });
 
@@ -2574,8 +2729,14 @@ export async function handleUpdate(
 
   if (update.callback_query) {
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
-    const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
-    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, config);
+    // Company-scoped (ODIAA-2699): the board token - and the Cloudflare Access
+    // headers that gate reaching it - are a per-company setting, not the
+    // instance-wide `config`. Reading `config` here would silently use
+    // whichever company's save the host replayed last, same collapse the
+    // `configFor` indirection exists to prevent for every other company setting.
+    const companyConfig = configFor(companyId);
+    const boardApiToken = await resolveBoardApiToken(ctx, companyConfig, companyId);
+    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, companyConfig);
     await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders, config.telegramActorMappings);
     return;
   }
@@ -2638,14 +2799,58 @@ export async function handleUpdate(
       return;
     }
 
+    if (command === "pending") {
+      // Company-scoped (ODIAA-2699): `/pending` lists approvals fetched with
+      // this company's own board token, not the instance-wide `config`.
+      await handlePending(ctx, token, configFor(companyId), chatId, threadId, baseUrl, companyId);
+      return;
+    }
+
     const handledCustom = await tryCustomCommand(ctx, token, chatId, command, args, threadId, companyId);
     if (handledCustom) return;
 
-    // Built-in commands
-    const boardApiToken = command === "approve" ? await resolveBoardApiToken(ctx, config, companyId) : undefined;
-    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, config) : undefined;
+    // Built-in commands. `/status` also needs the board token, so an operator
+    // sees a missing one there instead of only in a `warn` log (ODIAA-2699).
+    // Company-scoped: read through `configFor(companyId)`, not `config`.
+    const commandConfig = configFor(companyId);
+    const boardApiToken =
+      command === "approve" || command === "status" ? await resolveBoardApiToken(ctx, commandConfig, companyId) : undefined;
+    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, commandConfig) : undefined;
     await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(configFor(companyId)));
     return;
+  }
+
+  // Question cards: a reply to a card, or a plain message right after tapping a
+  // free-text option, answers the agent's question.
+  if (config.enableInbound) {
+    const replyToBotId = msg.reply_to_message?.from?.is_bot ? msg.reply_to_message.message_id : undefined;
+    const cardRef = replyToBotId
+      ? { chatId, messageId: replyToBotId }
+      : await awaitingCardRef(ctx, chatId);
+    if (cardRef) {
+      const deps: CardFlowDeps = {
+        ctx,
+        token,
+        baseUrl,
+        // Company-scoped (ODIAA-2699): the card's own companyId picks the config.
+        resolveBoardToken: (companyId) => resolveBoardApiToken(ctx, configFor(companyId), companyId),
+        telegramActorMappings: config.telegramActorMappings,
+      };
+      if (await handleCardText(deps, msg, cardRef, text)) return;
+    }
+  }
+
+  // A plain private message (no reply) becomes a task for the intake agent.
+  if (!msg.reply_to_message && msg.chat.type === "private") {
+    const companyId = await resolveCompanyIdOrNull(ctx, chatId);
+    const companyConfig = configFor(companyId);
+    if (companyId && companyConfig.createTasksFromMessages) {
+      await handleCreate(ctx, token, chatId, text, threadId, publicUrl || baseUrl, companyId, {
+        intakeAgentId: companyConfig.intakeAgentId,
+        replyToMessageId: msg.message_id,
+      });
+      return;
+    }
   }
 
   // Decision-interaction replies (TWX-46/105/328): a board member replying to an
@@ -2689,12 +2894,17 @@ export async function handleUpdate(
           return;
         }
       }
-      const boardApiToken = await resolveBoardApiToken(ctx, config);
+      // Company-scoped (ODIAA-2699): this mapping carries the company the
+      // interaction belongs to, so both the token ref lookup and its company
+      // scope must use it rather than the primary/unscoped config - the same
+      // rule every other interaction path (callback query, /approve, the
+      // question-card flow) follows.
+      const boardApiToken = await resolveBoardApiToken(ctx, configFor(mapping.companyId), mapping.companyId);
       if (boardApiToken) {
         try {
           const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
           if (answers.length > 0) {
-            await respondInteraction(ctx.http, {
+            await respondInteraction(paperclipHttp(ctx), {
               baseUrl,
               issueId: mapping.issueId,
               interactionId: mapping.interactionId,
@@ -2715,7 +2925,7 @@ export async function handleUpdate(
             const affirmatives = ["accept", "approve", "yes", "y", "ok", "okay", "sure", "confirm", "👍", "✅"];
             const action = affirmatives.includes(normalized) ? "accept" : "reject";
             const reason = action === "reject" ? `Telegram reply: ${text}` : undefined;
-            await respondInteraction(ctx.http, {
+            await respondInteraction(paperclipHttp(ctx), {
               baseUrl,
               issueId: mapping.issueId,
               interactionId: mapping.interactionId,
@@ -3094,6 +3304,59 @@ export async function routeInboundReply(
 }
 
 /**
+ * `/pending`: what in this chat is still waiting for the human - open question
+ * cards (answer them by replying to the card) and pending board approvals.
+ */
+export async function handlePending(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  chatId: string,
+  threadId: number | undefined,
+  baseUrl: string,
+  companyId?: string,
+): Promise<void> {
+  const esc = escapeMarkdownV2;
+  const lines: string[] = [];
+
+  for (const { card } of await openCardsForChat(ctx, chatId)) {
+    const what = card.kind === "request_confirmation"
+      ? card.confirm?.prompt
+      : card.title ?? card.questions[0]?.prompt;
+    const who = card.context.agentName ? `${card.context.agentName}: ` : "";
+    const ref = card.links?.issueMd ?? esc(card.context.issueIdentifier);
+    lines.push(`${esc("❓")} ${ref} ${esc(`${who}${what ?? "question"}`)}`);
+  }
+
+  if (companyId) {
+    const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
+    if (boardApiToken) {
+      try {
+        const res = await fetchPaperclipApi(ctx, `${baseUrl}/api/companies/${companyId}/approvals?status=pending`, {
+          method: "GET",
+          headers: buildPaperclipAuthHeaders(boardApiToken, await resolveCfAccessHeaders(ctx, config)),
+        });
+        const approvals = (await res.json()) as Array<{ id: string; type?: string; payload?: Record<string, unknown> }>;
+        for (const approval of (Array.isArray(approvals) ? approvals : []).slice(0, 15)) {
+          const title = typeof approval.payload?.title === "string" ? approval.payload.title : approval.type ?? "approval";
+          lines.push(`${esc("🔔")} ${esc(title)} \\- ${esc(`/approve ${approval.id}`)}`);
+        }
+      } catch (err) {
+        ctx.logger.warn("Could not list pending approvals for /pending", { error: String(err) });
+      }
+    }
+  }
+
+  const text = lines.length > 0
+    ? [`*${esc("Waiting for you")}*`, ...lines, "", `_${esc("Reply to a question card to answer it.")}_`].join("\n")
+    : esc("Nothing is waiting for you. 🎉");
+  await sendMessage(ctx, token, chatId, text, {
+    parseMode: "MarkdownV2",
+    ...(threadId ? { messageThreadId: threadId } : {}),
+  });
+}
+
+/**
  * Graceful fallback for a decision-button callback whose underlying approval is
  * no longer actionable (TWX-328: stale inline-button presses). When the failure
  * is an "already resolved/decided" conflict — the approval was decided through
@@ -3149,6 +3412,23 @@ export async function handleCallbackQuery(
   const actor = query.from.username ?? query.from.first_name ?? String(query.from.id);
   const chatId = query.message?.chat.id ? String(query.message.chat.id) : null;
   const messageId = query.message?.message_id;
+
+  const cardCallback = parseCardCallback(data);
+  if (cardCallback && chatId && messageId) {
+    const handled = await handleCardCallback(
+      { ctx, token, baseUrl, boardApiToken, telegramActorMappings },
+      query,
+      { chatId, messageId },
+      cardCallback,
+    );
+    if (handled) return;
+    // A card button whose card is gone (cleared state, very old message).
+    // Legacy interaction_accept/reject buttons fall through to their handler.
+    if (data.startsWith("qc:")) {
+      await answerCallbackQuery(ctx, token, query.id, "This question is no longer active");
+      return;
+    }
+  }
 
   if (data.startsWith("approve_")) {
     const approvalId = data.replace("approve_", "");
@@ -3303,7 +3583,7 @@ export async function handleCallbackQuery(
       }
     }
     try {
-      await respondInteraction(ctx.http, {
+      await respondInteraction(paperclipHttp(ctx), {
         baseUrl,
         issueId: mapping.issueId,
         interactionId: mapping.interactionId,

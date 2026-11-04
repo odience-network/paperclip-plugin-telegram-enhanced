@@ -391,11 +391,24 @@ function extractConnectionConfig(config: Record<string, unknown>): TelegramConne
   };
 }
 
+/** A secret ref field shown as its UUID, whether stored as a UUID or a `secret_ref` binding. */
+function asSecretRefString(value: unknown): string {
+  if (typeof value === "string") return value;
+  const secretId = value && typeof value === "object" ? (value as { secretId?: unknown }).secretId : undefined;
+  return typeof secretId === "string" ? secretId : "";
+}
+
+/** Current hosts reject a bare UUID secret ref at save; store the `secret_ref` binding instead. */
+function toSecretRefConfigValue(value: string): unknown {
+  const trimmed = value.trim();
+  return trimmed ? { type: "secret_ref", secretId: trimmed } : "";
+}
+
 function extractBoardConfig(config: Record<string, unknown>): TelegramBoardConfig {
   return {
-    paperclipBoardApiTokenRef: asString(config.paperclipBoardApiTokenRef),
-    cfAccessClientIdRef: asString(config.cfAccessClientIdRef),
-    cfAccessClientSecretRef: asString(config.cfAccessClientSecretRef),
+    paperclipBoardApiTokenRef: asSecretRefString(config.paperclipBoardApiTokenRef),
+    cfAccessClientIdRef: asSecretRefString(config.cfAccessClientIdRef),
+    cfAccessClientSecretRef: asSecretRefString(config.cfAccessClientSecretRef),
   };
 }
 
@@ -1166,7 +1179,12 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setBoardConfigMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...boardConfig };
+      const nextConfig = {
+        ...currentConfig,
+        paperclipBoardApiTokenRef: toSecretRefConfigValue(boardConfig.paperclipBoardApiTokenRef),
+        cfAccessClientIdRef: toSecretRefConfigValue(boardConfig.cfAccessClientIdRef),
+        cfAccessClientSecretRef: toSecretRefConfigValue(boardConfig.cfAccessClientSecretRef),
+      };
       await savePluginConfig(companyId, nextConfig);
       setBoardSnapshot(boardConfig);
       setBoardConfigMessage({
@@ -1459,6 +1477,13 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
         companyId,
         paperclipBoardApiTokenRef: secret.id,
         identity: nextIdentity,
+      });
+      // Current hosts resolve a plugin secret only when plugin config binds it,
+      // and only in the `secret_ref` object shape; saving it here binds it.
+      const currentConfig = await fetchPluginConfig(companyId);
+      await savePluginConfig(companyId, {
+        ...currentConfig,
+        paperclipBoardApiTokenRef: { type: "secret_ref", secretId: secret.id },
       });
       await boardAccess.refresh();
 

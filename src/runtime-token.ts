@@ -13,6 +13,7 @@
 // the worker can skip token-bound runtime features rather than die on an
 // unhandled rejection.
 import type { PluginContext, PluginHealthDiagnostics } from "@paperclipai/plugin-sdk";
+import { toSecretRefBinding } from "./secret-ref-validation.js";
 
 export type TelegramRuntimeHealth = PluginHealthDiagnostics & {
   message?: string;
@@ -23,6 +24,41 @@ export const SECRET_RESOLUTION_DISABLED_MESSAGE =
   "Plugin secret references are disabled until company-scoped plugin config lands";
 export const SECRET_RESOLUTION_ISSUE_URL =
   "https://github.com/mvanhorn/paperclip-plugin-telegram/issues/63";
+
+/**
+ * Resolve a secret reference on any host generation.
+ *
+ * Hosts from 2026.8xx only resolve `{ type: "secret_ref" }` bindings, need the
+ * company (a worker loop such as Telegram polling has no invocation scope, and
+ * the company is what admits the call), and look the secret up by the config
+ * path that bound it to the plugin. Older hosts take the bare UUID, so that is
+ * the fallback.
+ */
+export async function resolveSecretRef(
+  ctx: PluginContext,
+  ref: unknown,
+  opts: { companyId?: string | null; configPath?: string } = {},
+): Promise<string> {
+  const binding = toSecretRefBinding(ref);
+  if (!binding) throw new Error("Invalid secret reference");
+  let currentHostError: unknown;
+  if (opts.companyId) {
+    try {
+      return await ctx.secrets.resolve(binding, {
+        companyId: opts.companyId,
+        ...(opts.configPath ? { configPath: opts.configPath } : {}),
+      });
+    } catch (err) {
+      currentHostError = err;
+    }
+  }
+  try {
+    return await ctx.secrets.resolve(binding.secretId);
+  } catch (err) {
+    // On a current host the bare-UUID retry always fails; the first error is the real one.
+    throw currentHostError ?? err;
+  }
+}
 
 export async function resolveStartupTelegramBotToken(
   ctx: PluginContext,

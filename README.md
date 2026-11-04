@@ -39,6 +39,7 @@ Paperclip agents  ⇄  Telegram bot  ⇄  You
 |---|---|---|
 | 🔔 | **Notifications** | Issue created/done/blocked, board `@`-mentions, approvals, agent errors, and run lifecycle — formatted in MarkdownV2 with a plain-text fallback. |
 | ✅ | **One-tap approvals** | Inline **Approve** / **Reject** buttons on every approval. Act without leaving Telegram. |
+| ❓ | **Agent questions** | Agent questions and confirmations arrive with context and are answered by button or plain reply; cards sync with the board and remind you. |
 | 💬 | **Bot commands** | `/status`, `/issues`, `/agents`, `/approve`, `/connect`, `/topics`, `/acp`, `/commands`, and more. |
 | ↩️ | **Reply routing** | Reply to any notification and it becomes an issue comment or escalation reply. |
 | 🧵 | **Multi-agent threads** | Up to 5 agents per thread with `@mention` routing, handoff, and discuss loops. |
@@ -50,6 +51,23 @@ Paperclip agents  ⇄  Telegram bot  ⇄  You
 | 🤖 | **Proactive suggestions** | Agents register watches (e.g. *overdue invoice*) that fire suggestions when conditions hit. |
 
 ➡️ **Full feature reference:** see the [documentation](#documentation) below.
+
+> **Upgrading to this version?** Agent questions add a new capability,
+> **`issue.interactions.read`** (to look up an issue's pending interactions and
+> settle its question cards). Existing installs move to `upgrade_pending` until
+> a board member approves it — **this approval step is board-only**; an agent
+> cannot grant it to itself. Until approved, the plugin keeps running on its
+> previously-granted capabilities and agent questions simply do not reach
+> Telegram.
+>
+> **Push delivery depends on a host change that has not shipped yet.** Paperclip
+> does not currently emit `issue.interaction.created` to plugins, so a card
+> reaches Telegram when the asking agent's run ends — not the instant the
+> question is created. A question raised outside of a run (e.g. directly on the
+> board) only reaches Telegram once a later run on that issue ends, or once the
+> host starts emitting the event. The 5-minute `sync-question-cards` job keeps
+> already-delivered cards' status in sync (closing settled ones, sending
+> reminders) — it does not discover brand-new interactions on its own.
 
 ---
 
