@@ -90,7 +90,18 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "topics", description: "List or remove forum topic mappings" },
   { command: "acp", description: "Manage agent sessions (spawn, status, cancel, close)" },
   { command: "commands", description: "Manage custom workflow commands (list, import, run, delete)" },
+  // /start is intentionally omitted from the visible command menu and from
+  // /help — it is Telegram's implicit "chat just opened the bot" command, not
+  // one an operator picks from the list.
 ];
+
+// Commands that must work in a chat with no `/connect` link yet (ODIAA-2700).
+// Every other command — including unrecognized ones — replies with
+// NOT_LINKED_MESSAGE instead of touching any company's data.
+const UNLINKED_ALLOWED_COMMANDS = new Set(["help", "connect", "start"]);
+
+export const NOT_LINKED_MESSAGE =
+  "This chat is not linked to a Paperclip company yet. Run /connect <company-name> first.";
 
 export async function handleCommand(
   ctx: PluginContext,
@@ -109,21 +120,33 @@ export async function handleCommand(
 ): Promise<void> {
   await ctx.metrics.write(METRIC_NAMES.commandsHandled, 1);
 
+  // Resolve once so the unlinked-chat gate and every handler below agree on
+  // the same company — never fall back to another company's data just
+  // because this chat happens to be unlinked.
+  const resolvedCompanyId = companyId ?? (await resolveCompanyIdOrUndefined(ctx, chatId));
+  if (!UNLINKED_ALLOWED_COMMANDS.has(command) && !resolvedCompanyId) {
+    await sendMessage(ctx, token, chatId, NOT_LINKED_MESSAGE, { messageThreadId });
+    return;
+  }
+
   switch (command) {
     case "create":
-      await handleCreate(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, companyId);
+      await handleCreate(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, resolvedCompanyId);
       break;
     case "status":
-      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl, companyId, notificationFlags, boardApiToken);
+      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl, resolvedCompanyId, notificationFlags, boardApiToken);
       break;
     case "issues":
-      await handleIssues(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, companyId);
+      await handleIssues(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, resolvedCompanyId);
       break;
     case "agents":
-      await handleAgents(ctx, token, chatId, messageThreadId, publicUrl, companyId);
+      await handleAgents(ctx, token, chatId, messageThreadId, publicUrl, resolvedCompanyId);
       break;
     case "approve":
       await handleApprove(ctx, token, chatId, args, messageThreadId, baseUrl, boardApiToken, cfAccessHeaders);
+      break;
+    case "start":
+      await handleStart(ctx, token, chatId, messageThreadId);
       break;
     case "help":
       await handleHelp(ctx, token, chatId, messageThreadId);
@@ -138,7 +161,7 @@ export async function handleCommand(
       await handleTopicsCommand(ctx, token, chatId, args, messageThreadId);
       break;
     case "acp":
-      await handleAcpCommand(ctx, token, chatId, args, messageThreadId, companyId, maxAgentsPerThread);
+      await handleAcpCommand(ctx, token, chatId, args, messageThreadId, resolvedCompanyId, maxAgentsPerThread);
       break;
     default:
       await sendMessage(ctx, token, chatId, `Unknown command: /${command}. Try /help`, {
@@ -384,6 +407,27 @@ async function handleHelp(
   });
 }
 
+// Telegram's implicit first command in any new chat (ODIAA-2700). Must work
+// before `/connect` has linked the chat to a company — same as /help.
+async function handleStart(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  messageThreadId?: number,
+): Promise<void> {
+  const lines = [
+    escapeMarkdownV2("👋") + " *Welcome to the Paperclip bot*",
+    "",
+    escapeMarkdownV2("Run /connect <company-name> to link this chat to a Paperclip company, then /status to verify."),
+    escapeMarkdownV2("Run /help to see every available command."),
+  ];
+
+  await sendMessage(ctx, token, chatId, lines.join("\n"), {
+    parseMode: "MarkdownV2",
+    messageThreadId,
+  });
+}
+
 async function handleConnect(
   ctx: PluginContext,
   token: string,
@@ -439,8 +483,11 @@ async function handleConnect(
 
     // Outbound: company → chat (for notifications). A company-scoped write needs
     // that company to be configured for this plugin; if it is not, the chat is
-    // still usable for commands, so keep the link and say what is missing rather
-    // than failing the whole /connect (ODIAA-1927).
+    // still usable for commands (the inbound link above already covers that),
+    // but /connect must not claim success on the half that failed (ODIAA-2700)
+    // — outbound delivery is the whole point of linking a chat, and reporting
+    // "Linked" when it is broken hides the one actionable thing the operator
+    // needs to do next.
     let outboundError: string | undefined;
     try {
       await ctx.state.set(
@@ -449,22 +496,30 @@ async function handleConnect(
       );
     } catch (err) {
       outboundError = err instanceof Error ? err.message : String(err);
+    }
+
+    if (outboundError) {
       ctx.logger.warn("Linked chat but could not store outbound chat mapping", {
         chatId,
         companyId: match.id,
         error: outboundError,
       });
+      await sendMessage(
+        ctx,
+        token,
+        chatId,
+        `Could not finish linking this chat to "${match.name ?? input}": ${outboundError}\n`
+        + `Open the Telegram plugin settings for that company and save its configuration once, then run /connect again.`,
+        { messageThreadId },
+      );
+      return;
     }
 
-    const linkedText =
-      `${escapeMarkdownV2("🔗")} ${escapeMarkdownV2("Linked this chat to company:")} *${escapeMarkdownV2(match.name ?? input)}*`;
     await sendMessage(
       ctx,
       token,
       chatId,
-      outboundError
-        ? `${linkedText}\n${escapeMarkdownV2(`⚠️ Notifications may not reach this chat: ${outboundError}`)}`
-        : linkedText,
+      `${escapeMarkdownV2("🔗")} ${escapeMarkdownV2("Linked this chat to company:")} *${escapeMarkdownV2(match.name ?? input)}*`,
       { parseMode: "MarkdownV2", messageThreadId },
     );
 

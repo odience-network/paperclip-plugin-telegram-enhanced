@@ -770,6 +770,10 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
   const [proactiveMessage, setProactiveMessage] = useState<Notice | null>(null);
   const companyId = context.companyId ?? "";
   const companyLabel = context.companyPrefix?.trim() || "this company";
+  // ODIAA-2700: show which Telegram chat is linked to this company so an
+  // operator setting up multiple companies can see /connect's result without
+  // guessing which group answered.
+  const chatMapping = usePluginData<{ chatId: string | null }>("chat-mapping", { companyId });
   const configured = Boolean(boardAccess.data?.configured);
   const identity = boardAccess.data?.identity?.trim() || null;
   const routingDirty = JSON.stringify(routingConfig) !== JSON.stringify(routingSnapshot);
@@ -1517,6 +1521,30 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
         </p>
       </section>
 
+      <section
+        style={{
+          background: "#f9fafb",
+          border: "1px solid #e5e7eb",
+          borderRadius: 8,
+          display: "grid",
+          gap: 6,
+          padding: 16,
+        }}
+      >
+        <strong style={{ fontSize: 14 }}>Multi-company setup</strong>
+        <p style={{ color: "#6b7280", fontSize: 13, margin: 0, maxWidth: 760 }}>
+          One bot token serves every company on this instance; each company gets its own chat and settings.
+        </p>
+        <ol style={{ color: "#374151", fontSize: 13, margin: 0, paddingLeft: 20 }}>
+          <li>Connect one bot for the whole instance (below).</li>
+          <li>Create one Telegram group per company.</li>
+          <li>Add the bot to each group with privacy mode off.</li>
+          <li>Run <code>/connect &lt;company-name&gt;</code> in each group.</li>
+          <li>Set Chat ID, approvals chat, and board token in <em>that company's</em> plugin settings — opened from inside that company.</li>
+          <li>Verify with <code>/status</code> in each group.</li>
+        </ol>
+      </section>
+
       {notice ? (
         <div
           style={{
@@ -2021,6 +2049,22 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             }}
           >
             <strong>Default route</strong>
+            <div
+              style={{
+                background: chatMapping.data?.chatId ? "#f0fdfa" : "#fffbeb",
+                border: `1px solid ${chatMapping.data?.chatId ? "#99f6e4" : "#fde68a"}`,
+                borderRadius: 8,
+                color: chatMapping.data?.chatId ? "#115e59" : "#92400e",
+                fontSize: 13,
+                padding: "8px 10px",
+              }}
+            >
+              {chatMapping.loading
+                ? "Checking linked chat…"
+                : chatMapping.data?.chatId
+                  ? <>Linked chat for {companyLabel}: <code>{chatMapping.data.chatId}</code></>
+                  : <>No Telegram chat linked to {companyLabel} yet. Run <code>/connect {companyLabel}</code> in the target group.</>}
+            </div>
             <label style={{ display: "grid", gap: 5 }}>
               <span style={{ color: "#4b5563", fontSize: 12, fontWeight: 700 }}>Fallback Chat ID</span>
               <input

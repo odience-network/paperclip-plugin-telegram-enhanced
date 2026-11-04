@@ -88,6 +88,12 @@ const manifest: PaperclipPluginManifestV1 = {
       description: "Evaluate registered watches and send suggestions when conditions are met.",
       schedule: "*/15 * * * *",
     },
+    {
+      jobKey: "refresh-company-directory",
+      displayName: "Refresh Company Directory",
+      description: "Keep the /connect company list current from an invocation-scoped context.",
+      schedule: "*/10 * * * *",
+    },
   ],
   tools: [
     {
