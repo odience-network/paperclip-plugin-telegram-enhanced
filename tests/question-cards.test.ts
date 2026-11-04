@@ -9,7 +9,9 @@ import {
   isReminderDue,
   missingRequired,
   parseCardCallback,
+  parseCardQuestions,
   parseLegacyAnswerSyntax,
+  parseQuestionSetQuestions,
   renderCard,
   renderClosedCard,
   toggleOption,
@@ -69,6 +71,115 @@ describe("cardFromInteraction", () => {
   it("labels an unlabeled free-text option", () => {
     const c = card([{ ...singleQ, options: [...singleQ.options, { id: "other", freeText: true }] }]);
     expect(c.questions[0]!.options[2]).toEqual({ id: "other", label: "Other (type answer)", freeText: true });
+  });
+});
+
+describe("questionSet (paperclip.question_set.v1)", () => {
+  function questionSetInteraction(questions: unknown[]) {
+    return {
+      id: "int-qs",
+      issueId: "iss-1",
+      companyId: "co-1",
+      kind: "ask_user_questions",
+      status: "pending",
+      payload: {
+        version: 1,
+        title: "Hire responsibility",
+        // A real interaction carries both: the server generates `questions`
+        // for storage/answer compatibility alongside the authored `questionSet`.
+        questionSet: { schema: "paperclip.question_set.v1", questions },
+        questions: [{ id: "legacy-shadow", prompt: "legacy shadow", selectionMode: "single", required: true, options: [] }],
+      },
+    };
+  }
+
+  it("is read before the legacy `questions[]` shadow copy", () => {
+    const parsed = parseQuestionSetQuestions({
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        questions: [{ id: "responsibility", prompt: "What should the new agent be responsible for?", required: true, answerMode: "text" }],
+      },
+    });
+    expect(parsed).toEqual([
+      { id: "responsibility", prompt: "What should the new agent be responsible for?", selectionMode: "single", required: true, options: [] },
+    ]);
+  });
+
+  it("returns null (so the caller falls back to legacy) when questionSet is absent", () => {
+    expect(parseQuestionSetQuestions({ questions: [singleQ] })).toBeNull();
+  });
+
+  it("renders and answers a text question with no options", () => {
+    const c = cardFromInteraction(
+      questionSetInteraction([{ id: "responsibility", prompt: "What should the new agent be responsible for?", required: true, answerMode: "text" }]),
+      context,
+    )!;
+    expect(c.questions).toEqual([
+      { id: "responsibility", prompt: "What should the new agent be responsible for?", selectionMode: "single", required: true, options: [] },
+    ]);
+    const { text, keyboard } = renderCard(c, links);
+    expect(text).toContain("Reply to this message with your answer\\.");
+    expect(keyboard.map((row) => row[0]!.text)).toEqual(["Open XPL-7"]); // no option buttons - only the issue link
+
+    expect(applyTextAnswer(c, "Research and competitor analysis")).toBe("responsibility");
+    expect(isComplete(c)).toBe(true);
+    expect(buildAnswers(c)).toEqual([
+      { questionId: "responsibility", optionIds: [], otherText: "Research and competitor analysis" },
+    ]);
+  });
+
+  it("maps single_select and multi_select to the right selection mode and keeps options", () => {
+    const c = cardFromInteraction(
+      questionSetInteraction([
+        {
+          id: "responsibility",
+          prompt: "What should the new agent be responsible for?",
+          answerMode: "single_select",
+          required: true,
+          options: [
+            { id: "research", label: "Research", description: "Find and summarize information." },
+            { id: "writing", label: "Writing", description: "Draft and edit content." },
+          ],
+        },
+        {
+          id: "tools",
+          prompt: "Which tools?",
+          answerMode: "multi_select",
+          required: false,
+          options: [{ id: "slack", label: "Slack" }, { id: "github", label: "GitHub" }],
+        },
+      ]),
+      context,
+    )!;
+    expect(c.questions[0]).toEqual({
+      id: "responsibility",
+      prompt: "What should the new agent be responsible for?",
+      selectionMode: "single",
+      required: true,
+      options: [{ id: "research", label: "Research" }, { id: "writing", label: "Writing" }],
+    });
+    expect(c.questions[1]!.selectionMode).toBe("multi");
+    expect(c.questions[1]!.required).toBe(false);
+  });
+
+  it("never drops a question or an option for a card with more than four questions", () => {
+    const questions = Array.from({ length: 6 }, (_, i) => ({
+      id: `q${i}`,
+      prompt: `Question number ${i + 1}?`,
+      answerMode: "single_select",
+      required: true,
+      options: [{ id: "a", label: "Option A" }, { id: "b", label: "Option B" }, { id: "c", label: "Option C" }],
+    }));
+    const c = cardFromInteraction(questionSetInteraction(questions), context)!;
+    expect(c.questions).toHaveLength(6);
+    const { keyboard } = renderCard(c, links);
+    // 6 questions x 3 options each, plus Send, plus the issue link.
+    expect(keyboard).toHaveLength(6 * 3 + 2);
+    for (let qi = 0; qi < 6; qi++) {
+      for (let oi = 0; oi < 3; oi++) {
+        expect(keyboard.some((row) => row[0]!.callback_data === `qc:o:${qi}:${oi}`)).toBe(true);
+      }
+    }
   });
 });
 
@@ -171,6 +282,31 @@ describe("rendering", () => {
 
   it("says when the agent withdrew the question", () => {
     expect(renderClosedCard(card([singleQ]), links, "expired")).toContain("Expired \\- the agent moved on*");
+  });
+
+  it("never drops a question/option even when dropping narrative text alone cannot fit the card under 4096 chars", () => {
+    // Long prompts are never truncated by the compact pass (only the agent's
+    // excerpt and per-question help text are), so enough of them still forces
+    // the hard-truncate fallback - which must still keep every button.
+    const longPrompt = "What should we do about this specific aspect of the rollout, concretely and in detail? ".repeat(3);
+    const questions = Array.from({ length: 20 }, (_, i) => ({
+      id: `q${i}`,
+      prompt: `${i + 1}. ${longPrompt}`,
+      selectionMode: "single" as const,
+      required: true,
+      options: [{ id: "a", label: "Option A" }, { id: "b", label: "Option B" }],
+    }));
+    const c = card(questions);
+    const { text, keyboard } = renderCard(c, links);
+
+    expect(text.length).toBeLessThanOrEqual(4096);
+    // Every question's every option is still a working button - nothing silently dropped.
+    for (let qi = 0; qi < 20; qi++) {
+      for (let oi = 0; oi < 2; oi++) {
+        expect(keyboard.some((row) => row[0]!.callback_data === `qc:o:${qi}:${oi}`)).toBe(true);
+      }
+    }
+    expect(text).toContain("Open in Paperclip to see all 20 questions");
   });
 });
 
