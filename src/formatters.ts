@@ -21,25 +21,47 @@ function code(s: string): string {
   return `\`${esc(s)}\``;
 }
 
-export type IssueLinksOpts = { baseUrl?: string; issuePrefix?: string };
+/**
+ * Default cap for the text snippets formatters embed (issue descriptions, comments,
+ * agent error messages, ...) before they switch from a fixed, un-configurable cutoff
+ * (200-600 chars) to this single, much higher limit (ODIAA-2701). Long notifications
+ * are no longer silently cut mid-sentence with no way to read the rest — `sendMessage`
+ * now splits anything over Telegram's 4096-char limit across multiple messages — but a
+ * cap still exists so one pathologically long field (e.g. a 50k-char description)
+ * doesn't blow a single notification up into dozens of chat messages. Override per
+ * call via `IssueLinksOpts.textSnippetLimit`.
+ */
+export const DEFAULT_TEXT_SNIPPET_LIMIT = 3500;
+
+export type IssueLinksOpts = { baseUrl?: string; issuePrefix?: string; textSnippetLimit?: number };
 
 function isExternalUrl(url?: string): boolean {
   return !!url && url.startsWith("https://");
 }
 
+function issueUrl(identifier: string, opts?: IssueLinksOpts): string | null {
+  return opts?.baseUrl && opts?.issuePrefix ? `${opts.baseUrl}/${opts.issuePrefix}/issues/${identifier}` : null;
+}
+
 function issueLink(identifier: string, opts?: IssueLinksOpts): string {
-  if (opts?.baseUrl && opts?.issuePrefix) {
-    const url = `${opts.baseUrl}/${opts.issuePrefix}/issues/${identifier}`;
-    return `[${esc(identifier)}](${url})`;
-  }
-  return bold(identifier);
+  const url = issueUrl(identifier, opts);
+  return url ? `[${esc(identifier)}](${url})` : bold(identifier);
 }
 
 function issueButton(identifier: string, opts?: IssueLinksOpts): { text: string; url: string } | null {
-  if (opts?.baseUrl && opts?.issuePrefix && isExternalUrl(opts.baseUrl)) {
-    return { text: `Open ${identifier} ↗`, url: `${opts.baseUrl}/${opts.issuePrefix}/issues/${identifier}` };
-  }
-  return null;
+  const url = issueUrl(identifier, opts);
+  return url && isExternalUrl(opts?.baseUrl) ? { text: `Open ${identifier} ↗`, url } : null;
+}
+
+/** Truncates `text` at `DEFAULT_TEXT_SNIPPET_LIMIT` (or `opts.textSnippetLimit`), reporting whether it cut anything. */
+function truncateSnippet(text: string, opts?: IssueLinksOpts): { snippet: string; truncated: boolean } {
+  const limit = opts?.textSnippetLimit ?? DEFAULT_TEXT_SNIPPET_LIMIT;
+  return { snippet: truncateAtWord(text, limit), truncated: text.length > limit };
+}
+
+/** Appends a "Read more" link when a snippet was truncated and a URL is available. */
+function appendReadMore(lines: string[], url: string | null): void {
+  if (url) lines.push(`[${esc("Read more »")}](${url})`);
 }
 
 function agentButton(agentId: string, label: string, publicUrl?: string): { text: string; url: string } | null {
@@ -171,8 +193,9 @@ export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): F
   if (meta.length > 0) lines.push(meta.join(" \\| "));
 
   if (p.description) {
-    const desc = truncateAtWord(String(p.description), 200);
-    lines.push(`\n${esc(">")} ${esc(desc)}`);
+    const { snippet, truncated } = truncateSnippet(String(p.description), opts);
+    lines.push(`\n${esc(">")} ${esc(snippet)}`);
+    if (truncated) appendReadMore(lines, issueUrl(identifier, opts));
   }
 
   const button = issueButton(identifier, opts);
@@ -230,8 +253,9 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
   ];
 
   if (comment) {
-    const truncated = truncateAtWord(comment, 300);
-    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+    const { snippet, truncated } = truncateSnippet(comment, opts);
+    lines.push(`\n${esc(">")} ${esc(snippet)}`);
+    if (truncated) appendReadMore(lines, issueUrl(identifier, opts));
   }
 
   const button = issueButton(identifier, opts);
@@ -259,8 +283,9 @@ export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): F
   if (assigneeName) lines.push(`Assignee: ${esc(assigneeName)}`);
 
   if (reason) {
-    const truncated = truncateAtWord(reason, 300);
-    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+    const { snippet, truncated } = truncateSnippet(reason, opts);
+    lines.push(`\n${esc(">")} ${esc(snippet)}`);
+    if (truncated) appendReadMore(lines, issueUrl(identifier, opts));
   }
 
   const button = issueButton(identifier, opts);
@@ -288,8 +313,9 @@ export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): F
   if (authorName) lines.push(`From: ${esc(authorName)}`);
 
   if (body) {
-    const truncated = truncateAtWord(body, 300);
-    lines.push(`\n${esc(">")} ${esc(truncated)}`);
+    const { snippet, truncated } = truncateSnippet(body, opts);
+    lines.push(`\n${esc(">")} ${esc(snippet)}`);
+    if (truncated) appendReadMore(lines, issueUrl(identifier, opts));
   }
 
   const button = issueButton(identifier, opts);
@@ -372,10 +398,17 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   ];
 
   if (agentName) lines.push(`Agent: ${esc(agentName)} \\| Type: ${code(approvalType)}`);
-  if (description) lines.push(`\n${esc(truncateAtWord(description, 300))}`);
 
   // Add linked issues if present
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Payload> : [];
+  const firstLinkedIssueId = linkedIssues.length > 0 ? String(linkedIssues[0]!.identifier ?? "") : "";
+
+  if (description) {
+    const { snippet, truncated } = truncateSnippet(description, opts);
+    lines.push(`\n${esc(snippet)}`);
+    if (truncated) appendReadMore(lines, firstLinkedIssueId ? issueUrl(firstLinkedIssueId, opts) : null);
+  }
+
   if (linkedIssues.length > 0) {
     lines.push(`\n${bold(`Linked Issues (${String(linkedIssues.length)})`)}`);
     for (const issue of linkedIssues.slice(0, 5)) {
@@ -398,12 +431,9 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   ];
 
   // Add deep link to the first linked issue if available
-  if (linkedIssues.length > 0) {
-    const firstIssueId = String(linkedIssues[0]!.identifier ?? "");
-    if (firstIssueId) {
-      const btn = issueButton(firstIssueId, opts);
-      if (btn) keyboard.push([btn]);
-    }
+  if (firstLinkedIssueId) {
+    const btn = issueButton(firstLinkedIssueId, opts);
+    if (btn) keyboard.push([btn]);
   }
 
   return {
@@ -437,7 +467,9 @@ export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): For
         : `Issue: ${issueLink(issueIdentifier, opts)}`,
     );
   }
-  lines.push(`\n${code(truncateAtWord(errorMessage, 500))}`);
+  const { snippet, truncated } = truncateSnippet(errorMessage, opts);
+  lines.push(`\n${code(snippet)}`);
+  if (truncated) appendReadMore(lines, issueIdentifier ? issueUrl(issueIdentifier, opts) : null);
 
   const buttons = [
     runButton(agentId, runId, opts?.baseUrl),

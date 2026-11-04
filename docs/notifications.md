@@ -16,6 +16,23 @@ How the plugin decides *what* to send and *where* to send it. All messages are f
 
 Toggle each type with the `notifyOn*` settings in the [Configuration Reference](configuration.md#notification-toggles).
 
+## Long messages
+
+Telegram rejects any single message over 4096 characters. Notifications and the
+agent `send_to_telegram` tool no longer hit that wall:
+
+- Any outbound message over the limit is split into multiple Telegram messages —
+  on paragraph, then line, then word boundaries — rather than being truncated or
+  rejected. The split never lands inside an HTML tag/entity or a MarkdownV2
+  escape/entity, so formatting never breaks across chunks. Later chunks reply to
+  the previous one so they thread together; only the first chunk carries the
+  original reply-to/topic, and only the last chunk carries any inline keyboard.
+- Text snippets embedded in notifications (issue descriptions, comments, agent
+  error messages, …) are still capped — at `DEFAULT_TEXT_SNIPPET_LIMIT` (3500
+  characters) — so one pathologically long field can't blow a single
+  notification up into dozens of chat messages. When a snippet is cut, a
+  **Read more** link to the issue (or approval's linked issue) is appended.
+
 ## Interactive approvals
 
 Every approval notification includes inline **Approve** / **Reject** buttons:

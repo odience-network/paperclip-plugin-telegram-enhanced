@@ -9,7 +9,9 @@ import {
 } from "@paperclipai/plugin-sdk";
 import {
   sendMessage,
+  sendMessageWithResult,
   sendDocument,
+  sendDocumentWithResult,
   editMessage,
   answerCallbackQuery,
   setMyCommands,
@@ -809,6 +811,13 @@ function makeTelegramToolError(
   return { ok: false, code, message, ...metadata };
 }
 
+// Surfaces Telegram's own failure reason (the API's `description` field) to the
+// calling agent instead of a bare "send failed", so the agent can see e.g. a
+// MarkdownV2 parse error or a chat-not-found and react to it (ODIAA-2701).
+function telegramSendFailedMessage(errorDescription?: string): string {
+  return errorDescription ? `Telegram send failed: ${errorDescription}` : "Telegram send failed.";
+}
+
 async function resolveIssueIdentifierForFileRoute(
   ctx: PluginContext,
   companyId: string,
@@ -1057,16 +1066,16 @@ export async function sendToTelegramTool(
     ? destination.topicId
     : threadId;
   const result: SendToTelegramResult = markdownContent
-    ? await sendDocument(ctx, token, chatId, markdownContent, {
+    ? await sendDocumentWithResult(ctx, token, chatId, markdownContent, {
       filename: requestedMarkdownFileName,
       caption: text ?? undefined,
       parseMode,
       messageThreadId: outboundThreadId,
       replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
       disableNotification: p.silent === true,
-    }).then((messageId) => {
+    }).then(({ messageId, errorDescription }) => {
       if (!messageId) {
-        return makeTelegramToolError("telegram_send_failed", "Telegram send failed.");
+        return makeTelegramToolError("telegram_send_failed", telegramSendFailedMessage(errorDescription));
       }
       return {
         ok: true,
@@ -1080,14 +1089,14 @@ export async function sendToTelegramTool(
         issueIdentifier: destination?.ok ? destination.issueIdentifier : undefined,
       } as SendToTelegramResult;
     })
-    : await sendMessage(ctx, token, chatId, text!, {
+    : await sendMessageWithResult(ctx, token, chatId, text!, {
       parseMode,
       messageThreadId: outboundThreadId,
       replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
       disableNotification: p.silent === true,
-    }).then((messageId) => {
+    }).then(({ messageId, errorDescription }) => {
       if (!messageId) {
-        return makeTelegramToolError("telegram_send_failed", "Telegram send failed.");
+        return makeTelegramToolError("telegram_send_failed", telegramSendFailedMessage(errorDescription));
       }
       return {
         ok: true,

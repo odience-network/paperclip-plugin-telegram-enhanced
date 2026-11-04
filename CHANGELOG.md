@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.7] — 2026-11-04
+
+Notifications and `send_to_telegram` silently cut long text instead of delivering
+it, and a failed send told the agent nothing about why (ODIAA-2701).
+
+### Fixed
+
+- **Long messages were truncated or rejected instead of delivered (ODIAA-2701).**
+  `sendMessage` sent `text` as-is; anything over Telegram's hard 4096-character
+  limit was rejected outright, and the agent only saw a bare
+  `telegram_send_failed`. `sendMessage` (and `send_to_telegram`) now split long
+  text across multiple messages — on paragraph, then line, then word boundaries —
+  never inside an HTML tag/entity or a MarkdownV2 escape/entity. The inline
+  keyboard, if any, goes on the last chunk only; the original reply-to/topic goes
+  on the first chunk only, and later chunks reply to the previous chunk so they
+  thread together.
+- **Formatters truncated notification text at small, hardcoded limits with no way
+  to read the rest (ODIAA-2701).** Issue-created descriptions, done/blocked
+  comments, board mentions, approval descriptions, and agent error messages were
+  each cut at a different fixed length (200-500 chars) with no "read more" path.
+  They now share one much higher, overridable limit
+  (`formatters.DEFAULT_TEXT_SNIPPET_LIMIT`, 3500 chars), and a cut snippet gets a
+  **Read more** link to the issue (or the approval's first linked issue) instead
+  of just trailing off. (Interaction-card formatting is unchanged here; it's
+  tracked separately.)
+- **A failed Telegram send told the agent nothing about why (ODIAA-2701).**
+  `send_to_telegram` failures now carry Telegram's own `description` in the
+  returned error message (e.g. `telegram_send_failed: Bad Request: ...`) instead
+  of a bare "Telegram send failed.", and the plugin's log line puts that reason
+  in the message text itself rather than only in `meta.error`.
+
+### Coordination
+
+- PR [#33](https://github.com/odience-network/paperclip-plugin-telegram-enhanced/pull/33)
+  (`/agents` capped under 4096 via `capListMessage`) is unmerged and solves a
+  different problem — keeping one summarized message for a big agent list,
+  rather than splitting a notification across several. This PR introduces the
+  `TELEGRAM_MAX_MESSAGE_LENGTH` constant that #33 also declares; #33 should
+  rebase on top of this, drop its own copy, and import this one. Recommend
+  merging #33 as-is afterward — its capped summary is still the better UX for
+  `/agents`, distinct from (and compatible with) this PR's splitter.
+
 ## [0.4.6] — 2026-09-05
 
 Saved notification settings reached the database and stopped there. On an

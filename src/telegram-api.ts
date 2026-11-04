@@ -35,13 +35,26 @@ type TelegramResponse = {
   parameters?: { retry_after?: number };
 };
 
-export async function sendMessage(
+export type SendMessageResult = {
+  messageId: number | null;
+  /** Telegram's own failure reason (the API's `description` field), set only when the send failed. */
+  errorDescription?: string;
+};
+
+/** Telegram rejects any sendMessage/caption whose text exceeds 4096 characters. */
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * Send one chunk of text (already within Telegram's length limit), with the
+ * existing rate-limit retry and MarkdownV2-failure plain-text fallback.
+ */
+async function sendMessageChunk(
   ctx: PluginContext,
   token: string,
   chatId: string,
   text: string,
-  options: SendMessageOptions = {},
-): Promise<number | null> {
+  options: SendMessageOptions,
+): Promise<SendMessageResult> {
   const body: Record<string, unknown> = {
     chat_id: chatId,
     text,
@@ -66,12 +79,7 @@ export async function sendMessage(
         body: JSON.stringify(body),
       });
 
-      const data = (await res.json()) as {
-        ok: boolean;
-        result?: { message_id: number };
-        description?: string;
-        parameters?: { retry_after?: number };
-      };
+      const data = (await res.json()) as TelegramResponse;
 
       if (!data.ok) {
         if (data.parameters?.retry_after && attempt < 2) {
@@ -82,39 +90,101 @@ export async function sendMessage(
         }
 
         if (options.parseMode === "MarkdownV2") {
-          ctx.logger.warn("MarkdownV2 send failed, retrying as plain text", {
+          ctx.logger.warn(`MarkdownV2 send failed, retrying as plain text: ${data.description ?? "unknown error"}`, {
             error: data.description,
           });
-          return sendMessage(ctx, token, chatId, stripMarkdown(text), {
+          return sendMessageChunk(ctx, token, chatId, stripMarkdown(text), {
             ...options,
             parseMode: undefined,
           });
         }
-        ctx.logger.error("Telegram sendMessage failed", { error: data.description });
+        ctx.logger.error(`Telegram sendMessage failed: ${data.description ?? "unknown error"}`, {
+          error: data.description,
+        });
         await ctx.metrics.write(METRIC_NAMES.failed, 1);
-        return null;
+        return { messageId: null, errorDescription: data.description };
       }
 
       await ctx.metrics.write(METRIC_NAMES.sent, 1);
-      return data.result?.message_id ?? null;
+      return { messageId: data.result?.message_id ?? null };
     } catch (err) {
-      ctx.logger.error("Telegram API error", { error: String(err) });
+      ctx.logger.error(`Telegram API error: ${String(err)}`, { error: String(err) });
       await ctx.metrics.write(METRIC_NAMES.failed, 1);
-      return null;
+      return { messageId: null, errorDescription: String(err) };
     }
   }
-  return null;
+  return { messageId: null };
+}
+
+/**
+ * Send `text` to a Telegram chat, splitting it across multiple messages when it
+ * exceeds Telegram's 4096-character limit (see `splitTelegramMessage`) instead of
+ * letting Telegram reject the whole send. The inline keyboard, if any, is attached
+ * only to the last chunk; `replyToMessageId`/`messageThreadId` apply only to the
+ * first chunk — later chunks reply to the previous chunk so they thread together
+ * (and, in forum groups, automatically inherit its topic without repeating
+ * `messageThreadId`). Returns the first chunk's message id, which callers use as
+ * the stable anchor for this logical message.
+ */
+export async function sendMessageWithResult(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  text: string,
+  options: SendMessageOptions = {},
+): Promise<SendMessageResult> {
+  const chunks = splitTelegramMessage(text, options.parseMode);
+
+  let firstMessageId: number | null = null;
+  let previousMessageId: number | null = null;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const isFirst = i === 0;
+    const isLast = i === chunks.length - 1;
+
+    const chunkOptions: SendMessageOptions = {
+      parseMode: options.parseMode,
+      disableNotification: options.disableNotification,
+    };
+    if (isFirst) {
+      if (options.replyToMessageId) chunkOptions.replyToMessageId = options.replyToMessageId;
+      if (options.messageThreadId) chunkOptions.messageThreadId = options.messageThreadId;
+    } else if (previousMessageId) {
+      chunkOptions.replyToMessageId = previousMessageId;
+    }
+    if (isLast && options.inlineKeyboard) chunkOptions.inlineKeyboard = options.inlineKeyboard;
+
+    const result = await sendMessageChunk(ctx, token, chatId, chunks[i]!, chunkOptions);
+    if (result.messageId == null) {
+      return { messageId: firstMessageId, errorDescription: result.errorDescription };
+    }
+    if (isFirst) firstMessageId = result.messageId;
+    previousMessageId = result.messageId;
+  }
+
+  return { messageId: firstMessageId };
+}
+
+export async function sendMessage(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  text: string,
+  options: SendMessageOptions = {},
+): Promise<number | null> {
+  const result = await sendMessageWithResult(ctx, token, chatId, text, options);
+  return result.messageId;
 }
 
 // Ported from ant013/paperclip-plugin-telegram (TEL-8, commits 0b57865/a6f5037):
 // "send markdown documents with native upload fallback".
-export async function sendDocument(
+export async function sendDocumentWithResult(
   ctx: PluginContext,
   token: string,
   chatId: string,
   markdownContent: string,
   options: SendDocumentOptions,
-): Promise<number | null> {
+): Promise<SendMessageResult> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const data = await postTelegramDocument(ctx, token, chatId, markdownContent, options);
@@ -131,31 +201,44 @@ export async function sendDocument(
         }
 
         if (options.parseMode === "MarkdownV2" && options.caption) {
-          ctx.logger.warn("MarkdownV2 file caption failed, retrying as plain text", {
+          ctx.logger.warn(`MarkdownV2 file caption failed, retrying as plain text: ${data.description ?? "unknown error"}`, {
             error: data.description,
           });
-          return sendDocument(ctx, token, chatId, markdownContent, {
+          return sendDocumentWithResult(ctx, token, chatId, markdownContent, {
             ...options,
             caption: stripMarkdown(options.caption),
             parseMode: undefined,
           });
         }
 
-        ctx.logger.error("Telegram document send failed", { error: data.description });
+        ctx.logger.error(`Telegram document send failed: ${data.description ?? "unknown error"}`, {
+          error: data.description,
+        });
         await ctx.metrics.write(METRIC_NAMES.failed, 1);
-        return null;
+        return { messageId: null, errorDescription: data.description };
       }
 
       await ctx.metrics.write(METRIC_NAMES.sent, 1);
-      return data.result?.message_id ?? null;
+      return { messageId: data.result?.message_id ?? null };
     } catch (err) {
-      ctx.logger.error("Telegram document API error", { error: String(err) });
+      ctx.logger.error(`Telegram document API error: ${String(err)}`, { error: String(err) });
       await ctx.metrics.write(METRIC_NAMES.failed, 1);
-      return null;
+      return { messageId: null, errorDescription: String(err) };
     }
   }
 
-  return null;
+  return { messageId: null };
+}
+
+export async function sendDocument(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  markdownContent: string,
+  options: SendDocumentOptions,
+): Promise<number | null> {
+  const result = await sendDocumentWithResult(ctx, token, chatId, markdownContent, options);
+  return result.messageId;
 }
 
 function buildDocumentFormData(
@@ -370,6 +453,208 @@ export function truncateAtWord(text: string, maxLen: number): string {
   const truncated = text.slice(0, maxLen);
   const lastSpace = truncated.lastIndexOf(" ");
   return (lastSpace > maxLen * 0.7 ? truncated.slice(0, lastSpace) : truncated) + "...";
+}
+
+// --- Message splitting (ODIAA-2701) ---
+//
+// Telegram rejects any sendMessage whose `text` exceeds 4096 characters, so long
+// notifications and `send_to_telegram` payloads must be split across several
+// messages rather than truncated or failed outright. The split must never land
+// inside an HTML tag/entity or a MarkdownV2 escape/entity, or Telegram's parser
+// rejects the chunk that got the broken half.
+
+type TelegramParseMode = "MarkdownV2" | "HTML" | undefined;
+
+/** A half-open [start, end) character range that must never be split. */
+type ProtectedSpan = [number, number];
+
+function findHtmlProtectedSpans(text: string): ProtectedSpan[] {
+  const spans: ProtectedSpan[] = [];
+  const tagOrEntity = /<[^>]*>|&#?[a-zA-Z0-9]+;/g;
+  let match: RegExpExecArray | null;
+  while ((match = tagOrEntity.exec(text))) {
+    spans.push([match.index, match.index + match[0].length]);
+  }
+  return spans;
+}
+
+/** Index of the next `char` at/after `from` that isn't itself an escaped character, or -1. */
+function findUnescapedIndex(text: string, char: string, from: number): number {
+  for (let i = from; i < text.length; i++) {
+    if (text[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (text[i] === char) return i;
+  }
+  return -1;
+}
+
+// Scans for MarkdownV2 escape pairs (`\.` etc.) and entity spans (bold, italic,
+// underline, strikethrough, spoiler, code, pre, links) so none of them are ever
+// split across two chunks. Entities are matched as simple, non-nested spans,
+// which covers everything this plugin's own formatters generate.
+function findMarkdownV2ProtectedSpans(text: string): ProtectedSpan[] {
+  const spans: ProtectedSpan[] = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "\\") {
+      spans.push([i, Math.min(i + 2, n)]);
+      i += 2;
+      continue;
+    }
+    if (ch === "[") {
+      const closeBracket = findUnescapedIndex(text, "]", i + 1);
+      if (closeBracket !== -1 && text[closeBracket + 1] === "(") {
+        const closeParen = findUnescapedIndex(text, ")", closeBracket + 2);
+        if (closeParen !== -1) {
+          spans.push([i, closeParen + 1]);
+          i = closeParen + 1;
+          continue;
+        }
+      }
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      const isPre = text.slice(i, i + 3) === "```";
+      const marker = isPre ? "```" : "`";
+      const end = text.indexOf(marker, i + marker.length);
+      if (end !== -1) {
+        spans.push([i, end + marker.length]);
+        i = end + marker.length;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if ((ch === "_" && text[i + 1] === "_") || (ch === "|" && text[i + 1] === "|")) {
+      const marker = ch + ch;
+      const end = text.indexOf(marker, i + 2);
+      if (end !== -1) {
+        spans.push([i, end + 2]);
+        i = end + 2;
+        continue;
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === "*" || ch === "_" || ch === "~") {
+      const end = findUnescapedIndex(text, ch, i + 1);
+      if (end !== -1) {
+        spans.push([i, end + 1]);
+        i = end + 1;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return spans;
+}
+
+function getProtectedSpans(text: string, parseMode: TelegramParseMode): ProtectedSpan[] {
+  if (parseMode === "HTML") return findHtmlProtectedSpans(text);
+  if (parseMode === "MarkdownV2") return findMarkdownV2ProtectedSpans(text);
+  return [];
+}
+
+/** The span that strictly contains `index` (splitting there would divide it), if any. */
+function spanContaining(index: number, spans: ProtectedSpan[]): ProtectedSpan | null {
+  for (const span of spans) {
+    if (index > span[0] && index < span[1]) return span;
+  }
+  return null;
+}
+
+/** Pulls a candidate split point back before any protected span it falls inside of. */
+function retreatFromProtectedSpans(point: number, from: number, spans: ProtectedSpan[]): number {
+  let candidate = point;
+  for (let guard = 0; guard <= spans.length; guard++) {
+    const span = spanContaining(candidate, spans);
+    if (!span) return candidate;
+    if (span[0] <= from) return from;
+    candidate = span[0];
+  }
+  return candidate;
+}
+
+/** Last occurrence of `separator` in [from, hardEnd) whose split points are both safe. */
+function findLastSafeSeparator(
+  text: string,
+  from: number,
+  hardEnd: number,
+  separator: string,
+  spans: ProtectedSpan[],
+): number {
+  let idx = text.lastIndexOf(separator, hardEnd - 1);
+  while (idx >= from) {
+    if (!spanContaining(idx, spans) && !spanContaining(idx + separator.length, spans)) {
+      return idx;
+    }
+    if (idx === from) break;
+    idx = text.lastIndexOf(separator, idx - 1);
+  }
+  return -1;
+}
+
+/**
+ * Split `text` into chunks that each fit within `maxLength` (Telegram's hard
+ * message limit by default), breaking on paragraph ("\n\n") boundaries first,
+ * then line breaks, then spaces, and only falling back to a hard cut when no
+ * safe boundary exists. The split never lands inside an HTML tag/entity or a
+ * MarkdownV2 escape/entity for the given `parseMode`.
+ */
+export function splitTelegramMessage(
+  text: string,
+  parseMode?: "MarkdownV2" | "HTML",
+  maxLength: number = TELEGRAM_MAX_MESSAGE_LENGTH,
+): string[] {
+  if (text.length <= maxLength) return [text];
+
+  const spans = getProtectedSpans(text, parseMode);
+  const chunks: string[] = [];
+  let from = 0;
+
+  while (from < text.length) {
+    if (text.length - from <= maxLength) {
+      chunks.push(text.slice(from));
+      break;
+    }
+
+    let hardEnd = retreatFromProtectedSpans(from + maxLength, from, spans);
+    if (hardEnd <= from) hardEnd = from + maxLength;
+
+    let cutEnd = findLastSafeSeparator(text, from, hardEnd, "\n\n", spans);
+    let nextStart: number;
+    if (cutEnd !== -1) {
+      nextStart = cutEnd + 2;
+    } else {
+      cutEnd = findLastSafeSeparator(text, from, hardEnd, "\n", spans);
+      if (cutEnd !== -1) {
+        nextStart = cutEnd + 1;
+      } else {
+        cutEnd = findLastSafeSeparator(text, from, hardEnd, " ", spans);
+        nextStart = cutEnd !== -1 ? cutEnd + 1 : hardEnd;
+        if (cutEnd === -1) cutEnd = hardEnd;
+      }
+    }
+
+    if (cutEnd <= from) {
+      // No safe boundary anywhere in this window (e.g. a single unbreakable
+      // token/entity longer than one chunk) — hard-cut to guarantee progress.
+      cutEnd = from + maxLength;
+      nextStart = cutEnd;
+    }
+
+    chunks.push(text.slice(from, cutEnd));
+    from = nextStart;
+  }
+
+  return chunks;
 }
 
 function stripMarkdown(text: string): string {
