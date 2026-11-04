@@ -114,7 +114,7 @@ export async function handleCommand(
       await handleCreate(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, companyId);
       break;
     case "status":
-      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl, companyId, notificationFlags);
+      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl, companyId, notificationFlags, boardApiToken);
       break;
     case "issues":
       await handleIssues(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl, companyId);
@@ -159,6 +159,7 @@ async function handleStatus(
   publicUrl?: string,
   resolvedCompanyId?: string,
   notificationFlags?: NotificationFlags,
+  boardApiToken?: string,
 ): Promise<void> {
   await sendChatAction(ctx, token, chatId);
 
@@ -174,6 +175,9 @@ async function handleStatus(
       "",
       `${escapeMarkdownV2("🤖")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
       `${escapeMarkdownV2("📋")} Recent issues: *${escapeMarkdownV2(String(issues.length))}* \\(${escapeMarkdownV2(String(doneIssues.length))} done\\)`,
+      boardApiToken
+        ? `${escapeMarkdownV2("🔑")} Board access: connected`
+        : `${escapeMarkdownV2("⚠️")} *Board access: not configured* \\- question/confirmation cards cannot be answered from Telegram until a board API token is set`,
     ];
 
     if (notificationFlags) {

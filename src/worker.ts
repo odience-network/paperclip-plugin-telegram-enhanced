@@ -494,6 +494,13 @@ export function getBotConnectionRegistration(
 // (upstream mvanhorn@8a0e579) and ./runtime-token.ts.
 let runtimeHealth: TelegramRuntimeHealth = { status: "ok" };
 
+// Companies for which the last board-API-token lookup (ODIAA-2699) came back
+// empty. A missing token silently stops interaction cards (and `/approve`)
+// from being answerable, so it must be visible in onHealth()/`/status` — not
+// only a `warn` log nobody is watching. Updated by every resolveBoardApiToken
+// call; cleared the moment that company resolves a token again.
+const boardTokenMissingByCompany = new Set<string>();
+
 // Bridge from the definition-level `onConfigChanged` hook into the live worker
 // closure built by `setup()`. The hook is a sibling of `setup` on the plugin
 // definition, so it has no access to setup's `config`/`token`/`baseUrl`
@@ -563,10 +570,12 @@ async function resolveBoardApiToken(
     if (seen.has(key)) continue;
     seen.add(key);
     try {
-      return await resolveSecretRef(ctx, candidate.ref, {
+      const token = await resolveSecretRef(ctx, candidate.ref, {
         companyId: effectiveCompanyId,
         ...(candidate.configPath ? { configPath: candidate.configPath } : {}),
       });
+      if (effectiveCompanyId) boardTokenMissingByCompany.delete(effectiveCompanyId);
+      return token;
     } catch (err) {
       ctx.logger.warn("Failed to resolve board API token secret", {
         source: candidate.source,
@@ -576,6 +585,7 @@ async function resolveBoardApiToken(
     }
   }
 
+  if (effectiveCompanyId) boardTokenMissingByCompany.add(effectiveCompanyId);
   return undefined;
 }
 
@@ -2654,7 +2664,16 @@ export const plugin = definePlugin({
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
-    return runtimeHealth;
+    if (boardTokenMissingByCompany.size === 0) return runtimeHealth;
+    // A missing board token for even one company means that company's
+    // interaction cards and /approve cannot be answered from Telegram — never
+    // silently drop this to a `warn` log (ODIAA-2699).
+    const companyIds = Array.from(boardTokenMissingByCompany);
+    return {
+      status: runtimeHealth.status === "error" ? "error" : "degraded",
+      message: runtimeHealth.message ?? `Board API token not configured for ${companyIds.length} compan${companyIds.length === 1 ? "y" : "ies"} — question/confirmation cards cannot be answered from Telegram for them.`,
+      details: { ...runtimeHealth.details, boardTokenMissingCompanyIds: companyIds },
+    };
   },
 });
 
@@ -2688,8 +2707,14 @@ export async function handleUpdate(
 
   if (update.callback_query) {
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
-    const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
-    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, config);
+    // Company-scoped (ODIAA-2699): the board token - and the Cloudflare Access
+    // headers that gate reaching it - are a per-company setting, not the
+    // instance-wide `config`. Reading `config` here would silently use
+    // whichever company's save the host replayed last, same collapse the
+    // `configFor` indirection exists to prevent for every other company setting.
+    const companyConfig = configFor(companyId);
+    const boardApiToken = await resolveBoardApiToken(ctx, companyConfig, companyId);
+    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, companyConfig);
     await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders, config.telegramActorMappings);
     return;
   }
@@ -2753,16 +2778,22 @@ export async function handleUpdate(
     }
 
     if (command === "pending") {
-      await handlePending(ctx, token, config, chatId, threadId, baseUrl, companyId);
+      // Company-scoped (ODIAA-2699): `/pending` lists approvals fetched with
+      // this company's own board token, not the instance-wide `config`.
+      await handlePending(ctx, token, configFor(companyId), chatId, threadId, baseUrl, companyId);
       return;
     }
 
     const handledCustom = await tryCustomCommand(ctx, token, chatId, command, args, threadId, companyId);
     if (handledCustom) return;
 
-    // Built-in commands
-    const boardApiToken = command === "approve" ? await resolveBoardApiToken(ctx, config, companyId) : undefined;
-    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, config) : undefined;
+    // Built-in commands. `/status` also needs the board token, so an operator
+    // sees a missing one there instead of only in a `warn` log (ODIAA-2699).
+    // Company-scoped: read through `configFor(companyId)`, not `config`.
+    const commandConfig = configFor(companyId);
+    const boardApiToken =
+      command === "approve" || command === "status" ? await resolveBoardApiToken(ctx, commandConfig, companyId) : undefined;
+    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, commandConfig) : undefined;
     await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(configFor(companyId)));
     return;
   }
@@ -2779,7 +2810,8 @@ export async function handleUpdate(
         ctx,
         token,
         baseUrl,
-        resolveBoardToken: (companyId) => resolveBoardApiToken(ctx, config, companyId),
+        // Company-scoped (ODIAA-2699): the card's own companyId picks the config.
+        resolveBoardToken: (companyId) => resolveBoardApiToken(ctx, configFor(companyId), companyId),
         telegramActorMappings: config.telegramActorMappings,
       };
       if (await handleCardText(deps, msg, cardRef, text)) return;
@@ -2840,7 +2872,12 @@ export async function handleUpdate(
           return;
         }
       }
-      const boardApiToken = await resolveBoardApiToken(ctx, config);
+      // Company-scoped (ODIAA-2699): this mapping carries the company the
+      // interaction belongs to, so both the token ref lookup and its company
+      // scope must use it rather than the primary/unscoped config - the same
+      // rule every other interaction path (callback query, /approve, the
+      // question-card flow) follows.
+      const boardApiToken = await resolveBoardApiToken(ctx, configFor(mapping.companyId), mapping.companyId);
       if (boardApiToken) {
         try {
           const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
