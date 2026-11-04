@@ -6,6 +6,71 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-04
+
+0.4.6 (ODIAA-1930) keyed notification delivery and `/status` per company, but left
+three paths still reading the single primary config: `send_to_telegram`, the board
+token / Cloudflare Access headers / actor mappings used by commands and inbound
+replies, and the daily digest's own schedule. The company directory was also still
+filled only after a company's first notification, `/connect` still reported success
+when its outbound write failed, and health stayed `ok` with zero bot tokens
+configured.
+
+### Security
+
+- **`send_to_telegram` (tool and agent action) resolved its chat from the primary
+  config (ODIAA-2700).** Both call sites passed the single `config` mutable straight
+  to `sendToTelegramTool` instead of `configFor(companyId)`. An agent run for one
+  company could post into another company's chat, or get `disallowed_chat` while its
+  own company had a chat configured, depending on which company's `configChanged`
+  delivery happened to land last. Now scoped like every other company-scoped read.
+- **Board API token, Cloudflare Access headers, and `telegramActorMappings`
+  resolved from the primary config in several inbound paths (ODIAA-2700):**
+  callback-query handling, the `/approve` command, and the native-reply interaction
+  guard. The last of these is the most serious: a cross-company `telegramActorMappings`
+  mismatch is an authorization bug, not just a UX one — it decides who may act on a
+  decision. All three now resolve the config of the company the interaction (or
+  command) actually belongs to.
+
+### Fixed
+
+- **The daily digest decided *whether* to send for every company from the primary
+  config's `digestMode`/time fields.** Company A's digest schedule could suppress or
+  mistime company B's digest. Mode and timing are now read per company inside the
+  per-company loop, alongside the chat/topic routing that was already scoped.
+- **The company directory was filled only by the notification path (ODIAA-1927/2700).**
+  `rememberCompanies` was only called from `resolveIssueLinksOpts`, which only runs
+  after a company's first outbound notification — so `/connect` couldn't list a
+  company that had never notified yet. `applyConfig` now remembers every company the
+  moment its config is delivered (startup replay or an operator save), and a new
+  `refresh-company-directory` scheduled job refreshes the full list from an
+  invocation-scoped context, independent of any notification.
+- **`/connect` reported "Linked" when the outbound chat mapping failed to persist.**
+  It appended a warning but still showed the success text. It now replies only with
+  the actionable cause (configure the plugin for that company, then retry) and never
+  claims success for the half that failed.
+- **Health reported `ok` with zero bot tokens configured.** Every outbound
+  notification then failed silently with no operator-visible cause. `onHealth()` now
+  reports `degraded` / `"no bot connected"` whenever neither the instance-wide
+  connection nor the legacy `telegramBotTokenRef` resolves to a token, and clears back
+  to `ok` once one is connected (live, via config delivery, or cleared).
+- **Every command except `/start`, `/help`, and `/connect` now replies with one
+  "not linked" message in an unlinked chat**, instead of each handler resolving (and
+  sometimes partially using) company state on its own before falling back to its own
+  ad-hoc error text.
+
+### Added
+
+- `/start` replies with a short welcome instead of falling through to "Unknown
+  command" — Telegram's implicit first command in any new chat now works before
+  `/connect` has linked it.
+- The settings page shows which Telegram chat is linked to the current company (or
+  that none is, with the exact `/connect` command to run).
+- [Getting Started](docs/getting-started.md) and the settings page document the
+  multi-company model as steps: connect one bot for the instance, create one group per
+  company, add the bot with privacy mode off, `/connect` each group, configure each
+  company's own settings, verify with `/status`.
+
 ## [0.5.0] — 2026-11-04
 
 Agent questions now reach Telegram and can be answered there like a chat.
