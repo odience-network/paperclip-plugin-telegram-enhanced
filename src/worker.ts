@@ -81,7 +81,7 @@ import {
 import { handleCommandsCommand, tryCustomCommand } from "./command-registry.js";
 import { handleRegisterWatch, checkWatches } from "./watch-registry.js";
 import { AGENT_ERROR_DEDUPLICATION_WINDOW_MS, DEFAULT_CONFIG, METRIC_NAMES } from "./constants.js";
-import { rememberCompanies } from "./company-directory.js";
+import { listCompaniesResilient, rememberCompanies } from "./company-directory.js";
 import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
@@ -1324,6 +1324,9 @@ export const plugin = definePlugin({
       // every token-bound handler start working immediately — no worker restart
       // (the connection lives in plugin state, which does not trigger one).
       token = rawToken;
+      // ODIAA-2700: health must reflect a freshly-connected bot immediately,
+      // not keep reporting a stale "no bot connected" degraded status.
+      runtimeHealth = { status: "ok" };
       ensureBotCommands();
       ctx.logger.info("Telegram bot connected instance-wide", {
         botUsername: next.botUsername,
@@ -1345,6 +1348,15 @@ export const plugin = definePlugin({
       const fallback = await resolveBotToken(ctx, config);
       token = fallback?.token ?? "";
       commandsRegistered = false;
+      if (!token) {
+        // ODIAA-2700: every notification is about to start failing silently
+        // unless health says why.
+        runtimeHealth = {
+          status: "degraded",
+          message: "no bot connected",
+          details: { reason: "no_token_configured" },
+        };
+      }
       ctx.logger.info("Telegram bot connection cleared");
       return getBotConnectionRegistration(cleared, config);
     });
@@ -1357,6 +1369,14 @@ export const plugin = definePlugin({
       ctx.logger.warn(
         "No Telegram bot token configured yet; handlers registered, inbound polling idle until connected via Settings → Bot Connection.",
       );
+      // ODIAA-2700: default health was "ok" even with zero bot tokens
+      // configured, so every outbound notification counted as a silent
+      // failure with no operator-visible cause.
+      runtimeHealth = {
+        status: "degraded",
+        message: "no bot connected",
+        details: { reason: "no_token_configured" },
+      };
     }
 
     // Host → worker configuration delivery (ODIAA-1379). Called once per
@@ -1371,6 +1391,19 @@ export const plugin = definePlugin({
       const merged = { ...DEFAULT_CONFIG, ...next } as unknown as TelegramConfig;
       if (companyId) {
         configByCompany.set(companyId, merged);
+        // `configChanged` is itself a company-scoped invocation (the host is
+        // naming exactly this one company), so this single-company
+        // `companies.get()` call is exactly what the proactive gate admits —
+        // unlike the wildcard `companies.list()` that blocks /connect from the
+        // poll loop. Every company that gets config delivered — at startup
+        // replay or on an operator save — is immediately known to /connect,
+        // not only after it produces its first notification (ODIAA-2700).
+        try {
+          const company = await ctx.companies.get(companyId);
+          await rememberCompanies(ctx, [
+            { id: companyId, ...(company?.name ? { name: company.name } : {}) },
+          ]);
+        } catch { /* best effort — the directory still gets the id via the job below */ }
       } else {
         unscopedConfig = merged;
       }
@@ -1402,6 +1435,15 @@ export const plugin = definePlugin({
         token = nextToken;
         commandsRegistered = false;
       }
+      if (!nextToken) {
+        runtimeHealth = {
+          status: "degraded",
+          message: "no bot connected",
+          details: { reason: "no_token_configured" },
+        };
+      } else if (resolved?.source === "instance-state") {
+        runtimeHealth = { status: "ok" };
+      }
       ensureBotCommands();
 
       ctx.logger.info("Telegram plugin config applied", {
@@ -1423,7 +1465,9 @@ export const plugin = definePlugin({
 
     const invokeSendToTelegramAction = async (params: Record<string, unknown>) => {
       const runCtx = runActionContext(params);
-      const result = await sendToTelegramTool(ctx, token, config, params, runCtx);
+      // This company's own chat/allowlist/file-routes — never the primary
+      // config, which is the cross-company send this ticket fixes (ODIAA-2700).
+      const result = await sendToTelegramTool(ctx, token, configFor(runCtx.companyId), params, runCtx);
       return { content: result.content, data: result.data };
     };
 
@@ -2201,47 +2245,48 @@ export const plugin = definePlugin({
 
     // --- Daily digest job ---
 
-    // Support legacy dailyDigestEnabled boolean. Resolved per run rather than
-    // once at setup: the mode arrives with the host's config delivery, which
-    // lands after registration (ODIAA-1379).
-    const resolveDigestMode = (): string =>
-      (config as Record<string, unknown>).dailyDigestEnabled === true && config.digestMode === "off"
+    // Support legacy dailyDigestEnabled boolean.
+    const resolveDigestMode = (cfg: TelegramConfig): string =>
+      (cfg as Record<string, unknown>).dailyDigestEnabled === true && cfg.digestMode === "off"
         ? "daily"
-        : config.digestMode ?? "off";
+        : cfg.digestMode ?? "off";
+
+    const parseDigestHour = (t: string) => {
+      const [h] = (t || "").split(":");
+      return parseInt(h ?? "", 10);
+    };
 
     ctx.jobs.register("telegram-daily-digest", async () => {
-      const effectiveDigestMode = resolveDigestMode();
-      if (effectiveDigestMode === "off") return;
       // Check if current UTC hour matches a configured digest time
       const nowHour = new Date().getUTCHours();
       const nowMin = new Date().getUTCMinutes();
       if (nowMin >= 5) return; // only fire within first 5 min of the hour
 
-      const parseHour = (t: string) => {
-        const [h] = (t || "").split(":");
-        return parseInt(h ?? "", 10);
-      };
-      const firstHour = parseHour(config.dailyDigestTime);
-      const secondHour = parseHour(config.bidailySecondTime);
-      const tridailyHours = (config.tridailyTimes || "07:00,13:00,19:00")
-        .split(",")
-        .map((t) => parseHour(t.trim()));
-
-      let shouldSend = false;
-      if (effectiveDigestMode === "daily") {
-        shouldSend = nowHour === firstHour;
-      } else if (effectiveDigestMode === "bidaily") {
-        shouldSend = nowHour === firstHour || nowHour === secondHour;
-      } else if (effectiveDigestMode === "tridaily") {
-        shouldSend = tridailyHours.includes(nowHour);
-      }
-      if (!shouldSend) return;
-
       const companies = await ctx.companies.list();
       for (const company of companies) {
-        // The digest *schedule* is instance-wide (one job), but where each
-        // company's digest lands is that company's own setting (ODIAA-1930).
+        // Digest mode and timing are each company's own setting (ODIAA-2700):
+        // company A's schedule must never gate company B's digest, the way a
+        // single primary-config read used to.
         const companyConfig = configFor(company.id);
+        const effectiveDigestMode = resolveDigestMode(companyConfig);
+        if (effectiveDigestMode === "off") continue;
+
+        const firstHour = parseDigestHour(companyConfig.dailyDigestTime);
+        const secondHour = parseDigestHour(companyConfig.bidailySecondTime);
+        const tridailyHours = (companyConfig.tridailyTimes || "07:00,13:00,19:00")
+          .split(",")
+          .map((t) => parseDigestHour(t.trim()));
+
+        let shouldSend = false;
+        if (effectiveDigestMode === "daily") {
+          shouldSend = nowHour === firstHour;
+        } else if (effectiveDigestMode === "bidaily") {
+          shouldSend = nowHour === firstHour || nowHour === secondHour;
+        } else if (effectiveDigestMode === "tridaily") {
+          shouldSend = tridailyHours.includes(nowHour);
+        }
+        if (!shouldSend) continue;
+
         const chatId = await resolveChat(
           ctx,
           company.id,
@@ -2379,13 +2424,15 @@ export const plugin = definePlugin({
     }, async (params: unknown, runCtx) => {
       const p = params as Record<string, unknown>;
       const escalationId = crypto.randomUUID();
-      const timeoutMs = config.escalationTimeoutMs || 900000;
-      const defaultAction = config.escalationDefaultAction || "defer";
+      // This company's own escalation settings (ODIAA-2700), not the primary config.
+      const cfg = configFor(runCtx.companyId);
+      const timeoutMs = cfg.escalationTimeoutMs || 900000;
+      const defaultAction = cfg.escalationDefaultAction || "defer";
 
       const resolvedEscalationChatId = await resolveChat(
         ctx,
         runCtx.companyId,
-        config.escalationChatId,
+        cfg.escalationChatId,
       );
       if (!resolvedEscalationChatId) {
         ctx.logger.warn("Escalation received but no escalationChatId configured");
@@ -2418,8 +2465,8 @@ export const plugin = definePlugin({
       await escalationManager.create(ctx, token, escalationEvent, resolvedEscalationChatId);
 
       // Send hold message to the originating chat if configured
-      if (config.escalationHoldMessage && escalationEvent.originChatId) {
-        const holdText = escapeMarkdownV2(config.escalationHoldMessage);
+      if (cfg.escalationHoldMessage && escalationEvent.originChatId) {
+        const holdText = escapeMarkdownV2(cfg.escalationHoldMessage);
         await sendMessage(ctx, token, escalationEvent.originChatId, holdText, {
           parseMode: "MarkdownV2",
           messageThreadId: escalationEvent.originThreadId ? Number(escalationEvent.originThreadId) : undefined,
@@ -2472,8 +2519,11 @@ export const plugin = definePlugin({
     });
 
     // --- Agent file-send tool (ant013 TEL-8 / TEL-23) ---
+    // This company's own chat/allowlist/file-routes — never the primary config
+    // (ODIAA-2700): `send_to_telegram` is the agent-callable path, so a cross-
+    // company fallback here is a cross-tenant message leak, not just a UX bug.
     const sendToTelegram = (params: unknown, runCtx: { companyId: string; agentId: string }) =>
-      sendToTelegramTool(ctx, token, config, params, runCtx);
+      sendToTelegramTool(ctx, token, configFor(runCtx.companyId), params, runCtx);
 
     const sendToTelegramParametersSchema = {
       type: "object",
@@ -2599,6 +2649,22 @@ export const plugin = definePlugin({
       }
     });
 
+    // --- Company directory refresh (ODIAA-2700) ---
+    // `/connect` must list every configured company, not only companies that
+    // have already produced a notification. `applyConfig` above covers a
+    // company the moment its config is delivered; this job is the other
+    // half — it runs in an invocation-scoped context (unlike the proactive
+    // poll loop), so it is one of the few places `ctx.companies.list()` is
+    // admitted, and it keeps the directory current even for companies that
+    // have not touched this plugin's settings yet.
+    ctx.jobs.register("refresh-company-directory", async () => {
+      try {
+        await listCompaniesResilient(ctx);
+      } catch (err) {
+        ctx.logger.error("Company directory refresh failed", { error: String(err) });
+      }
+    });
+
     ctx.logger.info("Telegram bot plugin started (Chat OS v2 - all 5 phases)");
   },
 
@@ -2707,15 +2773,14 @@ export async function handleUpdate(
 
   if (update.callback_query) {
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
-    // Company-scoped (ODIAA-2699): the board token - and the Cloudflare Access
-    // headers that gate reaching it - are a per-company setting, not the
-    // instance-wide `config`. Reading `config` here would silently use
-    // whichever company's save the host replayed last, same collapse the
-    // `configFor` indirection exists to prevent for every other company setting.
-    const companyConfig = configFor(companyId);
-    const boardApiToken = await resolveBoardApiToken(ctx, companyConfig, companyId);
-    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, companyConfig);
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders, config.telegramActorMappings);
+    // This company's own board token / CF Access / actor mappings (ODIAA-2700)
+    // — not the primary config. `telegramActorMappings` in particular guards
+    // who may act on a decision; the wrong company's mapping is a cross-tenant
+    // authorization bug, not just a UX one.
+    const cfg = configFor(companyId);
+    const boardApiToken = await resolveBoardApiToken(ctx, cfg, companyId);
+    const cfAccessHeaders = await resolveCfAccessHeaders(ctx, cfg);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, cfAccessHeaders, cfg.telegramActorMappings);
     return;
   }
 
@@ -2730,10 +2795,11 @@ export async function handleUpdate(
   if (hasMedia) {
     const companyId = await resolveCompanyIdOrNull(ctx, chatId);
     if (companyId) {
+      const cfg = configFor(companyId);
       const handled = await handleMediaMessage(ctx, token, msg as Parameters<typeof handleMediaMessage>[2], {
-        briefAgentId: config.briefAgentId ?? "",
-        briefAgentChatIds: config.briefAgentChatIds ?? [],
-        transcriptionApiKeyRef: config.transcriptionApiKeyRef ?? "",
+        briefAgentId: cfg.briefAgentId ?? "",
+        briefAgentChatIds: cfg.briefAgentChatIds ?? [],
+        transcriptionApiKeyRef: cfg.transcriptionApiKeyRef ?? "",
         publicUrl,
       }, companyId);
       if (handled) return;
@@ -2789,12 +2855,14 @@ export async function handleUpdate(
 
     // Built-in commands. `/status` also needs the board token, so an operator
     // sees a missing one there instead of only in a `warn` log (ODIAA-2699).
-    // Company-scoped: read through `configFor(companyId)`, not `config`.
-    const commandConfig = configFor(companyId);
+    // This company's own board token / CF Access / maxAgentsPerThread
+    // (ODIAA-2700), matching the notification flags below — not the primary
+    // `config`.
+    const cfg = configFor(companyId);
     const boardApiToken =
-      command === "approve" || command === "status" ? await resolveBoardApiToken(ctx, commandConfig, companyId) : undefined;
-    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, commandConfig) : undefined;
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, config.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(configFor(companyId)));
+      command === "approve" || command === "status" ? await resolveBoardApiToken(ctx, cfg, companyId) : undefined;
+    const cfAccessHeaders = command === "approve" ? await resolveCfAccessHeaders(ctx, cfg) : undefined;
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId, boardApiToken, cfg.maxAgentsPerThread, cfAccessHeaders, notificationFlagsOf(cfg));
     return;
   }
 
@@ -2844,6 +2912,14 @@ export async function handleUpdate(
     }) as StoredMessageMapping | null;
 
     if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
+      // The interaction belongs to the company that originated it (stamped on
+      // the outbound mapping at send time), not whichever company this chat
+      // happens to be linked to right now — same org-routing invariant as
+      // `routeInboundReply` below (ODIAA-936), and load-bearing here: the
+      // wrong company's `telegramActorMappings` is a cross-tenant
+      // authorization bug (ODIAA-2700), not just a UX one.
+      const interactionCfg = configFor(mapping.companyId);
+
       // User-scoped ownership guard (ODIAA-938 / TWX-525), native-reply path. Same
       // deny-by-default rule as the callback guard, keyed on the immutable numeric id,
       // applied BEFORE any board API call. The ephemeral error must not reveal the
@@ -2851,7 +2927,7 @@ export async function handleUpdate(
       {
         const { allowed, actorUserId } = evaluateDecisionActor({
           ownerUserId: mapping.ownerUserId,
-          telegramActorMappings: config.telegramActorMappings,
+          telegramActorMappings: interactionCfg.telegramActorMappings,
           fromId: msg.from?.id,
         });
         if (!allowed) {
@@ -2877,7 +2953,7 @@ export async function handleUpdate(
       // scope must use it rather than the primary/unscoped config - the same
       // rule every other interaction path (callback query, /approve, the
       // question-card flow) follows.
-      const boardApiToken = await resolveBoardApiToken(ctx, configFor(mapping.companyId), mapping.companyId);
+      const boardApiToken = await resolveBoardApiToken(ctx, interactionCfg, mapping.companyId);
       if (boardApiToken) {
         try {
           const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
