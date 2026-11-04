@@ -29,6 +29,23 @@ When an agent asks the board something (`ask_user_questions`) or asks for a go-a
 
 Paperclip (at least up to 2026.1023) does not emit an interaction event to plugins, so the plugin checks the task when the asking agent's run ends (`agent.run.finished` / `failed` / `cancelled`). A card therefore arrives a moment after the run that asked. A sync job every 5 minutes closes settled cards and sends reminders, but it does not discover brand-new interactions on its own — a question raised outside of a run only reaches Telegram once a later run on that issue ends, or once the host starts emitting the event. Requires the `issue.interactions.read` capability; answering requires [board access](getting-started.md#6-enable-approval-buttons-board-access) **configured for that question's own company** — a missing token is reported per company in `/status` and the plugin's health check, not only logged.
 
+## Long messages
+
+Telegram rejects any single message over 4096 characters. Notifications and the
+agent `send_to_telegram` tool no longer hit that wall:
+
+- Any outbound message over the limit is split into multiple Telegram messages —
+  on paragraph, then line, then word boundaries — rather than being truncated or
+  rejected. The split never lands inside an HTML tag/entity or a MarkdownV2
+  escape/entity, so formatting never breaks across chunks. Later chunks reply to
+  the previous one so they thread together; only the first chunk carries the
+  original reply-to/topic, and only the last chunk carries any inline keyboard.
+- Text snippets embedded in notifications (issue descriptions, comments, agent
+  error messages, …) are still capped — at `DEFAULT_TEXT_SNIPPET_LIMIT` (3500
+  characters) — so one pathologically long field can't blow a single
+  notification up into dozens of chat messages. When a snippet is cut, a
+  **Read more** link to the issue (or approval's linked issue) is appended.
+
 ## Interactive approvals
 
 Every approval notification includes inline **Approve** / **Reject** buttons:

@@ -10,6 +10,7 @@ import {
   formatIssueBlocked,
   formatBoardMention,
   formatResolvedDecision,
+  DEFAULT_TEXT_SNIPPET_LIMIT,
 } from "../src/formatters.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
@@ -59,11 +60,30 @@ describe("formatIssueCreated", () => {
     expect(msg.text).toContain("A long description");
   });
 
-  it("truncates long descriptions at word boundary", () => {
+  it("does not truncate descriptions well under the shared snippet limit", () => {
     const words = Array(50).fill("word").join(" ");
     const msg = formatIssueCreated(mockEvent({ description: words }));
+    expect(msg.text).not.toContain("\\.\\.\\.");
+    expect(msg.text).toContain(words);
+  });
+
+  it("truncates descriptions past the shared snippet limit and appends a Read more link", () => {
+    const words = Array(DEFAULT_TEXT_SNIPPET_LIMIT).fill("word").join(" ");
+    const msg = formatIssueCreated(
+      mockEvent({ description: words }),
+      { baseUrl: "https://app.example.com", issuePrefix: "PROJ" },
+    );
     expect(msg.text).toContain("\\.\\.\\.");
-    expect(msg.text.length).toBeLessThan(words.length * 2);
+    expect(msg.text.length).toBeLessThan(words.length);
+    expect(msg.text).toContain("Read more");
+    expect(msg.text).toContain("https://app.example.com/PROJ/issues/PROJ-42");
+  });
+
+  it("truncates descriptions past the limit without a Read more link when no issue URL is available", () => {
+    const words = Array(DEFAULT_TEXT_SNIPPET_LIMIT).fill("word").join(" ");
+    const msg = formatIssueCreated(mockEvent({ description: words }));
+    expect(msg.text).toContain("\\.\\.\\.");
+    expect(msg.text).not.toContain("Read more");
   });
 
   it("omits metadata line when no metadata", () => {
@@ -94,10 +114,20 @@ describe("formatIssueDone", () => {
     expect(msg.text).toContain("Board prep package completed for Q3");
   });
 
-  it("truncates long comments", () => {
+  it("does not truncate comments well under the shared snippet limit", () => {
     const longComment = Array(80).fill("word").join(" ");
     const msg = formatIssueDone(mockEvent({ comment: longComment }));
+    expect(msg.text).not.toContain("\\.\\.\\.");
+  });
+
+  it("truncates comments past the shared snippet limit and appends a Read more link", () => {
+    const longComment = Array(DEFAULT_TEXT_SNIPPET_LIMIT).fill("word").join(" ");
+    const msg = formatIssueDone(
+      mockEvent({ comment: longComment }),
+      { baseUrl: "https://app.example.com", issuePrefix: "PROJ" },
+    );
     expect(msg.text).toContain("\\.\\.\\.");
+    expect(msg.text).toContain("Read more");
   });
 
   it("omits comment section when no comment", () => {
@@ -195,10 +225,34 @@ describe("formatApprovalCreated", () => {
     expect(msg.text).toContain("Linked Issues");
   });
 
-  it("truncates description at word boundary", () => {
+  it("does not truncate descriptions well under the shared snippet limit", () => {
     const longDesc = Array(80).fill("word").join(" ");
     const msg = formatApprovalCreated(mockEvent({ description: longDesc }));
+    expect(msg.text).not.toContain("\\.\\.\\.");
+  });
+
+  it("truncates descriptions past the shared snippet limit and links Read more to the first linked issue", () => {
+    const longDesc = Array(DEFAULT_TEXT_SNIPPET_LIMIT).fill("word").join(" ");
+    const msg = formatApprovalCreated(
+      mockEvent({
+        description: longDesc,
+        linkedIssues: [{ identifier: "ISS-1", title: "First", status: "open" }],
+      }),
+      { baseUrl: "https://app.example.com", issuePrefix: "PROJ" },
+    );
     expect(msg.text).toContain("\\.\\.\\.");
+    expect(msg.text).toContain("Read more");
+    expect(msg.text).toContain("https://app.example.com/PROJ/issues/ISS-1");
+  });
+
+  it("truncates descriptions past the limit without a Read more link when there is no linked issue", () => {
+    const longDesc = Array(DEFAULT_TEXT_SNIPPET_LIMIT).fill("word").join(" ");
+    const msg = formatApprovalCreated(
+      mockEvent({ description: longDesc }),
+      { baseUrl: "https://app.example.com", issuePrefix: "PROJ" },
+    );
+    expect(msg.text).toContain("\\.\\.\\.");
+    expect(msg.text).not.toContain("Read more");
   });
 });
 
@@ -212,11 +266,23 @@ describe("formatAgentError", () => {
     expect(msg.text).toContain("Connection refused");
   });
 
-  it("truncates long error messages", () => {
-    const longError = "x".repeat(600);
-    const msg = formatAgentError(mockEvent({ error: longError }));
+  it("does not truncate error messages well under the shared snippet limit", () => {
+    const error = "x".repeat(600);
+    const msg = formatAgentError(mockEvent({ error }));
+    expect(msg.text).not.toContain("\\.\\.\\.");
+    expect(msg.text).toContain("x".repeat(600));
+  });
+
+  it("truncates error messages past the shared snippet limit and links Read more to the issue", () => {
+    const longError = "x".repeat(DEFAULT_TEXT_SNIPPET_LIMIT + 500);
+    const msg = formatAgentError(
+      mockEvent({ error: longError, issueIdentifier: "PROJ-99" }),
+      { baseUrl: "https://app.example.com", issuePrefix: "PROJ" },
+    );
     expect(msg.text).toContain("\\.\\.\\.");
-    expect(msg.text).not.toContain("x".repeat(501));
+    expect(msg.text).not.toContain("x".repeat(DEFAULT_TEXT_SNIPPET_LIMIT + 1));
+    expect(msg.text).toContain("Read more");
+    expect(msg.text).toContain("https://app.example.com/PROJ/issues/PROJ-99");
   });
 
   it("falls back to entityId for agent name", () => {
