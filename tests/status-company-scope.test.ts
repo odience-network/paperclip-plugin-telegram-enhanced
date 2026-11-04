@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { handleUpdate } from "../src/worker.js";
+import { handleUpdate, plugin } from "../src/worker.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DEFAULT_CONFIG } from "../src/constants.js";
 
@@ -30,7 +30,7 @@ vi.mock("../src/telegram-api.js", async () => {
 const LINKED_CHAT = 4242;
 const COMPANY_ID = "9d8f432c-ff7d-4e3a-bbe3-3cd355f73b64";
 
-function mockCtx(): PluginContext {
+function mockCtx(opts: { secrets?: Record<string, string> } = {}): PluginContext {
   return {
     http: { fetch: vi.fn().mockResolvedValue({ json: () => Promise.resolve({ ok: true }) }) },
     metrics: { write: vi.fn(async () => {}) },
@@ -44,6 +44,14 @@ function mockCtx(): PluginContext {
     companies: { get: vi.fn().mockResolvedValue(null) },
     agents: { list: vi.fn().mockResolvedValue([]) },
     issues: { list: vi.fn().mockResolvedValue([]) },
+    secrets: {
+      resolve: vi.fn(async (binding: { secretId: string } | string) => {
+        const secretId = typeof binding === "string" ? binding : binding.secretId;
+        const resolved = opts.secrets?.[secretId];
+        if (!resolved) throw new Error(`No such secret: ${secretId}`);
+        return resolved;
+      }),
+    },
   } as unknown as PluginContext;
 }
 
@@ -113,5 +121,41 @@ describe("/status notification flags (ODIAA-1930)", () => {
     );
 
     expect(sentMessages.map((m) => m.text).join("\n")).toContain("task complete");
+  });
+});
+
+// ODIAA-2699 — every board-API-token lookup must read the event/card's own
+// company's config, and a missing token must be visible, not just a warn log.
+describe("/status and onHealth board-token visibility (ODIAA-2699)", () => {
+  const TOKEN_REF_A = "11111111-1111-1111-1111-111111111111";
+  const OTHER_COMPANY_ID = "8f55e80b-0264-4ab6-9d56-8b2652f18005";
+
+  it("reports the token configured for the linked company, not another company's", async () => {
+    const ctx = mockCtx({ secrets: { [TOKEN_REF_A]: "resolved-token-A" } });
+    // Company A has a board token configured; "another" company does not.
+    const configFor = (companyId?: string | null) =>
+      (companyId === COMPANY_ID
+        ? { ...DEFAULT_CONFIG, paperclipBoardApiTokenRef: TOKEN_REF_A }
+        : { ...DEFAULT_CONFIG }) as unknown as Parameters<typeof handleUpdate>[2];
+
+    await handleUpdate(ctx, "111:TOKEN", instanceConfig, statusCommandUpdate(), "http://localhost:3100", undefined, undefined, configFor);
+    expect(sentMessages.map((m) => m.text).join("\n")).toContain("Board access: connected");
+
+    sentMessages = [];
+    stateStore = { [`chat_${LINKED_CHAT}`]: { companyId: OTHER_COMPANY_ID } };
+    await handleUpdate(ctx, "111:TOKEN", instanceConfig, statusCommandUpdate(), "http://localhost:3100", undefined, undefined, configFor);
+    expect(sentMessages.map((m) => m.text).join("\n")).toContain("Board access: not configured");
+  });
+
+  it("surfaces a missing board token in onHealth(), not only a warn log", async () => {
+    const ctx = mockCtx({ secrets: { [TOKEN_REF_A]: "resolved-token-A" } });
+    stateStore = { [`chat_${LINKED_CHAT}`]: { companyId: OTHER_COMPANY_ID } };
+    const configFor = () => ({ ...DEFAULT_CONFIG }) as unknown as Parameters<typeof handleUpdate>[2];
+
+    await handleUpdate(ctx, "111:TOKEN", instanceConfig, statusCommandUpdate(), "http://localhost:3100", undefined, undefined, configFor);
+
+    const health = await plugin.definition.onHealth?.();
+    expect(health?.status).not.toBe("ok");
+    expect(health?.details?.boardTokenMissingCompanyIds).toContain(OTHER_COMPANY_ID);
   });
 });
