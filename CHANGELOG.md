@@ -6,7 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-04
+
 Agent questions now reach Telegram and can be answered there like a chat.
+
+### ⚠️ Upgrade note
+
+This release adds the **`issue.interactions.read`** capability (to look up an
+issue's pending interactions and settle its question cards). **Existing
+installs move to `upgrade_pending`.** A board member must approve the new
+capability — this step is **board-only**; an agent cannot grant it to itself.
+Until approved, the plugin keeps running on its previously-granted
+capabilities and agent questions do not reach Telegram.
 
 ### Fixed
 
@@ -15,10 +26,34 @@ Agent questions now reach Telegram and can be answered there like a chat.
   plugins (it is not in `PLUGIN_EVENT_TYPES`, and no activity action maps to
   it). Cards are now delivered when the asking agent's run ends, using
   `issues.listInteractions` (new `issue.interactions.read` capability). The
-  old subscription stays for hosts that emit the event.
+  old subscription stays for hosts that emit the event. **Push delivery still
+  depends on that host change**, which has not shipped: until it does, a card
+  arrives when the asking agent's run ends, or within the sync job's reach for
+  an already-delivered card - not the instant a board-created interaction is
+  created.
 - **Interaction answers failed on co-located boards.** Calls to
   `/api/issues/:id/interactions/...` went through `ctx.http`, which refuses
   loopback addresses. They now use the same loopback rule as approvals.
+- **Question parsing only read the legacy `payload.questions[]` shape.** A
+  real interaction's primary schema is `payload.questionSet.questions[]`
+  (`answerMode`: `single_select` / `multi_select` / `text`). Cards now read
+  `questionSet` first and fall back to the legacy shape only when it is
+  absent, so text questions render and can be answered by a plain reply.
+- **The board API token was read from the instance-wide config, not the
+  interaction's own company.** On a multi-company instance this silently used
+  whichever company's settings the host replayed last - the callback-query,
+  `/approve`, `/pending`, `/status`, question-card and legacy interaction-reply
+  paths are now all scoped to the event/card's own `companyId`.
+- **A missing board token was only a `warn` log.** It is now reported per
+  company in the plugin's health check and in `/status`, so a question/
+  confirmation that cannot be answered from Telegram is visible, not silent.
+- **A question card capped options at 12 per question and truncated agent
+  text with no visible sign anything was cut.** A card now keeps every
+  question and option as a button; if the card still will not fit in
+  Telegram's 4096-character message limit, narrative text (the agent's
+  comment, help text) is dropped first, and only as a last resort is the text
+  hard-truncated with an explicit "Open in Paperclip to see all N questions"
+  link - a question or option is never silently dropped.
 - `/create` left tasks unassigned when no agent had the literal role `ceo`; it
   now falls back to the top-level agent.
 

@@ -27,7 +27,7 @@ When an agent asks the board something (`ask_user_questions`) or asks for a go-a
 - **Stays in sync:** when the question is answered in the board, withdrawn or expires, the card is updated and its buttons removed.
 - **Reminders:** an unanswered card is re-pinged (`questionReminderMinutes`, `questionReminderMaxCount`).
 
-Paperclip (at least up to 2026.1023) does not emit an interaction event to plugins, so the plugin checks the task when the asking agent's run ends (`agent.run.finished` / `failed` / `cancelled`). A card therefore arrives a moment after the run that asked. A sync job every 5 minutes closes settled cards and sends reminders. Requires the `issue.interactions.read` capability; answering requires [board access](getting-started.md#6-enable-approval-buttons-board-access).
+Paperclip (at least up to 2026.1023) does not emit an interaction event to plugins, so the plugin checks the task when the asking agent's run ends (`agent.run.finished` / `failed` / `cancelled`). A card therefore arrives a moment after the run that asked. A sync job every 5 minutes closes settled cards and sends reminders, but it does not discover brand-new interactions on its own — a question raised outside of a run only reaches Telegram once a later run on that issue ends, or once the host starts emitting the event. Requires the `issue.interactions.read` capability; answering requires [board access](getting-started.md#6-enable-approval-buttons-board-access) **configured for that question's own company** — a missing token is reported per company in `/status` and the plugin's health check, not only logged.
 
 ## Interactive approvals
 
