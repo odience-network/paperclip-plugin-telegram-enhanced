@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-11-04
+
+Follow-up to 0.4.7's review: a failed chunk after the first could be reported
+as a clean success, long HTML/MarkdownV2 formatting elements split across
+chunks broke Telegram's parser, and an entity longer than one chunk was
+hard-cut mid-word (ODIAA-2701).
+
+### Fixed
+
+- **A chunk failure after the first was reported as a plain success
+  (ODIAA-2701).** `sendMessageWithResult` returned the first chunk's message id
+  with no indication that a later chunk failed, so `send_to_telegram` (which only
+  checked for a null message id) told the agent `ok: true` even though most of
+  the text never arrived. A failed later chunk now sets `partial: true` with
+  `deliveredChunks`/`totalChunks` and Telegram's `description`, which
+  `send_to_telegram` surfaces alongside `ok: true` (the already-sent chunks are
+  real messages; silently calling it a failure would invite a duplicate resend).
+- **Splitting inside an HTML or MarkdownV2 formatting element broke the next
+  chunk's markup (ODIAA-2701).** A `<b>`/`<pre>`/... element (or a MarkdownV2
+  bold/italic/underline/strikethrough/spoiler/code/pre span) that straddled a
+  4096-char boundary left one chunk with an unclosed tag and the next with a
+  dangling closing tag — Telegram rejected the HTML chunk outright (no
+  plain-text fallback exists for HTML), and the MarkdownV2 chunk only survived
+  via its plain-text fallback, losing formatting. The splitter now closes the
+  open element at the end of a chunk and reopens the same markup at the start of
+  the next.
+- **An entity longer than one chunk was hard-cut mid-word (ODIAA-2701).** A
+  MarkdownV2 code block (or any single formatting element) longer than 4096
+  characters used to be treated as one unsplittable span, so the cut fell back
+  to a raw 4096-character hard cut with no regard for word boundaries. Combined
+  with the fix above, the splitter now searches for a paragraph/line/word
+  boundary inside the element's own content instead.
+
 ## [0.4.7] — 2026-11-04
 
 Notifications and `send_to_telegram` silently cut long text instead of delivering

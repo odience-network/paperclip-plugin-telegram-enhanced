@@ -39,6 +39,12 @@ export type SendMessageResult = {
   messageId: number | null;
   /** Telegram's own failure reason (the API's `description` field), set only when the send failed. */
   errorDescription?: string;
+  /** True when a split message had some chunks delivered before a later chunk failed. */
+  partial?: boolean;
+  /** Number of chunks successfully delivered before the failure, set only when `partial` is true. */
+  deliveredChunks?: number;
+  /** Total number of chunks the message was split into, set only when `partial` is true. */
+  totalChunks?: number;
 };
 
 /** Telegram rejects any sendMessage/caption whose text exceeds 4096 characters. */
@@ -156,7 +162,19 @@ export async function sendMessageWithResult(
 
     const result = await sendMessageChunk(ctx, token, chatId, chunks[i]!, chunkOptions);
     if (result.messageId == null) {
-      return { messageId: firstMessageId, errorDescription: result.errorDescription };
+      // At least one earlier chunk already landed in the chat — the caller must
+      // not treat this as a clean failure, since silently retrying would re-send
+      // the delivered part too. Surface it as a partial delivery instead.
+      if (firstMessageId != null) {
+        return {
+          messageId: firstMessageId,
+          errorDescription: result.errorDescription,
+          partial: true,
+          deliveredChunks: i,
+          totalChunks: chunks.length,
+        };
+      }
+      return { messageId: null, errorDescription: result.errorDescription };
     }
     if (isFirst) firstMessageId = result.messageId;
     previousMessageId = result.messageId;
@@ -461,21 +479,81 @@ export function truncateAtWord(text: string, maxLen: number): string {
 // notifications and `send_to_telegram` payloads must be split across several
 // messages rather than truncated or failed outright. The split must never land
 // inside an HTML tag/entity or a MarkdownV2 escape/entity, or Telegram's parser
-// rejects the chunk that got the broken half.
+// rejects the chunk that got the broken half. Formatting elements (HTML tag
+// pairs; MarkdownV2 bold/italic/underline/strikethrough/spoiler/code/pre) are
+// allowed to straddle a split: the element is closed at the end of one chunk
+// and the same markup is reopened at the start of the next, so long elements
+// (e.g. a `pre` block of log output) can still be split on a word boundary
+// instead of being hard-cut mid-word.
 
 type TelegramParseMode = "MarkdownV2" | "HTML" | undefined;
 
-/** A half-open [start, end) character range that must never be split. */
+/** A half-open [start, end) character range that must never be split (escape pairs, tag/entity text, link entities, and the open/close markers of reopenable elements). */
 type ProtectedSpan = [number, number];
 
-function findHtmlProtectedSpans(text: string): ProtectedSpan[] {
+/**
+ * A formatting element whose markup may be closed at a chunk boundary and
+ * reopened at the start of the next chunk. `contentStart`/`contentEnd` bound
+ * the region where a split is allowed (inclusive of both ends, since cutting
+ * exactly at either edge still requires closing/reopening the element).
+ */
+type ReopenElement = {
+  start: number;
+  end: number;
+  openText: string;
+  closeText: string;
+  contentStart: number;
+  contentEnd: number;
+};
+
+type SplitStructure = {
+  spans: ProtectedSpan[];
+  elements: ReopenElement[];
+};
+
+function findHtmlStructure(text: string): SplitStructure {
   const spans: ProtectedSpan[] = [];
-  const tagOrEntity = /<[^>]*>|&#?[a-zA-Z0-9]+;/g;
+  const elements: ReopenElement[] = [];
+  const tagOrEntity = /<\/?[^<>]*>|&#?[a-zA-Z0-9]+;/g;
+  const stack: Array<{ tagText: string; start: number; name: string }> = [];
   let match: RegExpExecArray | null;
+
   while ((match = tagOrEntity.exec(text))) {
-    spans.push([match.index, match.index + match[0].length]);
+    const raw = match[0];
+    const start = match.index;
+    const end = start + raw.length;
+    spans.push([start, end]);
+
+    if (raw[0] !== "<") continue; // an HTML entity, not a tag
+
+    if (raw.startsWith("</")) {
+      const name = raw.slice(2, -1).trim().toLowerCase();
+      const openIdx = stack.findIndex((t) => t.name === name);
+      if (openIdx !== -1) {
+        const open = stack[openIdx]!;
+        // Drop anything left unclosed inside this element (malformed/overlapping
+        // markup) — best effort; this plugin's own formatters only ever nest cleanly.
+        stack.length = openIdx;
+        elements.push({
+          start: open.start,
+          end,
+          openText: open.tagText,
+          closeText: raw,
+          contentStart: open.start + open.tagText.length,
+          contentEnd: start,
+        });
+      }
+      continue;
+    }
+
+    if (raw.endsWith("/>")) continue; // self-closing, e.g. <br/>
+
+    const name = raw.slice(1, -1).trim().split(/\s/)[0]!.toLowerCase();
+    stack.push({ tagText: raw, start, name });
   }
-  return spans;
+
+  elements.sort((a, b) => a.start - b.start);
+  return { spans, elements };
 }
 
 /** Index of the next `char` at/after `from` that isn't itself an escaped character, or -1. */
@@ -490,14 +568,30 @@ function findUnescapedIndex(text: string, char: string, from: number): number {
   return -1;
 }
 
-// Scans for MarkdownV2 escape pairs (`\.` etc.) and entity spans (bold, italic,
-// underline, strikethrough, spoiler, code, pre, links) so none of them are ever
-// split across two chunks. Entities are matched as simple, non-nested spans,
-// which covers everything this plugin's own formatters generate.
-function findMarkdownV2ProtectedSpans(text: string): ProtectedSpan[] {
+// Scans for MarkdownV2 escape pairs (`\.` etc.), link entities (kept atomic —
+// short, and reopening a link partway through its label has no sane meaning),
+// and the reopenable bold/italic/underline/strikethrough/spoiler/code/pre
+// entities. Entities are matched as simple, non-nested spans, which covers
+// everything this plugin's own formatters generate.
+function findMarkdownV2Structure(text: string): SplitStructure {
   const spans: ProtectedSpan[] = [];
+  const elements: ReopenElement[] = [];
   const n = text.length;
   let i = 0;
+
+  function pushElement(openStart: number, openEnd: number, closeStart: number, closeEnd: number) {
+    spans.push([openStart, openEnd]);
+    spans.push([closeStart, closeEnd]);
+    elements.push({
+      start: openStart,
+      end: closeEnd,
+      openText: text.slice(openStart, openEnd),
+      closeText: text.slice(closeStart, closeEnd),
+      contentStart: openEnd,
+      contentEnd: closeStart,
+    });
+  }
+
   while (i < n) {
     const ch = text[i];
     if (ch === "\\") {
@@ -520,11 +614,12 @@ function findMarkdownV2ProtectedSpans(text: string): ProtectedSpan[] {
     }
     if (ch === "`") {
       const isPre = text.slice(i, i + 3) === "```";
+      const markerLen = isPre ? 3 : 1;
       const marker = isPre ? "```" : "`";
-      const end = text.indexOf(marker, i + marker.length);
+      const end = text.indexOf(marker, i + markerLen);
       if (end !== -1) {
-        spans.push([i, end + marker.length]);
-        i = end + marker.length;
+        pushElement(i, i + markerLen, end, end + markerLen);
+        i = end + markerLen;
         continue;
       }
       i++;
@@ -534,7 +629,7 @@ function findMarkdownV2ProtectedSpans(text: string): ProtectedSpan[] {
       const marker = ch + ch;
       const end = text.indexOf(marker, i + 2);
       if (end !== -1) {
-        spans.push([i, end + 2]);
+        pushElement(i, i + 2, end, end + 2);
         i = end + 2;
         continue;
       }
@@ -544,7 +639,7 @@ function findMarkdownV2ProtectedSpans(text: string): ProtectedSpan[] {
     if (ch === "*" || ch === "_" || ch === "~") {
       const end = findUnescapedIndex(text, ch, i + 1);
       if (end !== -1) {
-        spans.push([i, end + 1]);
+        pushElement(i, i + 1, end, end + 1);
         i = end + 1;
         continue;
       }
@@ -553,13 +648,15 @@ function findMarkdownV2ProtectedSpans(text: string): ProtectedSpan[] {
     }
     i++;
   }
-  return spans;
+
+  elements.sort((a, b) => a.start - b.start);
+  return { spans, elements };
 }
 
-function getProtectedSpans(text: string, parseMode: TelegramParseMode): ProtectedSpan[] {
-  if (parseMode === "HTML") return findHtmlProtectedSpans(text);
-  if (parseMode === "MarkdownV2") return findMarkdownV2ProtectedSpans(text);
-  return [];
+function getStructure(text: string, parseMode: TelegramParseMode): SplitStructure {
+  if (parseMode === "HTML") return findHtmlStructure(text);
+  if (parseMode === "MarkdownV2") return findMarkdownV2Structure(text);
+  return { spans: [], elements: [] };
 }
 
 /** The span that strictly contains `index` (splitting there would divide it), if any. */
@@ -601,12 +698,48 @@ function findLastSafeSeparator(
   return -1;
 }
 
+/** Finds the best split point in [from, hardEnd), preferring paragraph, then line, then word boundaries. */
+function findSplitBoundary(
+  text: string,
+  from: number,
+  hardEnd: number,
+  spans: ProtectedSpan[],
+): { cutEnd: number; nextStart: number } {
+  let safeHardEnd = retreatFromProtectedSpans(hardEnd, from, spans);
+  if (safeHardEnd <= from) safeHardEnd = hardEnd;
+
+  let cutEnd = findLastSafeSeparator(text, from, safeHardEnd, "\n\n", spans);
+  if (cutEnd !== -1) return { cutEnd, nextStart: cutEnd + 2 };
+
+  cutEnd = findLastSafeSeparator(text, from, safeHardEnd, "\n", spans);
+  if (cutEnd !== -1) return { cutEnd, nextStart: cutEnd + 1 };
+
+  cutEnd = findLastSafeSeparator(text, from, safeHardEnd, " ", spans);
+  if (cutEnd !== -1) return { cutEnd, nextStart: cutEnd + 1 };
+
+  if (safeHardEnd > from) return { cutEnd: safeHardEnd, nextStart: safeHardEnd };
+
+  // The whole window is inside a protected span (e.g. a tag/entity/escape pair,
+  // or a link longer than one chunk) — cut at the raw limit to guarantee progress.
+  return { cutEnd: hardEnd, nextStart: hardEnd };
+}
+
+/** Reopenable elements whose content contains `pos` (inclusive of both edges), outer to inner. */
+function elementsOpenAt(elements: ReopenElement[], pos: number): ReopenElement[] {
+  return elements.filter((e) => pos >= e.contentStart && pos <= e.contentEnd);
+}
+
 /**
  * Split `text` into chunks that each fit within `maxLength` (Telegram's hard
  * message limit by default), breaking on paragraph ("\n\n") boundaries first,
  * then line breaks, then spaces, and only falling back to a hard cut when no
  * safe boundary exists. The split never lands inside an HTML tag/entity or a
- * MarkdownV2 escape/entity for the given `parseMode`.
+ * MarkdownV2 escape/entity/link for the given `parseMode`. When a split falls
+ * inside a reopenable formatting element (an HTML tag pair, or a MarkdownV2
+ * bold/italic/underline/strikethrough/spoiler/code/pre span), the element's
+ * markup is closed at the end of the chunk and reopened at the start of the
+ * next one, so formatting survives the split and a single element longer than
+ * one chunk can still be split at a word boundary instead of a hard cut.
  */
 export function splitTelegramMessage(
   text: string,
@@ -615,42 +748,46 @@ export function splitTelegramMessage(
 ): string[] {
   if (text.length <= maxLength) return [text];
 
-  const spans = getProtectedSpans(text, parseMode);
+  const { spans, elements } = getStructure(text, parseMode);
   const chunks: string[] = [];
   let from = 0;
+  let prefix = "";
 
   while (from < text.length) {
-    if (text.length - from <= maxLength) {
-      chunks.push(text.slice(from));
+    if (text.length - from + prefix.length <= maxLength) {
+      chunks.push(prefix + text.slice(from));
       break;
     }
 
-    let hardEnd = retreatFromProtectedSpans(from + maxLength, from, spans);
-    if (hardEnd <= from) hardEnd = from + maxLength;
+    const budget = Math.max(1, maxLength - prefix.length);
+    let hardEnd = from + budget;
+    let cutEnd = from;
+    let nextStart = from;
+    let open: ReopenElement[] = [];
 
-    let cutEnd = findLastSafeSeparator(text, from, hardEnd, "\n\n", spans);
-    let nextStart: number;
-    if (cutEnd !== -1) {
-      nextStart = cutEnd + 2;
-    } else {
-      cutEnd = findLastSafeSeparator(text, from, hardEnd, "\n", spans);
-      if (cutEnd !== -1) {
-        nextStart = cutEnd + 1;
-      } else {
-        cutEnd = findLastSafeSeparator(text, from, hardEnd, " ", spans);
-        nextStart = cutEnd !== -1 ? cutEnd + 1 : hardEnd;
-        if (cutEnd === -1) cutEnd = hardEnd;
-      }
+    // Re-tighten the window if the elements open at the chosen cut point need a
+    // closing suffix that would push this chunk over the limit.
+    for (let guard = 0; guard < 4; guard++) {
+      const boundary = findSplitBoundary(text, from, hardEnd, spans);
+      cutEnd = boundary.cutEnd;
+      nextStart = boundary.nextStart;
+      open = elementsOpenAt(elements, cutEnd);
+      const suffixLength = open.reduce((sum, e) => sum + e.closeText.length, 0);
+
+      if (prefix.length + (cutEnd - from) + suffixLength <= maxLength || cutEnd <= from + 1) break;
+
+      const overflow = prefix.length + (cutEnd - from) + suffixLength - maxLength;
+      hardEnd = Math.max(from + 1, hardEnd - overflow);
     }
 
-    if (cutEnd <= from) {
-      // No safe boundary anywhere in this window (e.g. a single unbreakable
-      // token/entity longer than one chunk) — hard-cut to guarantee progress.
-      cutEnd = from + maxLength;
-      nextStart = cutEnd;
-    }
+    const suffix = open
+      .slice()
+      .reverse()
+      .map((e) => e.closeText)
+      .join("");
 
-    chunks.push(text.slice(from, cutEnd));
+    chunks.push(prefix + text.slice(from, cutEnd) + suffix);
+    prefix = open.map((e) => e.openText).join("");
     from = nextStart;
   }
 

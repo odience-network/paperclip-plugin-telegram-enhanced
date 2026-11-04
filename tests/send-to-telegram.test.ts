@@ -686,6 +686,30 @@ describe("sendToTelegramTool", () => {
     expect(rejoined.replace(/\s+/g, " ")).toBe(longText.replace(/\s+/g, " "));
   });
 
+  it("surfaces a partial split-message delivery as ok:true with chunk counts and Telegram's reason, not a bare success", async () => {
+    vi.spyOn(telegramApi, "sendMessageWithResult").mockResolvedValue({
+      messageId: 101,
+      partial: true,
+      deliveredChunks: 1,
+      totalChunks: 3,
+      errorDescription: "Bad Request: message is too long",
+    });
+    const ctx = createContext(async () => ({ ok: true }) as unknown as Response);
+
+    const result = await runSendToTelegram({ text: "hello" }, defaultConfig, ctx);
+
+    expect(result.data).toMatchObject({
+      ok: true,
+      mode: "message",
+      messageId: 101,
+      partial: true,
+      deliveredChunks: 1,
+      totalChunks: 3,
+      message: "Telegram send failed: Bad Request: message is too long",
+    });
+    expect(ctx.logger.warn).toHaveBeenCalled();
+  });
+
   it("smoke: generates a markdown file and sends it as Telegram document", async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "paperclip-telegram-smoke-"));
     const filePath = join(tmpDir, "agent-report.md");

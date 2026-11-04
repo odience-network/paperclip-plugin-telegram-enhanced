@@ -766,6 +766,12 @@ type SendToTelegramResult = {
   routeName?: string;
   projectKey?: string;
   issueIdentifier?: string;
+  /** True when a split message had some chunks delivered before a later chunk failed. */
+  partial?: boolean;
+  /** Number of chunks successfully delivered before the failure, set only when `partial` is true. */
+  deliveredChunks?: number;
+  /** Total number of chunks the message was split into, set only when `partial` is true. */
+  totalChunks?: number;
 };
 
 function validateOutboundThreadId(value: unknown): number | "invalid" | undefined {
@@ -1094,9 +1100,15 @@ export async function sendToTelegramTool(
       messageThreadId: outboundThreadId,
       replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
       disableNotification: p.silent === true,
-    }).then(({ messageId, errorDescription }) => {
+    }).then(({ messageId, errorDescription, partial, deliveredChunks, totalChunks }) => {
       if (!messageId) {
         return makeTelegramToolError("telegram_send_failed", telegramSendFailedMessage(errorDescription));
+      }
+      if (partial) {
+        ctx.logger.warn(
+          `Telegram split message only partially delivered (${deliveredChunks}/${totalChunks} chunks): ${telegramSendFailedMessage(errorDescription)}`,
+          { error: errorDescription, deliveredChunks, totalChunks },
+        );
       }
       return {
         ok: true,
@@ -1105,6 +1117,7 @@ export async function sendToTelegramTool(
         threadId: outboundThreadId,
         messageId,
         routeSource,
+        ...(partial ? { partial: true, deliveredChunks, totalChunks, message: telegramSendFailedMessage(errorDescription) } : {}),
       } as SendToTelegramResult;
     });
 

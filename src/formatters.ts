@@ -406,6 +406,9 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   if (description) {
     const { snippet, truncated } = truncateSnippet(description, opts);
     lines.push(`\n${esc(snippet)}`);
+    // Links to the first linked issue, not the approval itself: unlike issues, approvals
+    // have no stable host web route to deep-link to (only the approve/reject API actions
+    // used by /acp commands), so there's nowhere to send a reader when none is linked.
     if (truncated) appendReadMore(lines, firstLinkedIssueId ? issueUrl(firstLinkedIssueId, opts) : null);
   }
 

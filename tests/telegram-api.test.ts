@@ -197,6 +197,88 @@ describe("splitTelegramMessage", () => {
     for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(100);
     expect(chunks.length).toBeGreaterThan(1);
   });
+
+  it("closes and reopens an HTML element that straddles a chunk boundary, splitting its content on a word boundary", () => {
+    const words = Array.from({ length: 1000 }, (_, i) => `w${i}`);
+    const text = "<b>" + words.join(" ") + "</b>";
+
+    const chunks = splitTelegramMessage(text, "HTML");
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(TELEGRAM_MAX_MESSAGE_LENGTH);
+
+    // Each chunk is independently well-formed HTML: its own tags balance.
+    for (const chunk of chunks) {
+      const opens = (chunk.match(/<b>/g) ?? []).length;
+      const closes = (chunk.match(/<\/b>/g) ?? []).length;
+      expect(opens).toBe(closes);
+    }
+    expect(chunks[0]!.startsWith("<b>")).toBe(true);
+    expect(chunks[chunks.length - 1]!.endsWith("</b>")).toBe(true);
+
+    // No word is split in half by the cut (joining with a space accounts for the
+    // single separator space consumed at each split point, same as plain-text splits).
+    const reconstructed = chunks
+      .map((chunk) => chunk.replace(/<\/?b>/g, ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .split(" ");
+    expect(reconstructed).toEqual(words);
+  });
+
+  it("closes and reopens a long <pre> element rather than hard-cutting it", () => {
+    const words = Array.from({ length: 1200 }, (_, i) => `token${i}`);
+    const text = "<pre>" + words.join(" ") + "</pre>";
+
+    const chunks = splitTelegramMessage(text, "HTML");
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(TELEGRAM_MAX_MESSAGE_LENGTH);
+    for (const chunk of chunks) {
+      const opens = (chunk.match(/<pre>/g) ?? []).length;
+      const closes = (chunk.match(/<\/pre>/g) ?? []).length;
+      expect(opens).toBe(closes);
+    }
+
+    const reconstructed = chunks
+      .map((chunk) => chunk.replace(/<\/?pre>/g, ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .split(" ");
+    expect(reconstructed).toEqual(words);
+  });
+
+  it("falls back to a word boundary inside a MarkdownV2 code block longer than one chunk, closing and reopening the fence", () => {
+    const words = Array.from({ length: 1200 }, (_, i) => `line${i}`);
+    const body = words.join(" ");
+    const text = "```" + body + "```";
+    expect(text.length).toBeGreaterThan(TELEGRAM_MAX_MESSAGE_LENGTH);
+
+    const chunks = splitTelegramMessage(text, "MarkdownV2");
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(TELEGRAM_MAX_MESSAGE_LENGTH);
+
+    // Every chunk's own fences balance (an even number of ``` markers).
+    for (const chunk of chunks) {
+      const fenceCount = (chunk.match(/```/g) ?? []).length;
+      expect(fenceCount % 2).toBe(0);
+    }
+    expect(chunks[0]!.startsWith("```")).toBe(true);
+    expect(chunks[chunks.length - 1]!.endsWith("```")).toBe(true);
+
+    // No word is cut mid-way — unlike a raw 4096-char hard cut, which would land
+    // inside one of these tokens.
+    const reconstructed = chunks
+      .map((chunk) => chunk.replace(/```/g, ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .split(" ");
+    expect(reconstructed).toEqual(words);
+  });
 });
 
 describe("sendMessageWithResult", () => {
@@ -267,5 +349,27 @@ describe("sendMessageWithResult", () => {
     const result = await sendMessageWithResult(ctx, "token", "chat", "hello");
 
     expect(result).toEqual({ messageId: null, errorDescription: "Bad Request: message is too long" });
+  });
+
+  it("reports a partial delivery (not a bare success) when a later chunk fails, keeping the first chunk's message id", async () => {
+    let call = 0;
+    const { ctx, calls } = mockCtx(() => {
+      call++;
+      if (call === 1) return { ok: true, result: { message_id: 10 } };
+      return { ok: false, description: "Bad Request: message is too long" };
+    });
+    const longText = Array(2000).fill("word").join(" ");
+    const expectedChunks = splitTelegramMessage(longText).length;
+    expect(expectedChunks).toBeGreaterThan(1);
+
+    const result = await sendMessageWithResult(ctx, "token", "chat", longText);
+
+    expect(result.messageId).toBe(10);
+    expect(result.partial).toBe(true);
+    expect(result.deliveredChunks).toBe(1);
+    expect(result.totalChunks).toBe(expectedChunks);
+    expect(result.errorDescription).toBe("Bad Request: message is too long");
+    // Stops sending once a chunk fails — it doesn't keep going and lose more chunks.
+    expect(calls.length).toBe(2);
   });
 });
