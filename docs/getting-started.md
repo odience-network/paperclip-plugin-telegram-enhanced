@@ -92,6 +92,19 @@ If both are set, **both must match**: the user must be on the user allowlist *an
 
 Leave an allowlist empty only if that dimension should be unrestricted. After changing allowlists, save the settings and restart the plugin if the new values aren't picked up immediately.
 
+## 8. Running multiple companies on one instance
+
+Steps 1–7 cover a single company. For a Paperclip instance that hosts more than one company, each company gets its own Telegram group and its own settings — but shares the one bot you connected in step 4:
+
+1. **Connect one bot for the whole instance** — done once, in step 4. Every company below reuses it.
+2. **Create one Telegram group per company.**
+3. **Add the bot to each group**, with [group privacy mode off](https://core.telegram.org/bots/features#privacy-mode) so it can read `/connect` and other commands in the group.
+4. **Run `/connect <company-name>` in each group.** This links that specific chat to that specific company — it never links a chat to more than one company, and a chat left unlinked only answers `/start`, `/help`, and `/connect` until you do this.
+5. **Set Chat ID / approvals chat / board token in each company's own plugin settings** — open the Telegram plugin settings *from inside that company* (not another one) and save its `defaultChatId`, `approvalsChatId`, and board access there. Settings saved for one company are never used for another company's sends or notifications.
+6. **Verify with `/status`** in each group — it should report that company's agents and issues, not another company's.
+
+Run `/connect` with no argument in any chat to see every company the instance knows about.
+
 ---
 
 ## Next steps

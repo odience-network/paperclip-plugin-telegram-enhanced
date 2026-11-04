@@ -117,6 +117,8 @@ Set `telegramBotTokenRef` to the secret UUID and `defaultChatId` to your chat ID
 
 📘 **Need the detailed walkthrough?** Read the [Getting Started guide](docs/getting-started.md) — it covers the settings UI, board access for approvals, and security allowlists.
 
+🏢 **Hosting more than one company?** One bot serves the whole instance, but each company needs its own Telegram group, its own `/connect`, and its own plugin settings — see [Running multiple companies on one instance](docs/getting-started.md#8-running-multiple-companies-on-one-instance).
+
 ---
 
 ## Documentation
