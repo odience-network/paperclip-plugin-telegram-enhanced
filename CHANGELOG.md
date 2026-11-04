@@ -6,6 +6,77 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-04
+
+Notifications and `send_to_telegram` silently cut long text instead of delivering
+it, and a failed send told the agent nothing about why (ODIAA-2701).
+
+### Fixed
+
+- **Long messages were truncated or rejected instead of delivered (ODIAA-2701).**
+  `sendMessage` sent `text` as-is; anything over Telegram's hard 4096-character
+  limit was rejected outright, and the agent only saw a bare
+  `telegram_send_failed`. `sendMessage` (and `send_to_telegram`) now split long
+  text across multiple messages — on paragraph, then line, then word boundaries —
+  never inside an HTML tag/entity or a MarkdownV2 escape/entity. The inline
+  keyboard, if any, goes on the last chunk only; the original reply-to/topic goes
+  on the first chunk only, and later chunks reply to the previous chunk so they
+  thread together.
+- **Formatters truncated notification text at small, hardcoded limits with no way
+  to read the rest (ODIAA-2701).** Issue-created descriptions, done/blocked
+  comments, board mentions, approval descriptions, and agent error messages were
+  each cut at a different fixed length (200-500 chars) with no "read more" path.
+  They now share one much higher, overridable limit
+  (`formatters.DEFAULT_TEXT_SNIPPET_LIMIT`, 3500 chars), and a cut snippet gets a
+  **Read more** link to the issue (or the approval's first linked issue) instead
+  of just trailing off. (Interaction-card formatting is unchanged here; it's
+  tracked separately.)
+- **A failed Telegram send told the agent nothing about why (ODIAA-2701).**
+  `send_to_telegram` failures now carry Telegram's own `description` in the
+  returned error message (e.g. `telegram_send_failed: Bad Request: ...`) instead
+  of a bare "Telegram send failed.", and the plugin's log line puts that reason
+  in the message text itself rather than only in `meta.error`.
+- **A chunk failure after the first was reported as a plain success
+  (ODIAA-2701).** `sendMessageWithResult` returned the first chunk's message id
+  with no indication that a later chunk failed, so `send_to_telegram` (which only
+  checked for a null message id) told the agent `ok: true` even though most of
+  the text never arrived. A failed later chunk now sets `partial: true` with
+  `deliveredChunks`/`totalChunks` and Telegram's `description`, which
+  `send_to_telegram` surfaces alongside `ok: true` (the already-sent chunks are
+  real messages; silently calling it a failure would invite a duplicate resend).
+- **Splitting inside an HTML or MarkdownV2 formatting element broke the next
+  chunk's markup (ODIAA-2701).** A `<b>`/`<pre>`/... element (or a MarkdownV2
+  bold/italic/underline/strikethrough/spoiler/code/pre span) that straddled a
+  4096-char boundary left one chunk with an unclosed tag and the next with a
+  dangling closing tag — Telegram rejected the HTML chunk outright (no
+  plain-text fallback exists for HTML), and the MarkdownV2 chunk only survived
+  via its plain-text fallback, losing formatting. The splitter now closes the
+  open element at the end of a chunk and reopens the same markup at the start of
+  the next.
+- **An entity longer than one chunk was hard-cut mid-word (ODIAA-2701).** A
+  MarkdownV2 code block (or any single formatting element) longer than 4096
+  characters used to be treated as one unsplittable span, so the cut fell back
+  to a raw 4096-character hard cut with no regard for word boundaries. Combined
+  with the fix above, the splitter now searches for a paragraph/line/word
+  boundary inside the element's own content instead.
+- **A reopened MarkdownV2 `pre` block hid its first line (ODIAA-2701).**
+  Reopening a split code block with a bare ` ``` ` left Telegram's parser
+  reading the continuation's first line as the (invisible) language tag
+  instead of content — a second, more subtle case of the silent text loss
+  this issue exists to stop. The fence now reopens as ` ```\n ` so the blank
+  language line is explicit and the real content starts on its own line.
+
+### Coordination
+
+- PR [#33](https://github.com/odience-network/paperclip-plugin-telegram-enhanced/pull/33)
+  (`/agents` capped under 4096 via `capListMessage`) is unmerged and solves a
+  different problem — keeping one summarized message for a big agent list,
+  rather than splitting a notification across several. This PR introduces the
+  `TELEGRAM_MAX_MESSAGE_LENGTH` constant that #33 also declares; #33 should
+  rebase on top of this, drop its own copy, and import this one. Recommend
+  merging #33 as-is afterward — its capped summary is still the better UX for
+  `/agents`, distinct from (and compatible with) this PR's splitter.
+
 ## [0.5.0] — 2026-11-04
 
 Agent questions now reach Telegram and can be answered there like a chat.

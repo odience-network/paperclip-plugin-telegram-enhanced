@@ -9,7 +9,9 @@ import {
 } from "@paperclipai/plugin-sdk";
 import {
   sendMessage,
+  sendMessageWithResult,
   sendDocument,
+  sendDocumentWithResult,
   editMessage,
   answerCallbackQuery,
   setMyCommands,
@@ -805,6 +807,12 @@ type SendToTelegramResult = {
   routeName?: string;
   projectKey?: string;
   issueIdentifier?: string;
+  /** True when a split message had some chunks delivered before a later chunk failed. */
+  partial?: boolean;
+  /** Number of chunks successfully delivered before the failure, set only when `partial` is true. */
+  deliveredChunks?: number;
+  /** Total number of chunks the message was split into, set only when `partial` is true. */
+  totalChunks?: number;
 };
 
 function validateOutboundThreadId(value: unknown): number | "invalid" | undefined {
@@ -848,6 +856,13 @@ function makeTelegramToolError(
   metadata: Pick<SendToTelegramResult, "projectKey" | "issueIdentifier"> = {},
 ): SendToTelegramResult {
   return { ok: false, code, message, ...metadata };
+}
+
+// Surfaces Telegram's own failure reason (the API's `description` field) to the
+// calling agent instead of a bare "send failed", so the agent can see e.g. a
+// MarkdownV2 parse error or a chat-not-found and react to it (ODIAA-2701).
+function telegramSendFailedMessage(errorDescription?: string): string {
+  return errorDescription ? `Telegram send failed: ${errorDescription}` : "Telegram send failed.";
 }
 
 async function resolveIssueIdentifierForFileRoute(
@@ -1098,16 +1113,16 @@ export async function sendToTelegramTool(
     ? destination.topicId
     : threadId;
   const result: SendToTelegramResult = markdownContent
-    ? await sendDocument(ctx, token, chatId, markdownContent, {
+    ? await sendDocumentWithResult(ctx, token, chatId, markdownContent, {
       filename: requestedMarkdownFileName,
       caption: text ?? undefined,
       parseMode,
       messageThreadId: outboundThreadId,
       replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
       disableNotification: p.silent === true,
-    }).then((messageId) => {
+    }).then(({ messageId, errorDescription }) => {
       if (!messageId) {
-        return makeTelegramToolError("telegram_send_failed", "Telegram send failed.");
+        return makeTelegramToolError("telegram_send_failed", telegramSendFailedMessage(errorDescription));
       }
       return {
         ok: true,
@@ -1121,14 +1136,20 @@ export async function sendToTelegramTool(
         issueIdentifier: destination?.ok ? destination.issueIdentifier : undefined,
       } as SendToTelegramResult;
     })
-    : await sendMessage(ctx, token, chatId, text!, {
+    : await sendMessageWithResult(ctx, token, chatId, text!, {
       parseMode,
       messageThreadId: outboundThreadId,
       replyToMessageId: typeof replyToMessageId === "number" ? replyToMessageId : undefined,
       disableNotification: p.silent === true,
-    }).then((messageId) => {
+    }).then(({ messageId, errorDescription, partial, deliveredChunks, totalChunks }) => {
       if (!messageId) {
-        return makeTelegramToolError("telegram_send_failed", "Telegram send failed.");
+        return makeTelegramToolError("telegram_send_failed", telegramSendFailedMessage(errorDescription));
+      }
+      if (partial) {
+        ctx.logger.warn(
+          `Telegram split message only partially delivered (${deliveredChunks}/${totalChunks} chunks): ${telegramSendFailedMessage(errorDescription)}`,
+          { error: errorDescription, deliveredChunks, totalChunks },
+        );
       }
       return {
         ok: true,
@@ -1137,6 +1158,7 @@ export async function sendToTelegramTool(
         threadId: outboundThreadId,
         messageId,
         routeSource,
+        ...(partial ? { partial: true, deliveredChunks, totalChunks, message: telegramSendFailedMessage(errorDescription) } : {}),
       } as SendToTelegramResult;
     });
 

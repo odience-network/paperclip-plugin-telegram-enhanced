@@ -72,6 +72,8 @@ describe("sendToTelegramTool", () => {
     metricWrites = [];
     vi.spyOn(telegramApi, "sendMessage").mockResolvedValue(101);
     vi.spyOn(telegramApi, "sendDocument").mockResolvedValue(202);
+    vi.spyOn(telegramApi, "sendMessageWithResult").mockResolvedValue({ messageId: 101 });
+    vi.spyOn(telegramApi, "sendDocumentWithResult").mockResolvedValue({ messageId: 202 });
   });
 
   afterEach(() => {
@@ -84,7 +86,7 @@ describe("sendToTelegramTool", () => {
 
     expect(result.data).toMatchObject({ ok: true, mode: "message", chatId: "-1001", messageId: 101 });
     expect(result.data).toHaveProperty("mode", "message");
-    expect(telegramApi.sendMessage).toHaveBeenCalledWith(
+    expect(telegramApi.sendMessageWithResult).toHaveBeenCalledWith(
       ctx,
       "resolved-token",
       "-1001",
@@ -96,7 +98,7 @@ describe("sendToTelegramTool", () => {
         disableNotification: false,
       },
     );
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("makes a message about a task answerable: a reply routes to that task", async () => {
@@ -113,7 +115,7 @@ describe("sendToTelegramTool", () => {
     const result = await runSendToTelegram({ markdownContent: "# Report" }, defaultConfig, ctx);
 
     expect(result.data).toMatchObject({ ok: true, mode: "document", chatId: "-1001", messageId: 202 });
-    expect(telegramApi.sendDocument).toHaveBeenCalledWith(
+    expect(telegramApi.sendDocumentWithResult).toHaveBeenCalledWith(
       ctx,
       "resolved-token",
       "-1001",
@@ -138,7 +140,7 @@ describe("sendToTelegramTool", () => {
     );
 
     expect(result.data).toMatchObject({ ok: true, mode: "document", chatId: "-1001", messageId: 202 });
-    expect(telegramApi.sendDocument).toHaveBeenCalledWith(
+    expect(telegramApi.sendDocumentWithResult).toHaveBeenCalledWith(
       ctx,
       "resolved-token",
       "-1001",
@@ -176,7 +178,7 @@ describe("sendToTelegramTool", () => {
       projectKey: "TEL",
       messageId: 202,
     });
-    expect(telegramApi.sendDocument).toHaveBeenCalledWith(
+    expect(telegramApi.sendDocumentWithResult).toHaveBeenCalledWith(
       ctx,
       "resolved-token",
       "-2002",
@@ -281,7 +283,7 @@ describe("sendToTelegramTool", () => {
       ok: false,
       code: "unresolved_issue",
     });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("fails closed when route-aware markdown has no matching project route", async () => {
@@ -306,8 +308,8 @@ describe("sendToTelegramTool", () => {
       projectKey: "OPS",
       issueIdentifier: "OPS-1",
     });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
-    expect(telegramApi.sendMessage).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
+    expect(telegramApi.sendMessageWithResult).not.toHaveBeenCalled();
   });
 
   it("fails closed when duplicate enabled routes match the same project key", async () => {
@@ -332,7 +334,7 @@ describe("sendToTelegramTool", () => {
       code: "ambiguous_route",
       projectKey: "TEL",
     });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("fails closed when an enabled file route has invalid config", async () => {
@@ -356,7 +358,7 @@ describe("sendToTelegramTool", () => {
       code: "invalid_route_config",
       projectKey: "TEL",
     });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("ignores disabled invalid routes and uses the enabled matching route", async () => {
@@ -377,7 +379,7 @@ describe("sendToTelegramTool", () => {
     );
 
     expect(result.data).toMatchObject({ ok: true, chatId: "-2002", routeSource: "file_route" });
-    expect(telegramApi.sendDocument).toHaveBeenCalledTimes(1);
+    expect(telegramApi.sendDocumentWithResult).toHaveBeenCalledTimes(1);
   });
 
   it("rejects route-aware markdown mixed with explicit destination fields", async () => {
@@ -410,7 +412,7 @@ describe("sendToTelegramTool", () => {
 
     expect(withChatId.data).toMatchObject({ ok: false, code: "conflicting_destination" });
     expect(withThreadId.data).toMatchObject({ ok: false, code: "conflicting_destination" });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("keeps explicit chatId and threadId compatibility for markdown documents", async () => {
@@ -462,14 +464,14 @@ describe("sendToTelegramTool", () => {
       chatId: "-1001",
       routeSource: "legacy_fallback",
     });
-    expect(telegramApi.sendMessage).toHaveBeenCalledWith(
+    expect(telegramApi.sendMessageWithResult).toHaveBeenCalledWith(
       ctx,
       "resolved-token",
       "-1001",
       "hello TEL",
       expect.objectContaining({ messageThreadId: undefined }),
     );
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("rejects explicit disallowed chat ids before Telegram API calls", async () => {
@@ -491,8 +493,8 @@ describe("sendToTelegramTool", () => {
       code: "disallowed_chat",
       message: "Telegram chat is not allowed for agent outbound delivery.",
     });
-    expect(telegramApi.sendMessage).not.toHaveBeenCalled();
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendMessageWithResult).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("rejects explicit chatId when allowlist is empty but allows default chat when omitted", async () => {
@@ -520,7 +522,7 @@ describe("sendToTelegramTool", () => {
       ctx,
     );
     expect(allowed.data).toMatchObject({ ok: true, mode: "message", chatId: "-1001", messageId: 101 });
-    expect(telegramApi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(telegramApi.sendMessageWithResult).toHaveBeenCalledTimes(1);
   });
 
   it("rejects non-md markdown filenames", async () => {
@@ -539,7 +541,7 @@ describe("sendToTelegramTool", () => {
       code: "non_markdown_file",
       message: "Markdown file uploads must use a .md extension.",
     });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -561,7 +563,7 @@ describe("sendToTelegramTool", () => {
 
     expect(result.data).toMatchObject({ ok: false });
     expect(result.data.code).toBe("invalid_markdown_filename");
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it.each([".env.md", "secret-report.md", "my_token.md", "private-key.md"]) (
@@ -578,7 +580,7 @@ describe("sendToTelegramTool", () => {
       );
 
       expect(result.data).toMatchObject({ ok: false, code: "unsafe_filename" });
-      expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+      expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
     },
   );
 
@@ -615,8 +617,8 @@ describe("sendToTelegramTool", () => {
       code: "unsupported_file_source",
       message: "Only text and markdownContent are supported.",
     });
-    expect(telegramApi.sendMessage).not.toHaveBeenCalled();
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendMessageWithResult).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("rejects oversized markdown before Telegram API send", async () => {
@@ -630,7 +632,7 @@ describe("sendToTelegramTool", () => {
       code: "markdown_too_large",
       message: "Markdown content exceeds size limits.",
     });
-    expect(telegramApi.sendDocument).not.toHaveBeenCalled();
+    expect(telegramApi.sendDocumentWithResult).not.toHaveBeenCalled();
   });
 
   it("surfaces Telegram failure as structured error and counts failure metric", async () => {
@@ -645,7 +647,7 @@ describe("sendToTelegramTool", () => {
     expect(result.data).toEqual({
       ok: false,
       code: "telegram_send_failed",
-      message: "Telegram send failed.",
+      message: "Telegram send failed: Telegram API down",
     });
     expect(metricWrites.some((metric) => metric.name === "telegram_notification_failures" && metric.value === 1)).toBe(true);
   });
@@ -662,9 +664,59 @@ describe("sendToTelegramTool", () => {
     expect(result.data).toEqual({
       ok: false,
       code: "telegram_send_failed",
-      message: "Telegram send failed.",
+      message: "Telegram send failed: Telegram API down",
     });
     expect(metricWrites.some((metric) => metric.name === "telegram_notification_failures" && metric.value === 1)).toBe(true);
+  });
+
+  it("send_to_telegram splits text over 4096 characters across multiple Telegram messages", async () => {
+    vi.restoreAllMocks();
+
+    let messageIdCounter = 300;
+    const fetchCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const ctx = createContext(async (url, requestOptions) => {
+      const body = JSON.parse(String(requestOptions?.body ?? "{}")) as Record<string, unknown>;
+      fetchCalls.push({ url, body });
+      return { json: async () => ({ ok: true, result: { message_id: messageIdCounter++ } }) };
+    });
+
+    const longText = Array(2000).fill("word").join(" "); // 9999 chars, well over 4096
+    expect(longText.length).toBeGreaterThan(9000);
+
+    const result = await runSendToTelegram({ text: longText }, defaultConfig, ctx);
+
+    expect(result.data).toMatchObject({ ok: true, mode: "message", chatId: "-1001", messageId: 300 });
+    expect(fetchCalls.length).toBeGreaterThan(1);
+    for (const call of fetchCalls) {
+      expect((call.body.text as string).length).toBeLessThanOrEqual(4096);
+    }
+    // The chunks reassemble (modulo the single separator consumed at each split) to the original text.
+    const rejoined = fetchCalls.map((call) => call.body.text as string).join(" ");
+    expect(rejoined.replace(/\s+/g, " ")).toBe(longText.replace(/\s+/g, " "));
+  });
+
+  it("surfaces a partial split-message delivery as ok:true with chunk counts and Telegram's reason, not a bare success", async () => {
+    vi.spyOn(telegramApi, "sendMessageWithResult").mockResolvedValue({
+      messageId: 101,
+      partial: true,
+      deliveredChunks: 1,
+      totalChunks: 3,
+      errorDescription: "Bad Request: message is too long",
+    });
+    const ctx = createContext(async () => ({ ok: true }) as unknown as Response);
+
+    const result = await runSendToTelegram({ text: "hello" }, defaultConfig, ctx);
+
+    expect(result.data).toMatchObject({
+      ok: true,
+      mode: "message",
+      messageId: 101,
+      partial: true,
+      deliveredChunks: 1,
+      totalChunks: 3,
+      message: "Telegram send failed: Bad Request: message is too long",
+    });
+    expect(ctx.logger.warn).toHaveBeenCalled();
   });
 
   it("smoke: generates a markdown file and sends it as Telegram document", async () => {
