@@ -52,6 +52,23 @@ Paperclip agents  ⇄  Telegram bot  ⇄  You
 
 ➡️ **Full feature reference:** see the [documentation](#documentation) below.
 
+> **Upgrading to this version?** Agent questions add a new capability,
+> **`issue.interactions.read`** (to look up an issue's pending interactions and
+> settle its question cards). Existing installs move to `upgrade_pending` until
+> a board member approves it — **this approval step is board-only**; an agent
+> cannot grant it to itself. Until approved, the plugin keeps running on its
+> previously-granted capabilities and agent questions simply do not reach
+> Telegram.
+>
+> **Push delivery depends on a host change that has not shipped yet.** Paperclip
+> does not currently emit `issue.interaction.created` to plugins, so a card
+> reaches Telegram when the asking agent's run ends — not the instant the
+> question is created. A question raised outside of a run (e.g. directly on the
+> board) only reaches Telegram once a later run on that issue ends, or once the
+> host starts emitting the event. The 5-minute `sync-question-cards` job keeps
+> already-delivered cards' status in sync (closing settled ones, sending
+> reminders) — it does not discover brand-new interactions on its own.
+
 ---
 
 ## Quick start (5 minutes)
