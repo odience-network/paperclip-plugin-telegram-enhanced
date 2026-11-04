@@ -101,6 +101,27 @@ describe("inbound reply attribution (ODIAA-1927)", () => {
     expect(commentCalls[0].options).toEqual({ actorUserId: "user-mapped" });
   });
 
+  it("attributes using the mapping's own company config, not the primary config (ODIAA-2700)", async () => {
+    // The reply's stored mapping says company "co-1" (see makeCtx's state.get
+    // stub). The primary `config` passed as the instance-wide view carries a
+    // *different* company's mapping; `configFor` is the only place co-1's own
+    // mapping lives. A cross-company mapping here would misattribute the
+    // comment to the wrong user — an authorization bug, not a UX one.
+    const { ctx, commentCalls } = makeCtx();
+    const primaryConfig = {
+      enableInbound: true,
+      telegramActorMappings: { "42": "user-WRONG-COMPANY" },
+    } as never;
+    const configFor = (companyId?: string | null) =>
+      (companyId === "co-1"
+        ? { enableInbound: true, telegramActorMappings: { "42": "user-co1" } }
+        : primaryConfig) as never;
+
+    await routeInboundReply(ctx, "token", primaryConfig, makeReply(), CHAT, "please continue", configFor);
+
+    expect(commentCalls[0].options).toEqual({ actorUserId: "user-co1" });
+  });
+
   it("leaves the comment unattributed when the company has more than one human", async () => {
     const { ctx, commentCalls } = makeCtx({
       members: [

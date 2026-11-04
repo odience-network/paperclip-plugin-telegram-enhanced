@@ -26,11 +26,13 @@ configured.
   delivery happened to land last. Now scoped like every other company-scoped read.
 - **Board API token, Cloudflare Access headers, and `telegramActorMappings`
   resolved from the primary config in several inbound paths (ODIAA-2700):**
-  callback-query handling, the `/approve` command, and the native-reply interaction
-  guard. The last of these is the most serious: a cross-company `telegramActorMappings`
-  mismatch is an authorization bug, not just a UX one — it decides who may act on a
-  decision. All three now resolve the config of the company the interaction (or
-  command) actually belongs to.
+  callback-query handling, the `/approve` command, the native-reply interaction
+  guard, a typed (non-button) reply to a question card, and the inbound-comment
+  attribution that posts a board reply as its author. All are the same
+  authorization bug, not a UX one: a cross-company `telegramActorMappings` or
+  `userChatMappings` mismatch decides who may act on, or be credited for, someone
+  else's decision. All five now resolve the config of the company the card,
+  interaction, or stored reply mapping actually belongs to.
 
 ### Fixed
 

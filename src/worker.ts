@@ -2874,13 +2874,22 @@ export async function handleUpdate(
       ? { chatId, messageId: replyToBotId }
       : await awaitingCardRef(ctx, chatId);
     if (cardRef) {
+      // This card's own company's `telegramActorMappings` (ODIAA-2700), same
+      // mapping lookup as `resolveCallbackCompanyId` uses for the button-press
+      // path — not the primary `config`, and not necessarily the company this
+      // chat is currently `/connect`-ed to.
+      const cardMapping = await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: `msg_${cardRef.chatId}_${cardRef.messageId}`,
+      }) as { companyId?: string } | null;
+      const cardCfg = configFor(cardMapping?.companyId);
       const deps: CardFlowDeps = {
         ctx,
         token,
         baseUrl,
         // Company-scoped (ODIAA-2699): the card's own companyId picks the config.
         resolveBoardToken: (companyId) => resolveBoardApiToken(ctx, configFor(companyId), companyId),
-        telegramActorMappings: config.telegramActorMappings,
+        telegramActorMappings: cardCfg.telegramActorMappings,
       };
       if (await handleCardText(deps, msg, cardRef, text)) return;
     }
@@ -3003,7 +3012,7 @@ export async function handleUpdate(
     }
   }
 
-  const outcome = await routeInboundReply(ctx, token, config, msg, chatId, text);
+  const outcome = await routeInboundReply(ctx, token, config, msg, chatId, text, configFor);
   await acknowledgeUnroutedReply(ctx, token, config, msg, chatId, outcome);
   await noticeUnattributedReply(ctx, token, msg, chatId, outcome);
 }
@@ -3257,6 +3266,12 @@ export async function routeInboundReply(
   msg: NonNullable<TelegramUpdate["message"]>,
   chatId: string,
   text: string,
+  // This mapping's own company's `telegramActorMappings`/`userChatMappings`
+  // (ODIAA-2700) — not the primary `config` above, which only gates the
+  // instance-wide inbound feature toggle before the mapping's company is
+  // known. Defaults to `config` so existing single-company callers are
+  // unaffected.
+  configFor: (companyId?: string | null) => TelegramConfig = () => config,
 ): Promise<InboundReplyOutcome> {
   if (!config.enableInbound) {
     return { routed: "none", reason: "inbound-disabled" };
@@ -3303,7 +3318,7 @@ export async function routeInboundReply(
       // Post as the board member, not as the plugin (ODIAA-1927). An
       // agent-attributed comment renders as a system message and never wakes
       // anyone, which is exactly why replies looked like they were ignored.
-      const attribution = await resolveInboundActor(ctx, config, mapping.companyId, {
+      const attribution = await resolveInboundActor(ctx, configFor(mapping.companyId), mapping.companyId, {
         fromId: msg.from?.id,
         chatId,
         chatType: msg.chat?.type,
