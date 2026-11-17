@@ -1,4 +1,4 @@
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, type PluginContext } from "@paperclipai/plugin-sdk";
 
 /**
  * Company directory — a proactive-safe company lookup for the polling loop.
@@ -173,11 +173,20 @@ export async function resolveCompanyInput(
         return { match: entry, known: lookup.companies, source: lookup.source, error: lookup.error };
       }
     } catch (err) {
-      return {
-        known: lookup.companies,
-        source: lookup.source,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      // A revoked/expired scope means the company is genuinely unreachable
+      // from here — report it as "not found" like any other miss. Anything
+      // else (timeout, transient host failure) is not a verdict on the
+      // company at all and must not be reported as one; rethrow so the
+      // caller shows a real failure instead of a false "not found" (ported
+      // from mvanhorn cb031d9, ODIAA-2064).
+      if (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED) {
+        return {
+          known: lookup.companies,
+          source: lookup.source,
+          error: err.message,
+        };
+      }
+      throw err;
     }
   }
 

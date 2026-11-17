@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The polling loop inherited `setup()`'s invocation id (ODIAA-2064).** The SDK
+  RPC host tags every worker→host call with the active invocation through
+  AsyncLocalStorage, so once the invocation that ran `setup()` retired, every
+  company-scoped call the loop made (`/status`, `/connect`, offset persistence)
+  was refused as `INVOCATION_SCOPE_DENIED`. The loop now starts outside any
+  invocation. `/connect` also stops reporting a transient company lookup failure
+  (timeout, host error) as "not found". Ported from mvanhorn a83f84d + cb031d9.
+  `tests/worker-invocation-lifetime.test.ts` drives this through the real
+  `startWorkerRpcHost` transport (ODIAA-2648).
+
 ## [0.5.2] — 2026-11-04
 
 0.4.6 (ODIAA-1930) keyed notification delivery and `/status` per company, but left
